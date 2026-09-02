@@ -433,6 +433,71 @@ pub fn vertical_window_rows(
     rows
 }
 
+/// `horizontalWindowBounds` — how far left and right the window reaches, as `(dx_lo, dx_hi)`.
+///
+/// The base window is `±site_window`. With extension enabled both sides walk outward from
+/// `base_x`, and the result is clipped to the furthest **open** position each side reached —
+/// **never below the base window** — then capped at `±max_displacement_x`.
+///
+/// ⛔ **The budget of `2 * site_window` is SHARED between the two sides**, not one each. Budget a
+/// side cannot spend is simply left for the other, which is how a cell hemmed in on one side
+/// still gets a wide search on the other.
+///
+/// ⛔ **A blocked position costs NOTHING.** Only an open one spends budget, so a side keeps
+/// looking straight past a fixed instance instead of stopping at it. A side stops only at the die
+/// edge or after `step_cap = min(4 * site_window, max_displacement_x)` steps.
+///
+/// ⚠️ **`reach` is the furthest OPEN position, not the furthest step.** A walk that dies in the
+/// middle of a macro must not drag the window out over blocked sites it can never use.
+#[allow(clippy::too_many_arguments)]
+pub fn horizontal_window_bounds(
+    base_x: i32,
+    site_window: i32,
+    max_displacement_x: i32,
+    allow_extension: bool,
+    off_die: &dyn Fn(i32) -> bool,
+    open_at: &dyn Fn(i32) -> bool,
+) -> (i32, i32) {
+    let (mut dx_lo, mut dx_hi) = (-site_window, site_window);
+
+    if allow_extension {
+        let step_cap = (4 * site_window).min(max_displacement_x);
+        let mut budget = 2 * site_window;
+        let (mut left, mut right) = (0, 0);
+        let (mut left_reach, mut right_reach) = (0, 0);
+        let (mut left_open, mut right_open) = (true, true);
+
+        while budget > 0 && (left_open || right_open) {
+            if left_open {
+                if left >= step_cap || off_die(base_x - (left + 1)) {
+                    left_open = false;
+                } else {
+                    left += 1;
+                    if open_at(base_x - left) {
+                        left_reach = left;
+                        budget -= 1;
+                    }
+                }
+            }
+            if right_open && budget > 0 {
+                if right >= step_cap || off_die(base_x + (right + 1)) {
+                    right_open = false;
+                } else {
+                    right += 1;
+                    if open_at(base_x + right) {
+                        right_reach = right;
+                        budget -= 1;
+                    }
+                }
+            }
+        }
+        dx_lo = -site_window.max(left_reach);
+        dx_hi = site_window.max(right_reach);
+    }
+
+    (dx_lo.max(-max_displacement_x), dx_hi.min(max_displacement_x))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,6 +726,76 @@ mod tests {
         let rows = vertical_window_rows(4, 1, 40, 2, 10, 20, false, &has, &usable);
         assert!(rows.iter().all(|r| r % 2 == 0), "only usable rows are returned: {rows:?}");
         assert!(rows.len() >= 3, "quota was spent on usable rows, not on the skipped ones");
+    }
+
+    #[test]
+    fn without_extension_the_window_is_just_the_base() {
+        let (lo, hi) = horizontal_window_bounds(50, 4, 500, false, &|_| false, &|_| true);
+        assert_eq!((lo, hi), (-4, 4));
+    }
+
+    #[test]
+    fn the_extended_window_never_shrinks_below_the_base() {
+        // Everything blocked: no reach is recorded, so the base window stands.
+        let (lo, hi) = horizontal_window_bounds(50, 3, 500, true, &|_| false, &|_| false);
+        assert_eq!((lo, hi), (-3, 3));
+    }
+
+    #[test]
+    fn an_open_side_can_spend_the_shared_budget_before_a_blocked_side_uses_any() {
+        // ⛔ **The budget is SHARED, and that has a consequence worth stating.** With a macro at
+        // 51..56 on the right and open space on the left, the left side spends all
+        // `2 * site_window` of it while the right is still stepping (free) through the macro — so
+        // the right records NO reach and keeps only its base window.
+        //
+        // ⚠️ I asserted the opposite twice before tracing it. "Blocked steps are free" is about
+        // BUDGET, not about winning the race for it.
+        let open = |x: i32| !(51..=56).contains(&x);
+        let (lo, hi) = horizontal_window_bounds(50, 3, 500, true, &|_| false, &open);
+        assert_eq!(lo, -6, "the open side extended to its shared-budget reach");
+        assert_eq!(hi, 3, "the blocked side never spent budget, so its base window stands");
+    }
+
+    #[test]
+    fn a_blocked_stretch_is_stepped_over_when_the_other_side_cannot_compete() {
+        // The same macro, but the left is walled at the die edge, so the right owns the budget
+        // and walks through the macro to the open sites beyond it.
+        let open = |x: i32| !(51..=56).contains(&x);
+        let (_, hi) = horizontal_window_bounds(50, 3, 500, true, &|x| x < 50, &open);
+        assert!(hi >= 7, "with the budget to itself the right passes the macro: hi={hi}");
+    }
+
+    #[test]
+    fn the_step_cap_bounds_how_far_a_free_walk_can_go() {
+        // ⚠️ Blocked steps are free of BUDGET but not of STEPS: `step_cap = 4 * site_window`
+        // stops the walk, so a macro wider than the cap is never crossed. Learned by writing the
+        // previous test wrong — a 20-wide macro at site_window 2 (cap 8) is impassable.
+        let open = |x: i32| !(51..=70).contains(&x);
+        let (_, hi) = horizontal_window_bounds(50, 2, 500, true, &|_| false, &open);
+        assert_eq!(hi, 2, "cap 8 cannot cross a 20-wide macro, so the base window stands");
+    }
+
+    #[test]
+    fn the_reach_is_the_furthest_open_position_not_the_furthest_step() {
+        // Open only at +1; everything beyond is blocked to the step cap.
+        let open = |x: i32| x <= 51;
+        let (_, hi) = horizontal_window_bounds(50, 1, 500, true, &|_| false, &open);
+        assert_eq!(hi, 1, "must not drag the window over sites it can never use");
+    }
+
+    #[test]
+    fn a_side_at_the_die_edge_leaves_its_budget_to_the_other() {
+        // 🔑 The budget is shared: hemmed in on the left, the right still searches widely.
+        let off = |x: i32| x < 0;
+        let (lo, hi) = horizontal_window_bounds(1, 4, 500, true, &off, &|_| true);
+        assert!(lo >= -4, "the left is walled at the die edge: lo={lo}");
+        assert!(hi > 4, "the right spent the shared budget: hi={hi}");
+    }
+
+    #[test]
+    fn the_hard_cap_always_wins() {
+        let (lo, hi) = horizontal_window_bounds(500, 50, 6, true, &|_| false, &|_| true);
+        assert_eq!((lo, hi), (-6, 6), "max_displacement_x caps everything");
     }
 
     #[test]
