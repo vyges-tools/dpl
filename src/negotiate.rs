@@ -498,6 +498,73 @@ pub fn horizontal_window_bounds(
     (dx_lo.max(-max_displacement_x), dx_hi.min(max_displacement_x))
 }
 
+/// `effectiveSiteWindow` — the horizontal window, scaled by the cell and capped.
+///
+/// ⚠️ **`max(base, cell.width)`**: a wide cell gets at least its own width of search, because a
+/// window narrower than the cell can only ever offer positions that overlap where it already is.
+pub fn effective_site_window(base: i32, cell_width: i32, max_disp_x: i32,
+                             allow_extension: bool) -> i32 {
+    if !allow_extension || base == 0 {
+        return base.min(max_disp_x);
+    }
+    base.max(cell_width).min(max_disp_x)
+}
+
+/// `effectiveRowCap` — the vertical distance cap, scaled by the cell's height and capped.
+///
+/// ⚠️ **`cell.height * base`**, not `max(base, height)`: a 4-row cell searches four times as far
+/// vertically, because the rows it can legally start on are that much sparser.
+pub fn effective_row_cap(base: i32, cell_height: i32, max_disp_y: i32,
+                         allow_extension: bool) -> i32 {
+    if !allow_extension {
+        return base.min(max_disp_y);
+    }
+    (cell_height * base).min(max_disp_y)
+}
+
+/// One cell's search window: a horizontal reach and the rows to try.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchWindow {
+    pub dx_lo: i32,
+    pub dx_hi: i32,
+    pub rows: Vec<i32>,
+}
+
+/// `buildSearchWindow` — compose the two reaches around an anchor.
+///
+/// ⛔ **Horizontal FIRST, computed once at the anchor row; the vertical walk then probes only
+/// within that span.** The order is not cosmetic: `verticalWindowRows` judges a row usable by
+/// looking for a hostable column inside `[anchor_x + dx_lo, anchor_x + dx_hi]`, so a horizontal
+/// reach computed afterwards — or a wider one — would change which rows qualify.
+pub fn build_search_window(
+    anchor_x: i32,
+    anchor_y: i32,
+    site_window: i32,
+    row_window: i32,
+    row_cap: i32,
+    max_disp_x: i32,
+    max_disp_y: i32,
+    allow_extension: bool,
+    off_die: &dyn Fn(i32) -> bool,
+    open_at: &dyn Fn(i32) -> bool,
+    cell_height: i32,
+    grid_h: i32,
+    row_has_sites: &dyn Fn(i32) -> bool,
+    row_usable_in: &dyn Fn(i32, i32, i32) -> bool,
+) -> SearchWindow {
+    let (dx_lo, dx_hi) =
+        horizontal_window_bounds(anchor_x, site_window, max_disp_x, allow_extension,
+                                 off_die, open_at);
+    let (x_lo, x_hi) = (anchor_x + dx_lo, anchor_x + dx_hi);
+    let rows = vertical_window_rows(
+        anchor_y, cell_height, grid_h, row_window, row_cap,
+        (2 * row_cap).min(max_disp_y), allow_extension,
+        row_has_sites,
+        &|r| row_usable_in(r, x_lo, x_hi),
+    );
+    SearchWindow { dx_lo, dx_hi, rows }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,6 +863,41 @@ mod tests {
     fn the_hard_cap_always_wins() {
         let (lo, hi) = horizontal_window_bounds(500, 50, 6, true, &|_| false, &|_| true);
         assert_eq!((lo, hi), (-6, 6), "max_displacement_x caps everything");
+    }
+
+    #[test]
+    fn a_wide_cell_gets_at_least_its_own_width_of_search() {
+        // ⚠️ A window narrower than the cell can only offer positions overlapping where it is.
+        assert_eq!(effective_site_window(4, 30, 500, true), 30);
+        assert_eq!(effective_site_window(40, 30, 500, true), 40, "the base wins when it is wider");
+        assert_eq!(effective_site_window(4, 30, 10, true), 10, "the hard cap still wins");
+        assert_eq!(effective_site_window(4, 30, 500, false), 4, "no extension: the plain base");
+    }
+
+    #[test]
+    fn a_tall_cell_searches_proportionally_further_vertically() {
+        // ⚠️ MULTIPLIED by height, not max()'d — the legal starting rows are that much sparser.
+        assert_eq!(effective_row_cap(3, 4, 500, true), 12);
+        assert_eq!(effective_row_cap(3, 1, 500, true), 3);
+        assert_eq!(effective_row_cap(3, 4, 5, true), 5, "capped by max displacement");
+        assert_eq!(effective_row_cap(3, 4, 500, false), 3, "no extension: the plain base");
+    }
+
+    #[test]
+    fn the_window_probes_rows_only_within_its_horizontal_span() {
+        // 🔑 The horizontal reach is computed first and bounds the vertical probe. Here only
+        // columns 48..52 can host, so a narrow window finds rows and a shifted one does not.
+        let hostable = |_r: i32, x_lo: i32, x_hi: i32| x_lo <= 52 && x_hi >= 48;
+        let w = build_search_window(50, 5, 2, 2, 4, 500, 500, false,
+                                    &|_| false, &|_| true, 1, 20,
+                                    &|_| true, &hostable);
+        assert_eq!((w.dx_lo, w.dx_hi), (-2, 2));
+        assert!(!w.rows.is_empty(), "rows inside the span are found");
+
+        let away = build_search_window(200, 5, 2, 2, 4, 500, 500, false,
+                                       &|_| false, &|_| true, 1, 20,
+                                       &|_| true, &hostable);
+        assert!(away.rows.is_empty(), "no column in the span can host, so no row qualifies");
     }
 
     #[test]
