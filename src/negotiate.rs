@@ -95,6 +95,72 @@ pub fn sort_by_negotiation_order(keys: &mut [SortKey]) {
     keys.sort();
 }
 
+/// The cost a candidate location is judged by, as `kInfCost` — a location that cannot be used.
+pub const INF_COST: f64 = 1e18;
+
+/// `targetCostFromDisp` — the displacement term.
+///
+/// `disp + multiplier * max(0, disp - threshold)`: linear in displacement, then steeper once it
+/// passes the threshold.
+///
+/// 🔑 **Monotone in `disp`, and `findBestLocation` depends on that.** The wavefront search prunes
+/// as soon as a wavefront's displacement cost plus the congestion floor exceeds the incumbent —
+/// which is only sound because this never decreases as displacement grows.
+pub fn target_cost_from_disp(disp: i64, multiplier: f64, threshold: i64) -> f64 {
+    disp as f64 + multiplier * (disp - threshold).max(0) as f64
+}
+
+/// `targetCost` — displacement measured from the cell's INIT position.
+///
+/// ⛔ **From `init_x`/`init_y`, NOT from where the cell currently sits.** The init position is
+/// where global placement put it, and it does not move as the cell is ripped up and re-placed
+/// across iterations. Measuring from the current position instead would let a cell drift
+/// arbitrarily far over many iterations, one cheap step at a time.
+pub fn target_cost(x: i32, y: i32, init_x: i32, init_y: i32, multiplier: f64, threshold: i64) -> f64 {
+    let disp = (x - init_x).abs() as i64 + (y - init_y).abs() as i64;
+    target_cost_from_disp(disp, multiplier, threshold)
+}
+
+/// `negotiationCost` — displacement plus the PathFinder congestion term.
+///
+/// For each square of the footprint: `cost += hist_cost * (usage + 1) / capacity`. That is the
+/// classic `h * p` — history times present congestion (upstream's comment cites "Eq. 10").
+///
+/// ⚠️ **`usage + 1`** counts the cell being considered, so a square already holding one cell reads
+/// as 2/1 rather than 1/1. Without the `+1` an occupied square looks exactly as cheap as an empty
+/// one and the algorithm never separates overlaps.
+///
+/// ⛔ `capacity == 0` is a blockage and returns `INF_COST`; so does a square off the grid.
+///
+/// `abort_bound` is a branch-and-bound cut: the caller's incumbent cost. Returning early once the
+/// running total passes it is safe because every remaining term is non-negative.
+pub fn negotiation_cost(
+    footprint: impl Iterator<Item = Option<(i32, i32, f64)>>,
+    target: f64,
+    abort_bound: f64,
+) -> f64 {
+    let mut cost = target;
+    if cost > abort_bound {
+        return cost;
+    }
+    for square in footprint {
+        match square {
+            // Off the grid, or a blockage: unusable.
+            None => return cost + INF_COST,
+            Some((usage, capacity, hist)) => {
+                if capacity == 0 {
+                    return cost + INF_COST;
+                }
+                cost += hist * ((usage + 1) as f64 / capacity as f64);
+                if cost > abort_bound {
+                    return cost;
+                }
+            }
+        }
+    }
+    cost
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +199,54 @@ mod tests {
         let mut v = [k(1, 1, 1, 9), k(1, 1, 1, 2), k(1, 1, 1, 5)];
         sort_by_negotiation_order(&mut v);
         assert_eq!(v.iter().map(|s| s.idx).collect::<Vec<_>>(), [2, 5, 9]);
+    }
+
+    #[test]
+    fn displacement_cost_is_monotone_and_steepens_past_the_threshold() {
+        // 🔑 The wavefront prune is only sound because this never decreases.
+        let c = |d| target_cost_from_disp(d, 2.0, 10);
+        let vals: Vec<f64> = (0..20).map(c).collect();
+        assert!(vals.windows(2).all(|w| w[0] <= w[1]), "not monotone: {vals:?}");
+        assert_eq!(c(10), 10.0, "at the threshold it is still purely linear");
+        assert_eq!(c(11), 11.0 + 2.0, "past it, the multiplier applies to the excess only");
+    }
+
+    #[test]
+    fn displacement_is_measured_from_the_init_position() {
+        // ⛔ Not from where the cell currently sits — that would let it drift across iterations.
+        assert_eq!(target_cost(5, 0, 5, 0, 1.0, 100), 0.0, "at its init position, no cost");
+        assert_eq!(target_cost(7, 0, 5, 0, 1.0, 100), 2.0);
+        assert_eq!(target_cost(3, 0, 5, 0, 1.0, 100), 2.0, "symmetric");
+    }
+
+    #[test]
+    fn an_occupied_square_costs_more_than_an_empty_one() {
+        // ⚠️ The `usage + 1` is what separates overlaps; without it these are equal.
+        let empty = negotiation_cost([Some((0, 1, 1.0))].into_iter(), 0.0, INF_COST);
+        let taken = negotiation_cost([Some((1, 1, 1.0))].into_iter(), 0.0, INF_COST);
+        assert!(taken > empty, "empty={empty} taken={taken}");
+        assert_eq!(empty, 1.0);
+        assert_eq!(taken, 2.0);
+    }
+
+    #[test]
+    fn history_makes_a_contested_square_expensive() {
+        let fresh = negotiation_cost([Some((1, 1, 1.0))].into_iter(), 0.0, INF_COST);
+        let fought = negotiation_cost([Some((1, 1, 8.0))].into_iter(), 0.0, INF_COST);
+        assert!(fought > fresh, "history must raise the price of a contested site");
+    }
+
+    #[test]
+    fn a_blockage_or_an_off_grid_square_is_unusable() {
+        assert!(negotiation_cost([Some((0, 0, 1.0))].into_iter(), 0.0, INF_COST) >= INF_COST);
+        assert!(negotiation_cost([None].into_iter(), 0.0, INF_COST) >= INF_COST);
+    }
+
+    #[test]
+    fn the_abort_bound_stops_the_scan_early() {
+        // Two squares, but the bound is passed on the first: the second is never added.
+        let c = negotiation_cost([Some((9, 1, 1.0)), Some((9, 1, 1.0))].into_iter(), 0.0, 5.0);
+        assert_eq!(c, 10.0, "returned as soon as it passed the bound, not 20");
     }
 
     #[test]
