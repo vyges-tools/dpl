@@ -676,6 +676,74 @@ pub fn build_search_window(
     SearchWindow { dx_lo, dx_hi, rows }
 }
 
+/// How a negotiation run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Zero violations, in the given phase and iteration.
+    Converged { phase: u8, iter: i32 },
+    /// Violations stalled for 3 identical iterations; diamond recovery ran, then the phase broke.
+    StalledIntoRecovery { phase: u8, iter: i32, violations: i32 },
+    /// Both phases ran out of iterations. ⚠️ Upstream does NOT error here — the caller reports it
+    /// through `numViolations()`.
+    Exhausted { violations: i32 },
+}
+
+/// `runNegotiation`'s two-phase driver.
+///
+/// ```text
+/// phase 1: kMaxIterNeg  = 400  iterations, iter counted from 0
+/// phase 2: kMaxIterNeg2 = 1000 iterations, iter CONTINUES from max_iter_neg
+/// ```
+///
+/// ⛔ **Phase 2 continues the iteration counter (`actual_iter = iter + max_iter_neg`), it does not
+/// restart it.** Two things ride on that number and both would be wrong if it reset: the isolation
+/// point (`iter >= kIsolationPt` — already-legal cells are skipped) and the DRC penalty, which
+/// scales as `drc_penalty * (1 + iter)` and is meant to keep climbing.
+///
+/// ⚠️ **A stall is three CONSECUTIVE identical violation counts**, and any different count resets
+/// the counter. Not "no improvement" — a count that rises then falls is progress, not a stall.
+///
+/// 🔑 **The stall escape is `diamondRecovery`** — the diamond search legalizer, run over the cells
+/// still illegal, then the phase BREAKS. So `diamondDPL`'s search is not an alternative to
+/// negotiation; it is a component of it.
+pub fn run_negotiation(
+    max_iter_neg: i32,
+    max_iter_neg2: i32,
+    mut iterate: impl FnMut(i32) -> i32,
+    mut diamond_recovery: impl FnMut(),
+) -> Outcome {
+    for (phase, (start, count)) in [(0, max_iter_neg), (max_iter_neg, max_iter_neg2)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut prev = -1;
+        let mut stall = 0;
+        let mut last = 0;
+        for i in 0..count {
+            let actual = start + i;
+            let violations = iterate(actual);
+            last = violations;
+            if violations == 0 {
+                return Outcome::Converged { phase: phase as u8 + 1, iter: i };
+            }
+            if violations == prev {
+                stall += 1;
+                if stall == 3 {
+                    diamond_recovery();
+                    return Outcome::StalledIntoRecovery {
+                        phase: phase as u8 + 1, iter: i, violations,
+                    };
+                }
+            } else {
+                stall = 0;
+            }
+            prev = violations;
+        }
+        let _ = last;
+    }
+    Outcome::Exhausted { violations: -1 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,6 +1161,52 @@ mod tests {
         let rows = [0, 10];
         let (gx, _) = init_position(10_000, 0, 0, 0, 100, &rows, 3, 1, 10, 2);
         assert_eq!(gx, 7, "10 - 3, so the footprint ends exactly at the edge");
+    }
+
+    #[test]
+    fn converging_in_phase_one_stops_immediately() {
+        let mut seen = Vec::new();
+        let out = run_negotiation(400, 1000, |i| { seen.push(i); if i < 3 { 5 - i } else { 0 } },
+                                  || panic!("recovery must not run on a converging design"));
+        assert_eq!(out, Outcome::Converged { phase: 1, iter: 3 });
+        assert_eq!(seen, vec![0, 1, 2, 3], "no iteration past convergence");
+    }
+
+    #[test]
+    fn three_identical_counts_are_a_stall_and_call_recovery() {
+        let mut recovered = 0;
+        let out = run_negotiation(400, 1000, |_| 7, || recovered += 1);
+        assert_eq!(out, Outcome::StalledIntoRecovery { phase: 1, iter: 3, violations: 7 });
+        assert_eq!(recovered, 1, "recovery runs exactly once, then the phase breaks");
+    }
+
+    #[test]
+    fn a_changed_count_resets_the_stall() {
+        // ⚠️ Not "no improvement": a count that rises then falls is progress.
+        let seq = [4, 4, 5, 5, 5, 5];
+        let mut n = 0;
+        let out = run_negotiation(400, 1000, |_| { let v = seq[n.min(seq.len() - 1)]; n += 1; v },
+                                  || {});
+        // 4,4 -> stall 1; 5 resets; 5,5 -> stall 2; 5 -> stall 3 at index 5.
+        assert_eq!(out, Outcome::StalledIntoRecovery { phase: 1, iter: 5, violations: 5 });
+    }
+
+    #[test]
+    fn phase_two_continues_the_iteration_counter() {
+        // ⛔ The isolation point and the DRC penalty both read this number.
+        let mut iters = Vec::new();
+        run_negotiation(3, 2, |i| { iters.push(i); 1 + (iters.len() as i32 % 2) }, || {});
+        assert_eq!(&iters[..3], &[0, 1, 2], "phase 1");
+        assert_eq!(&iters[3..], &[3, 4], "phase 2 continues from 3, it does not restart at 0");
+    }
+
+    #[test]
+    fn exhausting_both_phases_is_not_an_error_here() {
+        // ⚠️ Upstream reports non-convergence through the caller's numViolations().
+        let mut n = 0;
+        let out = run_negotiation(2, 2, |_| { n += 1; n }, || {});
+        assert!(matches!(out, Outcome::Exhausted { .. }));
+        assert_eq!(n, 4, "both phases ran to their limits");
     }
 
     #[test]
