@@ -20,6 +20,32 @@
 //! sequence is recorded in `vyges-tools-internal/docs/openroad/dpl/negotiation-legalizer.md` so
 //! the next pass builds from a read reference rather than re-reading 2,315 lines.
 
+/// `updateHistoryCosts` — make contested squares more expensive for the next iteration.
+///
+/// For every square under an active cell, **deduped so a square shared by several cells is bumped
+/// once**: `hist_cost += HIST_INCREMENT * overuse`.
+///
+/// 🔑 **This is what makes negotiation terminate.** Present congestion alone oscillates — two
+/// cells swap into each other's square forever. History remembers which squares keep being fought
+/// over and prices them out, so the contest resolves instead of repeating.
+///
+/// ⚠️ **Only squares with `overuse > 0` are bumped.** A square that is merely occupied is not
+/// contested, and raising its price would penalise a cell for sitting somewhere legal.
+pub fn update_history_costs(pixels: &mut [NegPixel], footprints: &[Vec<usize>]) {
+    let mut seen = std::collections::HashSet::new();
+    for fp in footprints {
+        for &pid in fp {
+            if !seen.insert(pid) {
+                continue; // already bumped this iteration
+            }
+            let ov = pixels[pid].overuse();
+            if ov > 0 {
+                pixels[pid].hist_cost += consts::HIST_INCREMENT * ov as f64;
+            }
+        }
+    }
+}
+
 /// One cell in the negotiation model — upstream's `NegCell`.
 ///
 /// ⚠️ Coordinates are in GRID units (site columns, row indices), not DBU. The negotiation grid is
@@ -192,8 +218,36 @@ pub fn sort_by_negotiation_order(keys: &mut [SortKey]) {
     keys.sort();
 }
 
+/// The algorithm's constants, whose "defaults match the NBLG paper" per upstream's own comment.
+///
+/// ⚠️ Transcribed rather than chosen. `INF_COST` in particular is **`INT_MAX / 2`**, not an
+/// arbitrary large number — costs are compared against it directly, and a different magnitude
+/// changes which candidates the branch-and-bound prunes.
+pub mod consts {
+    /// `kInfCost` — an unusable location. ⚠️ `INT_MAX / 2`, ~1.07e9, NOT 1e18.
+    pub const INF_COST: f64 = (i32::MAX / 2) as f64;
+    /// `kSiteSearchWindow` — base search width along the row, in sites.
+    pub const SITE_SEARCH_WINDOW: i32 = 20;
+    /// `kRowSearchWindow` — base search width across rows.
+    pub const ROW_SEARCH_WINDOW: i32 = 5;
+    /// `kDrcPenalty` — base DRC penalty, scaled by `(1 + iter)`.
+    pub const DRC_PENALTY: f64 = 5.0;
+    /// `kMaxIterNeg` / `kMaxIterNeg2` — the phase-1 and phase-2 iteration limits.
+    pub const MAX_ITER_NEG: i32 = 400;
+    pub const MAX_ITER_NEG2: i32 = 1000;
+    /// `kIsolationPt` — from this iteration on, a cell that is already legal is skipped.
+    /// ⚠️ It is **1**, so the isolation applies from the SECOND iteration: only the first pass
+    /// rips up every active cell regardless of legality.
+    pub const ISOLATION_PT: i32 = 1;
+    /// `kMfDefault` / `kThDefault` — the displacement penalty past the threshold, in sites.
+    pub const MAX_DISP_MULTIPLIER: f64 = 1.5;
+    pub const MAX_DISP_THRESHOLD: i64 = 30;
+    /// `kHfDefault` — how much history a unit of overuse adds.
+    pub const HIST_INCREMENT: f64 = 1.0;
+}
+
 /// The cost a candidate location is judged by, as `kInfCost` — a location that cannot be used.
-pub const INF_COST: f64 = 1e18;
+pub use consts::INF_COST;
 
 /// `targetCostFromDisp` — the displacement term.
 ///
@@ -898,6 +952,56 @@ mod tests {
                                        &|_| false, &|_| true, 1, 20,
                                        &|_| true, &hostable);
         assert!(away.rows.is_empty(), "no column in the span can host, so no row qualifies");
+    }
+
+    fn px(usage: i32) -> NegPixel {
+        NegPixel { usage, hist_cost: 1.0, capacity: 1 }
+    }
+
+    #[test]
+    fn history_rises_only_on_contested_squares() {
+        // ⚠️ A merely occupied square is not contested; pricing it would penalise a legal cell.
+        let mut p = vec![px(1), px(3), px(0)];
+        update_history_costs(&mut p, &[vec![0, 1, 2]]);
+        assert_eq!(p[0].hist_cost, 1.0, "usage 1 is not overuse");
+        assert_eq!(p[1].hist_cost, 3.0, "overuse 2 adds 2.0");
+        assert_eq!(p[2].hist_cost, 1.0);
+    }
+
+    #[test]
+    fn a_shared_square_is_bumped_once_per_iteration() {
+        // ⛔ Two cells cover square 0. Without the dedupe it would be bumped twice, so history
+        // would grow with the number of overlapping cells rather than with the overuse.
+        let mut p = vec![px(2)];
+        update_history_costs(&mut p, &[vec![0], vec![0]]);
+        assert_eq!(p[0].hist_cost, 2.0, "one bump of +1, not two");
+    }
+
+    #[test]
+    fn history_accumulates_across_iterations() {
+        // 🔑 This is what makes the negotiation terminate: a square fought over repeatedly keeps
+        // getting dearer until the contest resolves rather than oscillating.
+        let mut p = vec![px(2)];
+        for _ in 0..4 {
+            update_history_costs(&mut p, &[vec![0]]);
+        }
+        assert_eq!(p[0].hist_cost, 5.0);
+    }
+
+    #[test]
+    fn the_constants_are_the_papers_defaults() {
+        // Pinned because they are transcribed, not chosen — a changed value is a changed algorithm.
+        assert_eq!(consts::SITE_SEARCH_WINDOW, 20);
+        assert_eq!(consts::ROW_SEARCH_WINDOW, 5);
+        assert_eq!(consts::MAX_ITER_NEG, 400);
+        assert_eq!(consts::MAX_ITER_NEG2, 1000);
+        assert_eq!(consts::ISOLATION_PT, 1);
+        assert_eq!(consts::MAX_DISP_MULTIPLIER, 1.5);
+        assert_eq!(consts::MAX_DISP_THRESHOLD, 30);
+        assert_eq!(consts::HIST_INCREMENT, 1.0);
+        assert_eq!(consts::DRC_PENALTY, 5.0);
+        // ⚠️ INT_MAX/2, not an arbitrary large number: costs are compared against it.
+        assert_eq!(consts::INF_COST, 1_073_741_823.0);
     }
 
     #[test]
