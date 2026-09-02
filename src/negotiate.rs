@@ -161,6 +161,82 @@ pub fn negotiation_cost(
     cost
 }
 
+/// Why a candidate position is not legal. `Legal` is the only passing value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Legality {
+    Legal,
+    OffDie,
+    RowHasNoSites,
+    RowRejectsSite,
+    Blockage,
+    Overused,
+    /// ⬜ Declared, never returned by this engine — see [`is_cell_legal`].
+    DrcUnavailable,
+}
+
+/// `isValidRow` — may this cell sit in this row, at this column?
+///
+/// 1. the row span must be inside the grid;
+/// 2. **every** row of the span must have sites — a multi-row cell may not straddle a gap;
+/// 3. the row must offer the cell's site (`getSiteOrientation`).
+///
+/// ⬜ Upstream also checks **master symmetry** (`checkMasterSym`) and, for multi-row cells,
+/// **power-stack compatibility** (`checkRowPowerCompatible`). Neither is implemented here and both
+/// are reported by the caller rather than skipped in silence.
+pub fn is_valid_row(
+    row: i32,
+    height: i32,
+    grid_h: i32,
+    row_has_sites: &dyn Fn(i32) -> bool,
+    row_offers_site: &dyn Fn(i32) -> bool,
+) -> Legality {
+    if row < 0 || row + height > grid_h {
+        return Legality::OffDie;
+    }
+    for dy in 0..height {
+        if !row_has_sites(row + dy) {
+            return Legality::RowHasNoSites;
+        }
+    }
+    if !row_offers_site(row) {
+        return Legality::RowRejectsSite;
+    }
+    Legality::Legal
+}
+
+/// `isCellLegal` — is the cell legally placed where it is?
+///
+/// ⛔ **Upstream's version returns FALSE when the DRC engine is unavailable**, logging
+/// *"DRC objects not available!"*. Transcribed literally without `PlacementDRC`, every cell would
+/// be illegal and the negotiation would never converge.
+///
+/// ⚠️ **So this omits the DRC clause, and that is a DIVERGENCE, not a simplification.** A cell that
+/// upstream rejects for edge spacing, blocked layers, padding or a one-site gap is legal here — so
+/// this engine will consider fewer cells illegal, negotiate fewer of them, and settle somewhere
+/// upstream would not. It must stay declared until `PlacementDRC` exists.
+pub fn is_cell_legal(
+    in_die: bool,
+    row_ok: Legality,
+    footprint: impl Iterator<Item = (i32, i32)>,
+) -> Legality {
+    if !in_die {
+        return Legality::OffDie;
+    }
+    if row_ok != Legality::Legal {
+        return row_ok;
+    }
+    // ⬜ upstream: `drc_engine_->checkDRC(node, x, y, orient)` here.
+    for (usage, capacity) in footprint {
+        if capacity == 0 {
+            return Legality::Blockage;
+        }
+        if (usage - 1).max(0) > 0 {
+            return Legality::Overused;
+        }
+    }
+    Legality::Legal
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +323,40 @@ mod tests {
         // Two squares, but the bound is passed on the first: the second is never added.
         let c = negotiation_cost([Some((9, 1, 1.0)), Some((9, 1, 1.0))].into_iter(), 0.0, 5.0);
         assert_eq!(c, 10.0, "returned as soon as it passed the bound, not 20");
+    }
+
+    #[test]
+    fn a_multi_row_cell_may_not_straddle_a_row_without_sites() {
+        // ⛔ EVERY row of the span is checked, not just the bottom one.
+        let has = |r: i32| r != 3;               // row 3 is a gap
+        let offers = |_: i32| true;
+        assert_eq!(is_valid_row(2, 1, 10, &has, &offers), Legality::Legal);
+        assert_eq!(is_valid_row(2, 2, 10, &has, &offers), Legality::RowHasNoSites,
+                   "a 2-row cell starting at 2 covers the gap at 3");
+    }
+
+    #[test]
+    fn a_row_span_running_past_the_grid_is_off_die() {
+        let (has, offers) = (|_: i32| true, |_: i32| true);
+        assert_eq!(is_valid_row(9, 2, 10, &has, &offers), Legality::OffDie);
+        assert_eq!(is_valid_row(-1, 1, 10, &has, &offers), Legality::OffDie);
+    }
+
+    #[test]
+    fn an_overused_or_blocked_square_makes_a_cell_illegal() {
+        let ok = |v: Vec<(i32, i32)>| is_cell_legal(true, Legality::Legal, v.into_iter());
+        assert_eq!(ok(vec![(1, 1), (1, 1)]), Legality::Legal, "one cell per square is legal");
+        assert_eq!(ok(vec![(1, 1), (2, 1)]), Legality::Overused);
+        assert_eq!(ok(vec![(1, 0)]), Legality::Blockage);
+    }
+
+    #[test]
+    fn the_row_verdict_is_reported_rather_than_collapsed_to_a_bool() {
+        // 🔑 A caller that only sees false cannot tell a blockage from a missing row, and the two
+        // want different fixes.
+        assert_eq!(is_cell_legal(false, Legality::Legal, [].into_iter()), Legality::OffDie);
+        assert_eq!(is_cell_legal(true, Legality::RowRejectsSite, [].into_iter()),
+                   Legality::RowRejectsSite);
     }
 
     #[test]
