@@ -15,6 +15,7 @@
 //! `Padding` model rather than the search" — that is now confirmed rather than assumed.
 pub mod check;
 pub mod grid;
+pub mod place;
 
 /// This crate's version, as Cargo knows it — the single number the whole suite is released on.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
