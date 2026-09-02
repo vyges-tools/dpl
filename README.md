@@ -55,4 +55,8 @@ unchecked families are implemented.
 
 ## License
 
-Apache-2.0. See `LICENSE` and `NOTICE`.
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+ℹ️ This engine reads the design database through `vyges-opendb`, which binds
+OpenROAD's OpenDB (libodb) — BSD 3-Clause, Copyright (c) 2019-2026 The Regents of the
+University of California. The attribution is in `NOTICE`.

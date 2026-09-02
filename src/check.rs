@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `check_placement` — is every cell legally placed?
 //!
 //! Transcribed from OpenROAD `src/dpl/src/CheckPlacement.cpp::Opendp::checkPlacement`.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Bakes the build's git commit into the binary as `VYGES_GIT_SHA`, so
 //! `--version` reports exactly which commit a user is running — essential for
 //! tracing bug reports back to a build.

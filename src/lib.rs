@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `dpl` — detailed placement: legality checking, and (later) legalization.
 //!
 //! Reference is OpenROAD `src/dpl` at pin `945a9f48dc6e5cc91d865daa92c45a1094cb682c`.
