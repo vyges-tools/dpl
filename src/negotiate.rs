@@ -334,6 +334,105 @@ pub fn is_cell_legal(
     Legality::Legal
 }
 
+/// `verticalWindowRows` — which rows a cell's search window covers.
+///
+/// Two sides walk outward from `seed_y`: `below` (+1) and `above` (-1). Each has its own **quota**
+/// (`count_per_side`) of usable rows and its own **distance cap** (`max_scan`).
+///
+/// A side closes when it fills its quota, exhausts its cap, or meets a **hard wall** — the die edge
+/// or a band of rows with no placement sites at all.
+///
+/// ⛔ **Unfilled quota is DONATED to the other side**, which is reopened and given a longer cap
+/// (`min(2 * max_scan, max_displacement_y)`). A side closed at a wall is `walled` and **cannot
+/// take** a donation; a side that merely filled its quota can be reopened by one. If both are
+/// walled short, the unspent quota is never used.
+///
+/// ⚠️ **The RETURNED ORDER is `seed, below…, above…` — not sorted by distance.** `findBestLocation`
+/// ties on a `ScanRank` whose middle term is the position in this list, so reordering it changes
+/// which of two equally-costed rows wins.
+///
+/// 🔑 **A row counts only if it can host the cell SOMEWHERE in the horizontal span.** Probing a
+/// single column would call a row beside a macro usable (or dead) on the evidence of one square.
+#[allow(clippy::too_many_arguments)]
+pub fn vertical_window_rows(
+    seed_y: i32,
+    height: i32,
+    grid_h: i32,
+    count_per_side: i32,
+    max_scan: i32,
+    extended_cap: i32,
+    allow_extension: bool,
+    row_has_sites: &dyn Fn(i32) -> bool,
+    row_usable: &dyn Fn(i32) -> bool,
+) -> Vec<i32> {
+    let hard_wall = |r: i32| -> bool {
+        if r < 0 || r + height > grid_h {
+            return true;
+        }
+        (0..height).any(|dy| !row_has_sites(r + dy))
+    };
+
+    struct Side {
+        dir: i32,
+        step: i32,
+        quota: i32,
+        cap: i32,
+        closed: bool,
+        walled: bool,
+        found: Vec<i32>,
+    }
+    let mk = |dir| Side { dir, step: 0, quota: count_per_side, cap: max_scan,
+                          closed: false, walled: false, found: Vec::new() };
+    let (mut below, mut above) = (mk(1), mk(-1));
+
+    // One step of `self`, with `other` available to receive a donation.
+    fn step_side(
+        s: &mut Side, o: &mut Side, seed_y: i32, extended_cap: i32, allow_extension: bool,
+        hard_wall: &dyn Fn(i32) -> bool, row_usable: &dyn Fn(i32) -> bool,
+    ) {
+        if s.closed {
+            return;
+        }
+        if s.quota == 0 {
+            s.closed = true; // quota filled — a later donation may reopen us
+            return;
+        }
+        if s.step >= s.cap || hard_wall(seed_y + s.dir * (s.step + 1)) {
+            s.closed = true;
+            s.walled = true;
+            if allow_extension && s.quota > 0 && !o.walled {
+                o.quota += s.quota;
+                o.cap = extended_cap;
+                o.closed = false;
+                s.quota = 0;
+            }
+            return;
+        }
+        s.step += 1;
+        let r = seed_y + s.dir * s.step;
+        if row_usable(r) {
+            s.found.push(r);
+            s.quota -= 1;
+        }
+    }
+
+    while !below.closed || !above.closed {
+        step_side(&mut below, &mut above, seed_y, extended_cap, allow_extension,
+                  &hard_wall, row_usable);
+        step_side(&mut above, &mut below, seed_y, extended_cap, allow_extension,
+                  &hard_wall, row_usable);
+    }
+
+    // ⚠️ seed first, then every row found below, then every row found above.
+    let mut rows = Vec::with_capacity(below.found.len() + above.found.len() + 1);
+    if row_usable(seed_y) {
+        rows.push(seed_y);
+    }
+    rows.extend(below.found);
+    rows.extend(above.found);
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +604,63 @@ mod tests {
         assert_eq!(g.total_overuse(), 1, "the shared square is overused by one");
         g.add_usage(1, 0, 2, 1, -1); // rip up
         assert_eq!(g.total_overuse(), 0);
+    }
+
+    fn window(seed: i32, quota: i32, scan: i32, grid_h: i32,
+              usable: &dyn Fn(i32) -> bool) -> Vec<i32> {
+        vertical_window_rows(seed, 1, grid_h, quota, scan, 2 * scan, true,
+                             &|r| r >= 0 && r < grid_h && usable(r), usable)
+    }
+
+    #[test]
+    fn the_window_returns_the_seed_first_then_below_then_above() {
+        // ⚠️ Not distance-sorted — the order is what ScanRank ties on.
+        let rows = window(5, 2, 5, 20, &|_| true);
+        assert_eq!(rows, vec![5, 6, 7, 4, 3]);
+    }
+
+    #[test]
+    fn each_side_stops_at_its_own_quota() {
+        let rows = window(10, 1, 9, 40, &|_| true);
+        assert_eq!(rows, vec![10, 11, 9], "one row per side");
+    }
+
+    #[test]
+    fn a_walled_side_donates_its_quota_to_the_other() {
+        // ⛔ The seed sits on row 1; row 0 exists, row -1 is the die edge, so `above` walls
+        // almost immediately and hands its quota down.
+        let rows = window(1, 3, 20, 30, &|_| true);
+        assert_eq!(rows[0], 1);
+        assert!(rows.contains(&0), "the one row above is taken");
+        let below: Vec<i32> = rows.iter().copied().filter(|r| *r > 1).collect();
+        assert!(below.len() > 3, "the walled side's unfilled quota was spent below: {rows:?}");
+    }
+
+    #[test]
+    fn extension_can_be_disabled() {
+        let plain = vertical_window_rows(1, 1, 30, 3, 20, 40, false,
+                                         &|r| (0..30).contains(&r), &|r| (0..30).contains(&r));
+        let below: Vec<i32> = plain.iter().copied().filter(|r| *r > 1).collect();
+        assert_eq!(below.len(), 3, "without extension each side keeps its own quota: {plain:?}");
+    }
+
+    #[test]
+    fn a_row_band_with_no_sites_is_a_hard_wall() {
+        // Rows 8..12 have no sites: the walk below stops there rather than jumping the gap.
+        let usable = |r: i32| !(8..=12).contains(&r);
+        let rows = vertical_window_rows(6, 1, 40, 5, 20, 40, false, &usable, &usable);
+        assert!(rows.iter().all(|r| *r < 8 || *r > 12), "must not cross the gap: {rows:?}");
+        assert!(rows.contains(&7), "it may reach the row just before the wall");
+    }
+
+    #[test]
+    fn an_unusable_row_costs_a_step_but_not_quota() {
+        // 🔑 Rows that exist but cannot host the cell are stepped over without spending quota.
+        let has = |_: i32| true;
+        let usable = |r: i32| r % 2 == 0; // odd rows exist but cannot host
+        let rows = vertical_window_rows(4, 1, 40, 2, 10, 20, false, &has, &usable);
+        assert!(rows.iter().all(|r| r % 2 == 0), "only usable rows are returned: {rows:?}");
+        assert!(rows.len() >= 3, "quota was spent on usable rows, not on the skipped ones");
     }
 
     #[test]
