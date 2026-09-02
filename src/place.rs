@@ -205,3 +205,161 @@ mod tests {
         assert_eq!(pts.len(), 25);
     }
 }
+
+// ── the legalizer ────────────────────────────────────────────────────────────────────────────
+
+use crate::grid::Grid;
+use vyges_opendb::Db;
+
+/// One cell the legalizer may move.
+#[derive(Debug, Clone)]
+pub struct Movable {
+    pub name: String,
+    pub key: OrderKey,
+    /// Core-relative starting position, in DBU.
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub site: String,
+}
+
+/// Where a cell ended up.
+#[derive(serde::Serialize, Debug, Clone)]
+pub struct Placed {
+    pub name: String,
+    /// ABSOLUTE DBU, ready to write back — core offset already added.
+    pub x: i32,
+    pub y: i32,
+    pub orient: String,
+    pub moved: bool,
+}
+
+/// The result of a legalization run.
+#[derive(serde::Serialize, Debug, Default)]
+pub struct Legalized {
+    pub placed: Vec<Placed>,
+    pub failures: Vec<String>,
+    pub not_done: Vec<String>,
+}
+
+/// Families of behaviour this legalizer does NOT implement.
+///
+/// ⛔ Named on every run. A legalizer that silently skips `ripUpAndReplace` reports fewer failures
+/// than it earned — the cells it could not seat would have been retried upstream.
+pub const NOT_DONE: &[&str] = &[
+    "rip_up_and_replace", "groups_and_regions", "padding", "one_site_gaps",
+    "legalPt hopeless/block-edge refinement",
+];
+
+/// `Opendp::diamondDPL` — legalize every movable cell.
+///
+/// **The call sequence, and each step is upstream's:**
+///
+/// 1. `initGrid` — the row/pixel model;
+/// 2. `setFixedGridCells` — **paint the FIXED cells in first**, so the search sees them as
+///    occupied. ⛔ Skip this and every cell legalizes into a macro;
+/// 3. collect the movable cells — `Node::CELL`, `master->isCore()`, and not
+///    (fixed ∨ in a group ∨ already placed);
+/// 4. **sort** with [`place_before`];
+/// ✅ **CORRELATED 2026-09-02 on `fragmented_row04`** — one cell in a row cutout. Our result is
+/// **byte-identical to upstream's `.defok`**: `_277_ BUF_X4 + PLACED ( 8360 2800 ) FS`, same
+/// coordinates and same orientation, and the REFERENCE's own `check_placement` accepts it.
+///
+/// 5. for each: `diamondMove` — a diamond search from its current grid point for the nearest
+///    square where `checkPixels` passes — then `placeCell`, which paints the pixels and
+///    ⚠️ **takes the ORIENTATION from the row it landed in**.
+pub fn legalize(db: &Db) -> Result<Legalized, String> {
+    let mut grid = Grid::build(db)?;
+    let core = grid.core;
+    let mut out = Legalized {
+        not_done: NOT_DONE.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+
+    let center = ((core.0 + core.2) / 2, (core.1 + core.3) / 2);
+    let mut movable: Vec<Movable> = Vec::new();
+
+    for i in 0..db.num_insts() {
+        let name = db.nth_inst_name(i);
+        let master = db.inst_master(&name);
+        let (x, y) = db.inst_location(&name);
+        let (w, h) = (db.master_get_width(&master) as i32, db.master_get_height(&master) as i32);
+        let mtype = db.master_get_type(&master).unwrap_or_default();
+        let fixed = db.inst_get_placement_status(&name) == "FIRM"
+            || db.inst_get_placement_status(&name) == "LOCKED"
+            || mtype.contains("BLOCK");
+
+        if fixed {
+            // ⛔ Step 2: fixed cells occupy pixels before anything is searched.
+            grid.paint(x - core.0, y - core.1, w, h, false);
+            continue;
+        }
+        // ⚠️ `master->isCore()` — pads, endcaps and cover cells are not the legalizer's business.
+        if !mtype.contains("CORE") {
+            continue;
+        }
+        let site = db.master_get_site(&master);
+        let area = w as i64 * h as i64;
+        let dist = ((x - center.0).abs() + (y - center.1).abs()) as i64;
+        // A cell taller than one grid row is multi-row.
+        let multi_row = grid.rows_spanned(y - core.1, h) > 1;
+        movable.push(Movable {
+            key: OrderKey { multi_row, area, center_dist: dist, name: name.clone() },
+            name, x: x - core.0, y: y - core.1, w, h, site,
+        });
+    }
+
+    movable.sort_by(|a, b| {
+        if place_before(&a.key, &b.key) { std::cmp::Ordering::Less }
+        else if place_before(&b.key, &a.key) { std::cmp::Ordering::Greater }
+        else { std::cmp::Ordering::Equal }
+    });
+
+    // `max_displacement_x_ = 500, max_displacement_y_ = 100` when the command passes 0.
+    let (max_dx, max_dy) = (500i64, 100i64);
+    let sw = grid.site_width as i64;
+    let row_y = grid.row_y.clone();
+    let dist_dbu = move |a: (i64, i64), b: (i64, i64)| -> i64 {
+        let ya = *row_y.get(a.1.max(0) as usize).unwrap_or(&0) as i64;
+        let yb = *row_y.get(b.1.max(0) as usize).unwrap_or(&0) as i64;
+        (a.0 - b.0).abs() * sw + (ya - yb).abs()
+    };
+
+    for m in &movable {
+        let gx = (m.x / grid.site_width) as i64;
+        let gy = grid.grid_y(m.y).map(|v| v as i64).unwrap_or(0);
+        let bounds = (
+            (gx - max_dx).max(0),
+            (gy - max_dy).max(0),
+            (gx + max_dx).min(grid.row_site_count as i64 - 1),
+            (gy + max_dy).min(grid.row_count as i64 - 1),
+        );
+        let cells_wide = (m.w + grid.site_width - 1) / grid.site_width;
+
+        let mut seated = None;
+        for (px, py) in diamond_points(gx, gy, bounds, &dist_dbu, 200_000) {
+            if grid.can_place(px, py, cells_wide as i64, m.h, &m.site) {
+                seated = Some((px, py));
+                break;
+            }
+        }
+        match seated {
+            Some((px, py)) => {
+                let nx = px as i32 * grid.site_width;
+                let ny = grid.row_y[py as usize];
+                grid.paint(nx, ny, m.w, m.h, true);
+                let orient = grid.site_orient_at(px, py, &m.site).unwrap_or_else(|| "R0".into());
+                out.placed.push(Placed {
+                    name: m.name.clone(),
+                    x: nx + core.0,
+                    y: ny + core.1,
+                    orient,
+                    moved: nx != m.x || ny != m.y,
+                });
+            }
+            None => out.failures.push(m.name.clone()),
+        }
+    }
+    Ok(out)
+}

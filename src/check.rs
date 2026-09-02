@@ -262,6 +262,8 @@ pub fn grid_facts(db: &Db) -> serde_json::Value {
         })
         .collect();
     serde_json::json!({
+        "core_area": [db.block_get_core_area_x_min(), db.block_get_core_area_y_min(),
+                      db.block_get_core_area_x_max(), db.block_get_core_area_y_max()],
         "num_rows": db.num_rows().unwrap_or(0),
         "site_width": site_width(db),
         "first_row_ys": ys,

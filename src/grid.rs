@@ -40,6 +40,8 @@ use vyges_opendb::Db;
 pub struct Pixel {
     /// A row covers this square, and no hard blockage has taken it away.
     pub is_valid: bool,
+    /// A cell sits here — upstream's `pixel->cell`, reduced to the one bit this engine reads.
+    pub occupied: bool,
     /// Bitmask of routing levels blocked here, `1 << level`.
     pub blocked_layers: u32,
 }
@@ -55,6 +57,8 @@ pub struct Grid {
     row_sites: Vec<Vec<(usize, usize, String)>>,
     /// Core-relative Y of each grid row boundary.
     pub row_y: Vec<i32>,
+    /// The orientation each grid row imposes on a cell placed in it.
+    pub row_orient: Vec<String>,
 }
 
 impl Grid {
@@ -116,6 +120,7 @@ impl Grid {
 
         let mut pixels = vec![vec![Pixel::default(); row_site_count]; row_count];
         let mut row_sites: Vec<Vec<(usize, usize, String)>> = vec![Vec::new(); row_count];
+        let mut row_orient: Vec<String> = vec!["R0".into(); row_count];
 
         for (x, y, count, site, _orient, _h) in &rows {
             let Some(&gy) = index_of.get(y) else { continue };
@@ -128,9 +133,11 @@ impl Grid {
                 pixels[gy][gx].is_valid = true;
             }
             row_sites[gy].push((x_start, x_end, site.clone()));
+            row_orient[gy] = _orient.clone();
         }
 
-        let mut g = Grid { core, site_width, row_count, row_site_count, pixels, row_sites, row_y };
+        let mut g = Grid { core, site_width, row_count, row_site_count, pixels, row_sites, row_y,
+                           row_orient };
         g.mark_blocked(db);
         Ok(g)
     }
@@ -198,6 +205,73 @@ impl Grid {
             .map(|v| v as i64 + 1)
             .unwrap_or(ylo + 1);
         (xlo, ylo, xhi, yhi)
+    }
+
+    /// `Grid::paintPixel` — mark the squares a cell occupies.
+    ///
+    /// ⚠️ Padding (`paintCellPadding`) is NOT applied; this engine does not implement padding, and
+    /// declares that rather than pretending the reservation exists.
+    pub fn paint(&mut self, x: i32, y: i32, w: i32, h: i32, _movable: bool) {
+        let (xlo, ylo, xhi, yhi) = self.covering(x, y, w, h);
+        if ylo < 0 {
+            return;
+        }
+        for gy in ylo.max(0)..yhi.min(self.row_count as i64) {
+            for gx in xlo.max(0)..xhi.min(self.row_site_count as i64) {
+                self.pixels[gy as usize][gx as usize].occupied = true;
+            }
+        }
+    }
+
+    /// `Opendp::checkPixels` — may a cell of `cells_wide` sites and `h` DBU sit at this square?
+    ///
+    /// Every square it would cover must exist, be **valid** and be **unoccupied**, and the FIRST
+    /// ROW must offer the cell's site.
+    ///
+    /// ⬜ Not checked here, and declared by the caller: group/region membership, one-site gaps,
+    /// padding reservations, and master symmetry.
+    pub fn can_place(&self, x: i64, y: i64, cells_wide: i64, h: i32, site: &str) -> bool {
+        if y < 0 || y as usize >= self.row_count || x < 0 {
+            return false;
+        }
+        let y_end = self.rows_spanned(self.row_y[y as usize], h) as i64 + y;
+        if x + cells_wide > self.row_site_count as i64 || y_end > self.row_count as i64 {
+            return false;
+        }
+        for gy in y..y_end {
+            for gx in x..x + cells_wide {
+                match self.pixel(gx, gy) {
+                    None => return false,
+                    Some(p) if !p.is_valid || p.occupied => return false,
+                    _ => {}
+                }
+            }
+            if gy == y && !self.site_valid_at(x, gy, site) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// How many grid rows a cell of height `h` starting at core-relative `y` spans.
+    ///
+    /// 🔑 Not `h / row_height`: grid rows are the distinct Y boundaries, so a hybrid design has
+    /// rows of differing heights and the answer depends on WHERE the cell starts.
+    pub fn rows_spanned(&self, y: i32, h: i32) -> usize {
+        let Some(lo) = self.grid_y(y) else { return 1 };
+        let hi = self.grid_y(y + h - 1).unwrap_or(lo);
+        hi - lo + 1
+    }
+
+    /// The orientation the row at this square imposes — `placeCell` writes it onto the cell.
+    pub fn site_orient_at(&self, x: i64, y: i64, site: &str) -> Option<String> {
+        if y < 0 || y as usize >= self.row_count {
+            return None;
+        }
+        self.row_sites[y as usize]
+            .iter()
+            .find(|(lo, hi, s)| (x as usize) >= *lo && (x as usize) < *hi && s == site)
+            .map(|(_, _, _)| self.row_orient[y as usize].clone())
     }
 
     /// How many squares are usable — the number a legal placement has to fit into.
