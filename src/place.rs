@@ -301,7 +301,18 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         }
         let site = db.master_get_site(&master);
         let area = w as i64 * h as i64;
-        let dist = ((x - center.0).abs() + (y - center.1).abs()) as i64;
+        // ⛔ **Transcribed exactly, including the frame mismatch.** `CellPlaceOrderLess` computes
+        // `abs(cell->getLeft() - center_x_)` where `getLeft()` is CORE-RELATIVE (see
+        // `updateDbInstLocations`, which adds `core_.xMin()` back) while `center_x_` is the
+        // ABSOLUTE core centre. So it ranks by distance from a point that is not the core centre
+        // in either frame.
+        //
+        // ⚠️ **Do not "correct" this.** It is deterministic and it decides the order cells claim
+        // sites in, so the ranking IS the behaviour. Using the absolute position on both sides —
+        // which is what this line did first — gives a different order and cascades: measured on
+        // `gcd`, 265 of 549 cells landed elsewhere, 114 of them with a flipped orientation
+        // because they had moved to a row of the opposite parity.
+        let dist = ((x - core.0 - center.0).abs() + (y - core.1 - center.1).abs()) as i64;
         // A cell taller than one grid row is multi-row.
         let multi_row = grid.rows_spanned(y - core.1, h) > 1;
         movable.push(Movable {
