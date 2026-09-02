@@ -20,6 +20,59 @@
 //! sequence is recorded in `vyges-tools-internal/docs/openroad/dpl/negotiation-legalizer.md` so
 //! the next pass builds from a read reference rather than re-reading 2,315 lines.
 
+/// Which instances enter the negotiation model — `initFromDb`'s filter.
+///
+/// ⛔ Two exclusions, both load-bearing:
+///
+/// - **`dbPlacementStatus::NONE`** — never placed at all, so there is no position to negotiate
+///   from;
+/// - **`!isCoreAutoPlaceable()`** — pads and blocks, which are absent from the `Opendp` network,
+///   so DRC and legality checks cannot be run on them. ⚠️ They are NOT ignored: `setFixedGridCells`
+///   paints them separately, so they still block sites.
+pub fn enters_model(placement_status: &str, core_auto_placeable: bool) -> bool {
+    placement_status != "NONE" && core_auto_placeable
+}
+
+/// A cell's width in SITES — `initFromDb`'s sizing.
+///
+/// ⛔ **`round(width / site_width)`, floored at 1 — NOT `divCeil`.** `Grid::gridWidth` uses
+/// `divCeil`, so the two disagree for a cell whose width is a fraction of a site below a whole
+/// number: 1.4 sites rounds to 1 and ceils to 2.
+///
+/// ⚠️ Transcribed as-is. The negotiation model measures congestion in its own grid, and using the
+/// wider `divCeil` here would make cells claim a site they do not occupy — inventing overuse that
+/// the algorithm would then work to resolve.
+pub fn cell_width_in_sites(master_width: i64, site_width: i64) -> i32 {
+    if site_width <= 0 {
+        return 1;
+    }
+    (1).max((master_width as f64 / site_width as f64).round() as i32)
+}
+
+/// The starting grid position — `gridX` for x, **`gridRoundY`** for y, then clamped.
+///
+/// ⚠️ **`x` FLOORS and `y` ROUNDS.** `diamondDPL`'s `legalGridPt` snaps y DOWN instead; this
+/// legalizer takes the nearest row. A cell sitting just below a row boundary therefore starts one
+/// row higher here than it would there.
+///
+/// 🔑 The clamp uses `grid_w - width` and `grid_h - height`, not `grid_w`/`grid_h`, so the whole
+/// footprint stays on the grid rather than just the origin.
+pub fn init_position(
+    x_dbu: i64, y_dbu: i64, core_x: i64, core_y: i64, site_width: i64,
+    row_y: &[i32], width: i32, height: i32, grid_w: i32, grid_h: i32,
+) -> (i32, i32) {
+    let gx = ((x_dbu - core_x) as f64 / site_width as f64).floor() as i32;
+    let rel_y = (y_dbu - core_y) as i32;
+    // `gridRoundY` — the NEAREST row boundary.
+    let gy = row_y
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, ry)| (**ry - rel_y).abs())
+        .map(|(i, _)| i as i32)
+        .unwrap_or(0);
+    (gx.clamp(0, (grid_w - width).max(0)), gy.clamp(0, (grid_h - height).max(0)))
+}
+
 /// `updateHistoryCosts` — make contested squares more expensive for the next iteration.
 ///
 /// For every square under an active cell, **deduped so a square shared by several cells is bumped
@@ -1006,6 +1059,40 @@ mod tests {
         assert_eq!(consts::DRC_PENALTY, 5.0);
         // ⚠️ INT_MAX/2, not an arbitrary large number: costs are compared against it.
         assert_eq!(consts::INF_COST, 1_073_741_823.0);
+    }
+
+    #[test]
+    fn unplaced_and_non_core_instances_stay_out_of_the_model() {
+        assert!(enters_model("PLACED", true));
+        assert!(enters_model("FIRM", true));
+        assert!(!enters_model("NONE", true), "never placed: nothing to negotiate from");
+        assert!(!enters_model("PLACED", false), "a pad or block is painted, not negotiated");
+    }
+
+    #[test]
+    fn cell_width_rounds_rather_than_ceils() {
+        // ⛔ The difference from Grid::gridWidth, which uses divCeil.
+        assert_eq!(cell_width_in_sites(140, 100), 1, "1.4 sites rounds DOWN to 1");
+        assert_eq!(cell_width_in_sites(160, 100), 2, "1.6 rounds up");
+        assert_eq!(cell_width_in_sites(200, 100), 2, "exactly 2");
+        assert_eq!(cell_width_in_sites(10, 100), 1, "never below one site");
+    }
+
+    #[test]
+    fn the_start_position_floors_x_and_rounds_y() {
+        // Rows every 10 units; the cell sits at y=17, nearer row 2 (y=20) than row 1 (y=10).
+        let rows = [0, 10, 20, 30];
+        let (gx, gy) = init_position(255, 17, 0, 0, 100, &rows, 1, 1, 100, 4);
+        assert_eq!(gx, 2, "x floors: 2.55 sites -> 2");
+        assert_eq!(gy, 2, "y takes the NEAREST row, not the one below");
+    }
+
+    #[test]
+    fn the_clamp_keeps_the_whole_footprint_on_the_grid() {
+        // 🔑 grid_w - width, not grid_w: a 3-site cell may not start on the last column.
+        let rows = [0, 10];
+        let (gx, _) = init_position(10_000, 0, 0, 0, 100, &rows, 3, 1, 10, 2);
+        assert_eq!(gx, 7, "10 - 3, so the footprint ends exactly at the edge");
     }
 
     #[test]
