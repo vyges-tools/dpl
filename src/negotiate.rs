@@ -29,6 +29,10 @@
 /// cells swap into each other's square forever. History remembers which squares keep being fought
 /// over and prices them out, so the contest resolves instead of repeating.
 ///
+/// ⚠️ **A mutation that does not COMPILE proves nothing.** Deleting the dedupe outright leaves
+/// `seen` unused and the build fails — which prints no test results at all, and reads at a glance
+/// exactly like a clean run. The honest mutation keeps `seen.insert(pid)` and drops only the skip.
+///
 /// ⚠️ **Only squares with `overuse > 0` are bumped.** A square that is merely occupied is not
 /// contested, and raising its price would penalise a cell for sitting somewhere legal.
 pub fn update_history_costs(pixels: &mut [NegPixel], footprints: &[Vec<usize>]) {
