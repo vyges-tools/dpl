@@ -327,8 +327,8 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     };
 
     for m in &movable {
-        let gx = (m.x / grid.site_width) as i64;
-        let gy = grid.grid_y(m.y).map(|v| v as i64).unwrap_or(0);
+        // `legalGridPt(cell, padded)` — clamp into the core and round, THEN search from there.
+        let (gx, gy) = grid.legal_start(m.x, m.y, m.w, m.h);
         let bounds = (
             (gx - max_dx).max(0),
             (gy - max_dy).max(0),

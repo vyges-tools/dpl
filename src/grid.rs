@@ -190,6 +190,36 @@ impl Grid {
             .any(|(lo, hi, s)| (x as usize) >= *lo && (x as usize) < *hi && s == site)
     }
 
+    /// `Opendp::legalPt(cell, pt)` — clamp a wanted position into the core, then ROUND it to the
+    /// nearest site and row.
+    ///
+    /// ⛔ **Not an optional refinement — without it an UNPLACED cell never enters the grid.** A
+    /// cell the DEF leaves at `(0,0)` is at core-relative `(-core.x, -core.y)`, so the diamond
+    /// search starts outside its own bounds, every neighbour is rejected by the bounds test, and
+    /// the cell reports as unplaceable on a design with an empty row waiting for it. Measured on
+    /// `simple01`.
+    ///
+    /// ⚠️ **ROUND, not floor** (`divRound`, `gridRoundY`). Flooring biases every clamped cell one
+    /// site to the left, which is invisible on a design where the site happens to be free and a
+    /// wrong answer where it is not.
+    pub fn legal_start(&self, x: i32, y: i32, w: i32, h: i32) -> (i64, i64) {
+        let max_x = self.row_site_count as i32 * self.site_width - w;
+        let cx = x.clamp(0, max_x.max(0));
+        let gx = ((cx as f64) / self.site_width as f64).round() as i64;
+        let core_dy = self.core.3 - self.core.1;
+        let cy = y.clamp(0, (core_dy - h).max(0));
+        // Nearest row boundary, which is `gridRoundY`.
+        let gy = self
+            .row_y
+            .iter()
+            .take(self.row_count.max(1))
+            .enumerate()
+            .min_by_key(|(_, ry)| (**ry - cy).abs())
+            .map(|(i, _)| i as i64)
+            .unwrap_or(0);
+        (gx.clamp(0, self.row_site_count as i64 - 1), gy)
+    }
+
     /// The grid row index a core-relative Y sits in, if any.
     pub fn grid_y(&self, y: i32) -> Option<usize> {
         (0..self.row_count).find(|&i| self.row_y[i] <= y && y < self.row_y[i + 1])
