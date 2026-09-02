@@ -36,6 +36,101 @@ pub struct NegCell {
     pub legal: bool,
 }
 
+/// The negotiation grid — `NegotiationLegalizer::buildGrid`.
+///
+/// Built by resetting every square, then blockading the fixed cells:
+///
+/// ```text
+/// capacity  = is_valid ? 1 : 0      usage = 0      hist_cost = 1.0
+/// row_has_sites[y] = any square in row y has capacity > 0
+/// for each FIXED cell footprint:  capacity = 0,  usage = 1
+/// ```
+///
+/// ⛔ **A fixed cell sets `capacity = 0`, not merely `usage = 1`.** It is a hard blockage, so
+/// `negotiation_cost` returns `INF_COST` there — a movable cell can never be considered for that
+/// square, however cheap the displacement. Recording only the usage would make a fixed cell look
+/// like a single overlap that negotiation could bargain away.
+///
+/// ⚠️ **`hist_cost` starts at 1.0, not 0.** The cost is `hist_cost * (usage + 1) / capacity`, so a
+/// zero start would make every square free on the first iteration and the whole congestion term
+/// inert until something bumped it.
+///
+/// ℹ️ **Footprint only — padding is left to `PlacementDRC`**, which knows both masters and can
+/// apply class-pair rules that a plain capacity cannot express.
+pub struct NegGrid {
+    pub width: usize,
+    pub height: usize,
+    pixels: Vec<NegPixel>,
+    row_has_sites: Vec<bool>,
+}
+
+impl NegGrid {
+    /// `valid(x, y)` is the `dpl` Grid's `is_valid` for that square.
+    pub fn build(width: usize, height: usize, valid: &dyn Fn(usize, usize) -> bool) -> NegGrid {
+        let mut pixels = vec![NegPixel::default(); width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let p = &mut pixels[y * width + x];
+                p.capacity = if valid(x, y) { 1 } else { 0 };
+                p.usage = 0;
+                p.hist_cost = 1.0;
+            }
+        }
+        let mut g = NegGrid { width, height, pixels, row_has_sites: vec![false; height] };
+        g.recompute_rows();
+        g
+    }
+
+    fn recompute_rows(&mut self) {
+        for y in 0..self.height {
+            self.row_has_sites[y] = (0..self.width).any(|x| self.at(x, y).capacity > 0);
+        }
+    }
+
+    /// Blockade a fixed cell's footprint: `capacity = 0`, `usage = 1`.
+    pub fn blockade(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        for dy in 0..h {
+            for dx in 0..w {
+                let (gx, gy) = (x + dx, y + dy);
+                if gx < 0 || gy < 0 || gx as usize >= self.width || gy as usize >= self.height {
+                    continue;
+                }
+                let p = &mut self.pixels[gy as usize * self.width + gx as usize];
+                p.capacity = 0;
+                p.usage = 1;
+            }
+        }
+        self.recompute_rows();
+    }
+
+    pub fn at(&self, x: usize, y: usize) -> &NegPixel {
+        &self.pixels[y * self.width + x]
+    }
+
+    /// ⚠️ A row with no usable square at all — `isValidRow` rejects any cell spanning it.
+    pub fn row_has_sites(&self, y: i32) -> bool {
+        y >= 0 && (y as usize) < self.height && self.row_has_sites[y as usize]
+    }
+
+    /// `addUsage(cell, delta)` over a footprint.
+    pub fn add_usage(&mut self, x: i32, y: i32, w: i32, h: i32, delta: i32) {
+        for dy in 0..h {
+            for dx in 0..w {
+                let (gx, gy) = (x + dx, y + dy);
+                if gx < 0 || gy < 0 || gx as usize >= self.width || gy as usize >= self.height {
+                    continue;
+                }
+                self.pixels[gy as usize * self.width + gx as usize].usage += delta;
+            }
+        }
+    }
+
+    /// Total overuse across the grid — zero is what the negotiation converges to.
+    pub fn total_overuse(&self) -> i32 {
+        self.pixels.iter().map(|p| p.overuse()).sum()
+    }
+}
+
 /// One square of the negotiation grid.
 ///
 /// 🔑 `usage` is what makes this "negotiated": a site may be claimed by more than one cell, and the
@@ -45,15 +140,17 @@ pub struct NegCell {
 pub struct NegPixel {
     pub usage: i32,
     pub hist_cost: f64,
-    pub valid: bool,
+    /// 1 for a usable square, 0 for a blockage or a fixed cell's footprint.
+    pub capacity: i32,
 }
 
 impl NegPixel {
     /// Sites claimed beyond the one the square can serve.
     ///
-    /// ⚠️ **A fixed cell makes `usage` 1 with no cell negotiating for it**, so `overuse` is
-    /// `max(0, usage - 1)` rather than `usage > 0`. Treating any usage as overuse would report a
-    /// legal design as fully congested.
+    /// ⚠️ **One cell per square is not overuse** — `max(0, usage - 1)`, not `usage > 0`. A fixed
+    /// cell's square carries `usage = 1` (and `capacity = 0`), and a legally placed movable cell
+    /// carries 1 too; treating any usage as overuse would report a legal design as fully
+    /// congested and the negotiation would never terminate.
     pub fn overuse(&self) -> i32 {
         (self.usage - 1).max(0)
     }
@@ -357,6 +454,57 @@ mod tests {
         assert_eq!(is_cell_legal(false, Legality::Legal, [].into_iter()), Legality::OffDie);
         assert_eq!(is_cell_legal(true, Legality::RowRejectsSite, [].into_iter()),
                    Legality::RowRejectsSite);
+    }
+
+    #[test]
+    fn a_fixed_cell_is_a_blockage_not_an_overlap() {
+        // ⛔ The distinction that decides whether negotiation can bargain a site away.
+        let mut g = NegGrid::build(4, 2, &|_, _| true);
+        g.blockade(1, 0, 2, 1);
+        assert_eq!(g.at(1, 0).capacity, 0, "a fixed footprint has NO capacity");
+        assert_eq!(g.at(1, 0).usage, 1);
+        assert_eq!(g.at(0, 0).capacity, 1, "its neighbour is untouched");
+        // And the cost model refuses it outright rather than pricing it.
+        let c = negotiation_cost([Some((g.at(1, 0).usage, g.at(1, 0).capacity, 1.0))].into_iter(),
+                                 0.0, INF_COST);
+        assert!(c >= INF_COST, "a blockade must be unusable, not merely expensive");
+    }
+
+    #[test]
+    fn history_starts_at_one_so_the_congestion_term_is_live_immediately() {
+        // ⚠️ At 0 the whole term would be inert until something bumped it.
+        let g = NegGrid::build(2, 1, &|_, _| true);
+        assert_eq!(g.at(0, 0).hist_cost, 1.0);
+        assert_eq!(negotiation_cost([Some((0, 1, g.at(0, 0).hist_cost))].into_iter(), 0.0,
+                                    INF_COST), 1.0);
+    }
+
+    #[test]
+    fn a_row_with_no_usable_square_has_no_sites() {
+        // Row 1 is entirely invalid; a cell may not span it.
+        let g = NegGrid::build(3, 2, &|_, y| y == 0);
+        assert!(g.row_has_sites(0));
+        assert!(!g.row_has_sites(1));
+        assert!(!g.row_has_sites(-1), "off the grid is not a row with sites");
+    }
+
+    #[test]
+    fn blockading_a_whole_row_removes_it() {
+        let mut g = NegGrid::build(2, 1, &|_, _| true);
+        assert!(g.row_has_sites(0));
+        g.blockade(0, 0, 2, 1);
+        assert!(!g.row_has_sites(0), "every square blocked means the row is gone");
+    }
+
+    #[test]
+    fn usage_tracks_rip_up_and_place() {
+        let mut g = NegGrid::build(4, 1, &|_, _| true);
+        g.add_usage(0, 0, 2, 1, 1);
+        assert_eq!(g.total_overuse(), 0, "one cell over two squares is not overuse");
+        g.add_usage(1, 0, 2, 1, 1);
+        assert_eq!(g.total_overuse(), 1, "the shared square is overused by one");
+        g.add_usage(1, 0, 2, 1, -1); // rip up
+        assert_eq!(g.total_overuse(), 0);
     }
 
     #[test]
