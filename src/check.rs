@@ -60,7 +60,7 @@ impl Report {
 /// The families this engine cannot yet evaluate. Named so `not_checked` is never empty by
 /// accident: a checker that quietly stops checking is the `vacuous` class.
 pub const NOT_CHECKED: &[&str] = &[
-    "in_rows", "region_placement", "padding", "edge_spacing", "blocked_layers", "one_site_gap",
+    "region_placement", "padding", "edge_spacing", "blocked_layers", "one_site_gap",
 ];
 
 /// The rectangle a cell occupies, in DBU: `(x, y, w, h)`.
@@ -114,6 +114,32 @@ fn site_width(db: &Db) -> i64 {
         .unwrap_or(0)
 }
 
+/// `Opendp::checkInRows` — every square the cell covers must be a valid row square, and the
+/// cell's site must be one the first row it sits in actually offers.
+///
+/// ⚠️ **The site check applies to the FIRST ROW ONLY** (`first_row = (y == grid_rect.ylo)`), not
+/// to every row a multi-height cell spans. Applying it to all of them rejects legal multi-row
+/// cells whose upper rows offer a different site.
+fn check_in_rows(g: &crate::grid::Grid, x: i32, y: i32, w: i32, h: i32, site: &str) -> bool {
+    let (xlo, ylo, xhi, yhi) = g.covering(x, y, w, h);
+    if ylo < 0 {
+        return false;
+    }
+    for gy in ylo..yhi {
+        for gx in xlo..xhi {
+            match g.pixel(gx, gy) {
+                None => return false,               // outside the core
+                Some(p) if !p.is_valid => return false,
+                _ => {}
+            }
+            if gy == ylo && !g.site_valid_at(gx, gy, site) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Run the legality check.
 pub fn check_placement(db: &Db) -> Report {
     let ys = row_ys(db);
@@ -129,8 +155,14 @@ pub fn check_placement(db: &Db) -> Report {
     let boxes: Vec<(String, (i64, i64, i64, i64), bool)> =
         insts.iter().map(|i| (i.clone(), cell_box(db, i), is_block(i))).collect();
 
-    let mut out = Report { not_checked: NOT_CHECKED.iter().map(|s| s.to_string()).collect(),
-                           ..Default::default() };
+    // ⚠️ A design the grid cannot be built for is not a clean design: `in_rows` goes back into
+    // `not_checked` and says why, rather than being silently skipped.
+    let grid = crate::grid::Grid::build(db);
+    let mut not_checked: Vec<String> = NOT_CHECKED.iter().map(|s| s.to_string()).collect();
+    if let Err(ref why) = grid {
+        not_checked.push(format!("in_rows (grid unavailable: {why})"));
+    }
+    let mut out = Report { not_checked, ..Default::default() };
 
     // ⛔ **A site-align failure removes the cell from the overlap comparison ENTIRELY**, and that
     // is a side effect of upstream's `continue`, not a separate rule. `checkOverlap` is what paints
@@ -158,6 +190,17 @@ pub fn check_placement(db: &Db) -> Report {
                 out.failures.push(Failure { family: "site_align".into(), cell: name.clone(),
                                             with: None });
                 continue;
+            }
+        }
+
+        if let Ok(ref g) = grid {
+            if !*blk {
+                let site = db.master_get_site(&db.inst_master(name));
+                if !check_in_rows(g, bx.0 as i32 - g.core.0, bx.1 as i32 - g.core.1,
+                                  bx.2 as i32, bx.3 as i32, &site) {
+                    out.failures.push(Failure { family: "in_rows".into(), cell: name.clone(),
+                                                with: None });
+                }
             }
         }
 

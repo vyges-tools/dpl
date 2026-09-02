@@ -14,6 +14,7 @@
 //! scoping estimate recorded before the source was read predicted the risk was "the `Grid`/
 //! `Padding` model rather than the search" — that is now confirmed rather than assumed.
 pub mod check;
+pub mod grid;
 
 /// This crate's version, as Cargo knows it — the single number the whole suite is released on.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -18,12 +18,12 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
     "SCOPE: `check-placement` only. `detailed_placement` (legalization) is NOT implemented, so this engine reports whether a placement is legal and never makes one legal.",
-    "THREE of upstream's NINE check families are evaluated: site alignment, placed, and overlap. The six not evaluated are named in the report's `not_checked` field on every run -- in_rows, region_placement, padding, edge_spacing, blocked_layers and one_site_gap -- because a clean verdict from a partial checker must not read as a complete one. Those six need the Grid/Pixel model, Padding, or PlacementDRC.",
+    "FOUR of upstream's NINE check families are evaluated: site alignment, placed, overlap and in_rows. The five not evaluated are named in the report's `not_checked` field on every run -- region_placement, padding, edge_spacing, blocked_layers and one_site_gap -- because a clean verdict from a partial checker must not read as a complete one. Those five need regions, Padding or PlacementDRC; the Grid they also need is built.",
     "Site alignment is CORE-RELATIVE: upstream compares `cell->getLeft() % siteWidth` where getLeft() is relative to core_.xMin(). Measured on aes.defok, reading it as an absolute coordinate reports every one of 21340 cells misaligned on a design the reference calls clean.",
     "A site-alignment failure removes the cell from the overlap comparison entirely. That is a side effect of upstream's `continue`, not a separate rule: checkOverlap is what paints a cell into its pixels, so a cell that was skipped is never there for a later cell to collide with.",
     "The OVERLAP ACCELERATION differs from upstream deliberately: a rectangle sweep here, a pixel walk there. The predicate is identical and the failing SET matches, but which partner is reported can differ, because upstream reports whichever cell already owns the pixel and that depends on visit order.",
     "status is one of clean, violations, vacuous or error. VACUOUS IS NOT CLEAN: it means the run examined no cell, and a design with no instances is an absent placement rather than a legal one.",
-    "Correlated at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c in both directions: aes.defok gives 21340 cells and 0 violations against the reference's clean verdict, and cell_on_block1.def gives 4 site-align failures against the reference's `Site aligned check failed (4)`."
+    "Correlated at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c in both directions on three designs: aes.defok gives 21340 cells and 0 violations against the reference's clean verdict; cell_on_block1.def gives 4 site-align failures against `Site aligned check failed (4)`; fragmented_row04.def gives 1 in_rows failure against `Placed in rows check failed (1)`."
   ],
   "invocation": {
     "args_template": ["check-placement", "{odb}"],
@@ -53,8 +53,8 @@ USAGE:
    and upstream's suite calls `check_placement` in 77 of 92 cases against 68 for
    `detailed_placement`.
 
-⚠️ Three of upstream's nine check families are evaluated (site alignment, placed, overlap).
-   The other six are reported in `not_checked` rather than passed over in silence.
+⚠️ Four of upstream's nine check families are evaluated (site alignment, placed, overlap,
+   in rows). The other five are reported in `not_checked` rather than passed over in silence.
 ";
 
 fn main() -> ExitCode {
