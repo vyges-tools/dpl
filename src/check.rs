@@ -252,6 +252,14 @@ mod tests {
 /// ⚠️ Exists because the first run of that check reported EVERY cell misaligned on a design the
 /// reference calls clean. A wrong site width or an empty row set produces exactly that, and both
 /// look identical from the failure list.
+fn status_counts(db: &Db) -> std::collections::BTreeMap<String, usize> {
+    let mut c: std::collections::BTreeMap<String, usize> = Default::default();
+    for i in 0..db.num_insts() {
+        *c.entry(db.inst_get_placement_status(&db.nth_inst_name(i))).or_default() += 1;
+    }
+    c
+}
+
 pub fn grid_facts(db: &Db) -> serde_json::Value {
     let ys: Vec<i64> = row_ys(db).into_iter().take(5).collect();
     let sample: Vec<serde_json::Value> = (0..db.num_insts().min(3))
@@ -265,6 +273,7 @@ pub fn grid_facts(db: &Db) -> serde_json::Value {
         "core_area": [db.block_get_core_area_x_min(), db.block_get_core_area_y_min(),
                       db.block_get_core_area_x_max(), db.block_get_core_area_y_max()],
         "num_rows": db.num_rows().unwrap_or(0),
+        "placement_statuses": status_counts(db),
         "site_width": site_width(db),
         "first_row_ys": ys,
         "row_x_origins": (0..db.num_rows().unwrap_or(0))

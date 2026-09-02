@@ -225,16 +225,47 @@ impl Grid {
         (0..self.row_count).find(|&i| self.row_y[i] <= y && y < self.row_y[i + 1])
     }
 
-    /// `Grid::gridCovering` for a cell's box, in core-relative DBU.
+    /// The grid squares a cell occupies — upstream's `gridX(cell)` / `gridWidth(cell)` pair.
+    ///
+    /// ⛔ **`x_end` is `floor(x / site_width) + ceil(w / site_width)`, NOT `ceil((x + w) /
+    /// site_width)`.** The two agree when `x` is site-aligned and differ by one column when it is
+    /// not — and FIXED cells frequently are not.
+    ///
+    /// ⚠️ **Measured on `gcd`:** the wider form over-paints every unaligned fixed cell by a
+    /// column, making sites unavailable that upstream leaves free, so movable cells get pushed one
+    /// site right. `+380` — exactly one site — was the single most common disagreement, 62 cells.
+    ///
+    /// 🔑 `y_end` is likewise measured from the SNAPPED row's Y (`gridEndY(gridYToDbu(grid_y) +
+    /// height)`), not from the cell's raw `y`.
     pub fn covering(&self, x: i32, y: i32, w: i32, h: i32) -> (i64, i64, i64, i64) {
-        let xlo = (x / self.site_width) as i64;
-        let xhi = ((x + w + self.site_width - 1) / self.site_width) as i64;
-        let ylo = self.grid_y(y).map(|v| v as i64).unwrap_or(-1);
-        let yhi = self
-            .grid_y(y + h - 1)
-            .map(|v| v as i64 + 1)
-            .unwrap_or(ylo + 1);
+        let xlo = (x.div_euclid(self.site_width)) as i64;
+        let xhi = xlo + ((w + self.site_width - 1) / self.site_width).max(1) as i64;
+        let ylo = match self.grid_snap_down_y(y) {
+            Some(v) => v as i64,
+            None => return (xlo, -1, xhi, -1),
+        };
+        // From the snapped row's own Y, as `gridEndY` does.
+        let top = self.row_y[ylo as usize] + h;
+        let yhi = (0..=self.row_count)
+            .find(|&i| self.row_y.get(i).copied().unwrap_or(i32::MAX) >= top)
+            .map(|v| v as i64)
+            .unwrap_or(self.row_count as i64)
+            .max(ylo + 1);
         (xlo, ylo, xhi, yhi)
+    }
+
+    /// `Grid::gridSnapDownY` — the row a core-relative Y falls in, snapping DOWN.
+    ///
+    /// ⚠️ Below the first row it clamps to 0 rather than answering `None`: upstream's
+    /// `gridSnapDownY` returns an index, and a fixed cell hanging below the core still paints.
+    pub fn grid_snap_down_y(&self, y: i32) -> Option<usize> {
+        if self.row_count == 0 {
+            return None;
+        }
+        if y < self.row_y[0] {
+            return Some(0);
+        }
+        (0..self.row_count).rev().find(|&i| self.row_y[i] <= y)
     }
 
     /// `Grid::paintPixel` — mark the squares a cell occupies.
