@@ -415,7 +415,12 @@ pub fn grid_facts(db: &Db) -> serde_json::Value {
         .map(|i| {
             let n = db.nth_inst_name(i);
             let (x, y) = db.inst_location(&n);
-            serde_json::json!({"inst": n, "x": x, "y": y, "master": db.inst_master(&n)})
+            let m = db.inst_master(&n);
+            // 🔑 The SITE, because every row-legality test keys on it: a master whose site no
+            // row carries can never be seated, and nothing in a position reveals that.
+            serde_json::json!({"inst": n, "x": x, "y": y, "master": m.clone(),
+                               "site": db.master_get_site(&m),
+                               "height": db.master_get_height(&m)})
         })
         .collect();
     serde_json::json!({
@@ -431,6 +436,11 @@ pub fn grid_facts(db: &Db) -> serde_json::Value {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter().take(4).collect::<Vec<_>>(),
         "row_count_distinct_y": row_ys(db).len(),
+        // The distinct sites the ROWS offer, which is what a master's site must match.
+        "row_sites": (0..db.num_rows().unwrap_or(0))
+            .filter_map(|i| db.nth_row(i).ok().flatten())
+            .map(|(_, site, _)| site)
+            .collect::<std::collections::BTreeSet<_>>(),
         // 🔑 The GRID's own dimensions, not the database's. They are what every placement
         // decision is clamped against, and a diagnostic that reports only the DEF cannot show a
         // grid that came out the wrong size.
