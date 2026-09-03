@@ -88,6 +88,11 @@ pub struct Grid {
     pub row_orient: Vec<String>,
     /// Whether `mark_blocked_layers` found any special wire to record.
     blocked_layers_populated: bool,
+    /// The SITE height of every row in the block, in the order the rows were read.
+    ///
+    /// ⛔ Kept because `uniform_row_height_` is derived from SITE heights, not from the spacing
+    /// between grid-row boundaries. The two are different questions and give different answers.
+    site_heights: Vec<i32>,
 }
 
 impl Grid {
@@ -166,7 +171,8 @@ impl Grid {
         }
 
         let mut g = Grid { core, site_width, row_count, row_site_count, pixels, row_sites, row_y,
-                           row_orient, blocked_layers_populated: false };
+                           row_orient, blocked_layers_populated: false,
+                           site_heights: rows.iter().map(|r| r.5 as i32).collect() };
         g.mark_blocked(db);
         g.mark_blocked_layers(db);
         Ok(g)
@@ -486,13 +492,39 @@ impl Grid {
         }
     }
 
-    /// The row height, if every row in the grid has the same one.
+    /// `Grid::uniform_row_height_` — the row height the design reduces to, if it has one.
     ///
-    /// ⚠️ `None` for a hybrid-row design, which is what selects the ROWPATTERN branch above.
+    /// ⛔ **NOT "every row is the same height".** Upstream folds the row SITE heights pairwise:
+    /// keep the SMALLER when the larger is an exact multiple of it, and give up otherwise. So a
+    /// design mixing 2800-tall and 5600-tall rows IS uniform, at **2800** — the double-height
+    /// rows are a whole number of single rows.
+    ///
+    /// ⚠️ **And it is computed from SITE heights, not from the spacing between grid-row
+    /// boundaries.** Those are different questions: boundaries come from every row's origin AND
+    /// top, so two overlapping row stacks can produce even spacing from sites that do not divide
+    /// each other, and uneven spacing from sites that do.
+    ///
+    /// 🔑 `None` is what selects the ROWPATTERN branch in [`Grid::grid_height`] and upstream's
+    /// `isMultiHeight`, so getting this wrong silently changes how tall every master is thought
+    /// to be.
     pub fn uniform_row_height(&self) -> Option<i32> {
-        let mut heights = self.row_y.windows(2).map(|w| w[1] - w[0]);
-        let first = heights.next()?;
-        if heights.all(|h| h == first) { Some(first) } else { None }
+        let mut acc: Option<i32> = None;
+        for &h in &self.site_heights {
+            if h <= 0 {
+                continue;
+            }
+            acc = match acc {
+                None => Some(h),
+                Some(prev) => {
+                    let (smaller, larger) = (prev.min(h), prev.max(h));
+                    if larger % smaller != 0 {
+                        return None; // not uniform, and upstream stops looking
+                    }
+                    Some(smaller)
+                }
+            };
+        }
+        acc
     }
 
     /// How many grid rows a cell of height `h` starting at core-relative `y` spans.
@@ -539,6 +571,7 @@ mod padding_paint_tests {
             row_y: vec![0, 10],
             row_orient: vec!["R0".to_string()],
             blocked_layers_populated: false,
+            site_heights: vec![10],
         }
     }
 
@@ -603,6 +636,7 @@ mod grid_height_tests {
             row_y: (0..=rows).map(|i| i as i32 * pitch).collect(),
             row_orient: vec!["R0".to_string(); rows],
             blocked_layers_populated: false,
+            site_heights: vec![pitch; rows],
         }
     }
 
@@ -627,9 +661,10 @@ mod grid_height_tests {
 
     #[test]
     fn hybrid_rows_use_the_pattern_length_not_a_division() {
-        // Rows of 2800 then 1400, alternating — no uniform height.
+        // ⛔ Sites of 2800 and 1800: 2800 % 1800 != 0, so the reduction gives up. Heights that
+        // DIVIDE — 2800 and 5600 — would still be uniform, at 2800.
         let mut g = uniform(2800, 4);
-        g.row_y = vec![0, 2800, 4200, 7000, 8400];
+        g.site_heights = vec![2800, 1800];
         assert_eq!(g.uniform_row_height(), None);
         // ⛔ The pattern's length IS the answer; the master height is not consulted at all.
         assert_eq!(g.grid_height(999999, 3), 3);
@@ -661,6 +696,7 @@ mod site_orientation_tests {
             // returned for every master in the row.
             row_orient: vec!["N".to_string()],
             blocked_layers_populated: false,
+            site_heights: vec![10],
         }
     }
 
@@ -687,5 +723,50 @@ mod site_orientation_tests {
         assert_eq!(g.site_orient_at(1, 0, "S"), None, "below the interval");
         assert_eq!(g.site_orient_at(2, 0, "S").as_deref(), Some("FS"), "lo is inclusive");
         assert_eq!(g.site_orient_at(5, 0, "S"), None, "hi is EXCLUSIVE");
+    }
+}
+
+#[cfg(test)]
+mod uniform_row_height_tests {
+    fn with_site_heights(hs: Vec<i32>) -> super::Grid {
+        super::Grid {
+            core: (0, 0, 100, 100), site_width: 10, row_count: 1, row_site_count: 10,
+            pixels: vec![vec![super::Pixel::default(); 10]],
+            row_sites: vec![vec![]], row_y: vec![0, 10],
+            row_orient: vec!["R0".to_string()], blocked_layers_populated: false,
+            site_heights: hs,
+        }
+    }
+
+    #[test]
+    fn heights_that_divide_are_uniform_at_the_smaller_one() {
+        // ⛔ NOT "all rows equal". A design mixing single- and double-height rows is uniform.
+        assert_eq!(with_site_heights(vec![2800, 5600]).uniform_row_height(), Some(2800));
+        assert_eq!(with_site_heights(vec![5600, 2800]).uniform_row_height(), Some(2800),
+                   "and the order it meets them in does not matter");
+        assert_eq!(with_site_heights(vec![2800, 5600, 8400]).uniform_row_height(), Some(2800));
+    }
+
+    #[test]
+    fn heights_that_do_not_divide_are_not_uniform() {
+        assert_eq!(with_site_heights(vec![2800, 1800]).uniform_row_height(), None);
+        // ⚠️ And once it gives up it stays given up — a later divisible pair does not rescue it.
+        assert_eq!(with_site_heights(vec![2800, 1800, 2800]).uniform_row_height(), None);
+    }
+
+    #[test]
+    fn a_single_row_height_is_itself() {
+        assert_eq!(with_site_heights(vec![2800]).uniform_row_height(), Some(2800));
+        assert_eq!(with_site_heights(vec![]).uniform_row_height(), None, "no rows, no height");
+    }
+
+    #[test]
+    fn it_reads_site_heights_not_boundary_spacing() {
+        // 🔑 The distinction that makes this its own function: grid-row BOUNDARIES come from
+        // every row's origin and top, so evenly spaced boundaries can arise from sites that do
+        // not divide each other. Boundary spacing here is uniform; the sites are not.
+        let mut g = with_site_heights(vec![2800, 1800]);
+        g.row_y = vec![0, 100, 200, 300];
+        assert_eq!(g.uniform_row_height(), None);
     }
 }
