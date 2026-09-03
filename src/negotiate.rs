@@ -2249,6 +2249,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             orient,
             moved: c.x != c.init_x || c.y != c.init_y,
             init_grid: Some((c.init_x, c.init_y)),
+            footprint: Some((c.width, c.height)),
         });
     }
     if !matches!(outcome, Outcome::Converged { .. }) {

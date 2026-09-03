@@ -241,6 +241,14 @@ pub struct Placed {
     /// site 0 with `moved: false`, and only the start told us which.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_grid: Option<(i32, i32)>,
+    /// The cell's footprint in grid units, `(sites, rows)`.
+    ///
+    /// 🔑 **Reported because the sweep ORDER is keyed on it** — `sortByNegotiationOrder` is
+    /// `(overuse DESC, height ASC, width ASC, index ASC)`. When two runs disagree about which
+    /// cell got which slot, the height is the first thing to compare, and it cannot be inferred
+    /// from a position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub footprint: Option<(i32, i32)>,
 }
 
 /// The result of a legalization run.
@@ -376,6 +384,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
                     orient,
                     moved: nx != m.x || ny != m.y,
                     init_grid: None,
+                    footprint: None,
                 });
             }
             None => out.failures.push(m.name.clone()),
