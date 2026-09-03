@@ -215,6 +215,126 @@ pub fn check_one_site_gap(
     true
 }
 
+/// One entry of the LEF58 cell-edge spacing table.
+///
+/// ⚠️ **`except_abutted` is PARSED AND NEVER READ** by `checkEdgeSpacing` at this pin — the entry
+/// carries it, the check consults only `spc` and `is_exact`. Kept so the shape matches, and so
+/// that wiring it up later is an addition rather than a re-parse.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EdgeSpacingEntry {
+    pub spc: i32,
+    pub is_exact: bool,
+    pub except_abutted: bool,
+}
+
+/// The symmetric edge-type spacing table — `makeCellEdgeSpacingTable`.
+///
+/// Edge-type names are assigned indices in **encounter order** across the rules, and each rule
+/// fills **both** `[i][j]` and `[j][i]`: the relation is symmetric.
+#[derive(Debug, Default, Clone)]
+pub struct EdgeSpacingTable {
+    names: Vec<String>,
+    table: Vec<Vec<EdgeSpacingEntry>>,
+}
+
+impl EdgeSpacingTable {
+    /// Build from `(first_edge, second_edge, spacing, exact, except_abutted)` rules.
+    pub fn build(rules: &[(String, String, i32, bool, bool)]) -> EdgeSpacingTable {
+        if rules.is_empty() {
+            return EdgeSpacingTable::default();
+        }
+        // ⚠️ Encounter order, first edge then second, exactly as the two `try_emplace` calls run.
+        let mut names: Vec<String> = Vec::new();
+        let mut idx_of = std::collections::HashMap::new();
+        for (a, b, ..) in rules {
+            for n in [a, b] {
+                if !idx_of.contains_key(n) {
+                    idx_of.insert(n.clone(), names.len());
+                    names.push(n.clone());
+                }
+            }
+        }
+        let n = names.len();
+        let mut table = vec![vec![EdgeSpacingEntry::default(); n]; n];
+        for (a, b, spc, exact, except_abutted) in rules {
+            let e = EdgeSpacingEntry { spc: *spc, is_exact: *exact,
+                                       except_abutted: *except_abutted };
+            let (i, j) = (idx_of[a], idx_of[b]);
+            table[i][j] = e;
+            table[j][i] = e;
+        }
+        EdgeSpacingTable { names, table }
+    }
+
+    /// ⚠️ **An empty table means the check is skipped entirely** — `checkEdgeSpacing` returns true
+    /// before doing anything when the technology states no rules.
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    pub fn index_of(&self, edge_type: &str) -> Option<usize> {
+        self.names.iter().position(|n| n == edge_type)
+    }
+
+    pub fn entry(&self, a: usize, b: usize) -> EdgeSpacingEntry {
+        self.table[a][b]
+    }
+
+    /// `getMaxSpacing` — the widest spacing this edge type demands against anything.
+    pub fn max_spacing(&self, edge_type_idx: usize) -> i32 {
+        self.table[edge_type_idx].iter().map(|e| e.spc).max().unwrap_or(0)
+    }
+
+    /// The search radius for an edge — `getMaxSpacing(...) + 1`.
+    ///
+    /// ⛔ **The `+1` is "to account for EXACT rules"**, in upstream's words. An exact rule fires
+    /// when the distance EQUALS the spacing, so a query bloated by exactly `spc` would put a
+    /// neighbour at distance `spc` on the boundary and risk missing it.
+    pub fn query_radius(&self, edge_type_idx: usize) -> i32 {
+        self.max_spacing(edge_type_idx) + 1
+    }
+}
+
+/// Is the spacing between two parallel edges a violation?
+///
+/// ⛔ **An EXACT rule fires when the distance EQUALS the spacing — not when it is less.** So a
+/// closer neighbour passes an exact rule and a farther one passes too; only the stated distance is
+/// forbidden. Reading `is_exact` as "at least" inverts the rule for every distance below `spc`.
+pub fn edge_spacing_violation(dist: i32, entry: EdgeSpacingEntry) -> bool {
+    if entry.is_exact {
+        dist == entry.spc
+    } else {
+        dist < entry.spc
+    }
+}
+
+/// `getQueryRect` — bloat the edge box across its own direction by `spc`.
+///
+/// ⚠️ **A VERTICAL edge bloats HORIZONTALLY** and vice versa: the search widens across the gap the
+/// edge faces, not along the edge itself.
+pub fn query_rect(
+    (xlo, ylo, xhi, yhi): (i32, i32, i32, i32), spc: i32, is_vertical: bool,
+) -> (i32, i32, i32, i32) {
+    if is_vertical {
+        (xlo - spc, ylo, xhi + spc, yhi)
+    } else {
+        (xlo, ylo - spc, xhi, yhi + spc)
+    }
+}
+
+/// The distance between two parallel edges — the span of their merged rect.
+///
+/// ⚠️ **`dx` for vertical edges, `dy` for horizontal** — measured ACROSS the gap. Upstream calls
+/// this the "generalized intersection": merge the two boxes and take the span in the direction the
+/// edges face.
+pub fn edge_distance(
+    a: (i32, i32, i32, i32), b: (i32, i32, i32, i32), is_vertical: bool,
+) -> i32 {
+    let (xlo, ylo) = (a.0.min(b.0), a.1.min(b.1));
+    let (xhi, yhi) = (a.2.max(b.2), a.3.max(b.3));
+    if is_vertical { xhi - xlo } else { yhi - ylo }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +464,70 @@ mod tests {
                 "PlacementDRC's reading flags it");
         assert!(check_one_site_gap(true, 0, 2, 0, 1, EdgeReading::OffGridIsEmpty, &occ),
                 "Place.cpp's reading does not");
+    }
+
+    fn rules() -> Vec<(String, String, i32, bool, bool)> {
+        vec![
+            ("A".into(), "B".into(), 100, false, false),
+            ("A".into(), "C".into(), 250, false, false),
+            ("B".into(), "B".into(), 40, true, false),
+        ]
+    }
+
+    #[test]
+    fn the_table_is_symmetric_and_indexed_in_encounter_order() {
+        let t = EdgeSpacingTable::build(&rules());
+        // A first (first rule's first edge), then B, then C.
+        assert_eq!(t.index_of("A"), Some(0));
+        assert_eq!(t.index_of("B"), Some(1));
+        assert_eq!(t.index_of("C"), Some(2));
+        assert_eq!(t.index_of("Z"), None);
+        // Both halves are filled by each rule.
+        assert_eq!(t.entry(0, 1).spc, 100);
+        assert_eq!(t.entry(1, 0).spc, 100, "the relation is symmetric");
+    }
+
+    #[test]
+    fn an_empty_technology_table_skips_the_check_entirely() {
+        // ⚠️ checkEdgeSpacing returns true before doing anything when there are no rules.
+        assert!(EdgeSpacingTable::build(&[]).is_empty());
+        assert!(!EdgeSpacingTable::build(&rules()).is_empty());
+    }
+
+    #[test]
+    fn the_query_radius_is_the_max_spacing_plus_one() {
+        // ⛔ The +1 exists so an EXACT rule at distance == spc is still inside the query.
+        let t = EdgeSpacingTable::build(&rules());
+        assert_eq!(t.max_spacing(0), 250, "A's widest demand is against C");
+        assert_eq!(t.query_radius(0), 251);
+    }
+
+    #[test]
+    fn an_exact_rule_fires_only_at_the_stated_distance() {
+        // ⛔ Not "at least" — closer passes, farther passes, only equal is forbidden.
+        let exact = EdgeSpacingEntry { spc: 40, is_exact: true, except_abutted: false };
+        assert!(!edge_spacing_violation(39, exact), "closer than the exact distance is fine");
+        assert!(edge_spacing_violation(40, exact), "exactly the stated distance is the violation");
+        assert!(!edge_spacing_violation(41, exact));
+
+        let normal = EdgeSpacingEntry { spc: 40, is_exact: false, except_abutted: false };
+        assert!(edge_spacing_violation(39, normal), "an ordinary rule is a minimum");
+        assert!(!edge_spacing_violation(40, normal));
+    }
+
+    #[test]
+    fn a_vertical_edge_bloats_horizontally() {
+        // ⚠️ The search widens ACROSS the gap the edge faces, not along the edge.
+        assert_eq!(query_rect((10, 0, 10, 100), 5, true), (5, 0, 15, 100));
+        assert_eq!(query_rect((0, 10, 100, 10), 5, false), (0, 5, 100, 15));
+    }
+
+    #[test]
+    fn the_distance_is_the_span_of_the_merged_boxes() {
+        // Two zero-width vertical edges at x=10 and x=30: the merged span is 20.
+        assert_eq!(edge_distance((10, 0, 10, 50), (30, 0, 30, 50), true), 20);
+        // Horizontal edges at y=10 and y=45 -> 35.
+        assert_eq!(edge_distance((0, 10, 50, 10), (0, 45, 50, 45), false), 35);
     }
 
     #[test]
