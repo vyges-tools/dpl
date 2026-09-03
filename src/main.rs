@@ -18,7 +18,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
     "SCOPE: `check-placement` only. `detailed_placement` (legalization) is NOT implemented, so this engine reports whether a placement is legal and never makes one legal.",
-    "FOUR of upstream's NINE check families are evaluated: site alignment, placed, overlap and in_rows. The five not evaluated are named in the report's `not_checked` field on every run -- region_placement, padding, edge_spacing, blocked_layers and one_site_gap -- because a clean verdict from a partial checker must not read as a complete one. Those five need regions, Padding or PlacementDRC; the Grid they also need is built.",
+    "SEVEN of upstream's NINE check families are evaluated: site alignment, placed, overlap, in_rows, padding, blocked_layers and one_site_gap. What is NOT evaluated is named in the report's `not_checked` field on every run -- region_placement needs regions, edge_spacing needs each master's LEF58 cell-edge list -- because a clean verdict from a partial checker must not read as a complete one. Families that ran under a restriction are named in `limitations` rather than left to be inferred.",
     "Site alignment is CORE-RELATIVE: upstream compares `cell->getLeft() % siteWidth` where getLeft() is relative to core_.xMin(). Measured on aes.defok, reading it as an absolute coordinate reports every one of 21340 cells misaligned on a design the reference calls clean.",
     "A site-alignment failure removes the cell from the overlap comparison entirely. That is a side effect of upstream's `continue`, not a separate rule: checkOverlap is what paints a cell into its pixels, so a cell that was skipped is never there for a later cell to collide with.",
     "The OVERLAP ACCELERATION differs from upstream deliberately: a rectangle sweep here, a pixel walk there. The predicate is identical and the failing SET matches, but which partner is reported can differ, because upstream reports whichever cell already owns the pixel and that depends on visit order.",
@@ -54,8 +54,9 @@ USAGE:
    `--use-diamond-legalizer` selects the diamond one, as upstream's own flag does. Whichever
    runs, what it does NOT implement is named in `not_done` on every run rather than omitted.
 
-⚠️ Four of upstream's nine check families are evaluated (site alignment, placed, overlap,
-   in rows). The other five are reported in `not_checked` rather than passed over in silence.
+⚠️ Seven of upstream's nine check families are evaluated. `region_placement` and `edge_spacing`
+   are reported in `not_checked` rather than passed over in silence, and a family that ran under
+   a restriction says so in `limitations`.
 ";
 
 fn main() -> ExitCode {

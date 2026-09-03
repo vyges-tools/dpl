@@ -160,13 +160,21 @@ fn check_in_rows(g: &crate::grid::Grid, x: i32, y: i32, w: i32, h: i32, site: &s
 
 /// Run the legality check.
 pub fn check_placement(db: &Db) -> Report {
-    check_placement_opts(db, false)
+    // ⛔ **`disallow_one_site_gaps_` is DERIVED FROM THE TECHNOLOGY, not asked for.** `importDb`
+    // sets it to `!odb::hasOneSiteMaster(db_)`: if no placeable master is exactly one site wide,
+    // a one-site gap can never be filled, so leaving one is a violation. Where such a master
+    // exists the gap is fillable and the check is off.
+    //
+    // ⚠️ Taking it as a caller-supplied option would be wrong in both directions: it would let a
+    // caller demand the check on a technology where upstream does not apply it, and skip it where
+    // upstream does. It is a property of the library, not a preference.
+    check_placement_opts(db, !db.has_one_site_master())
 }
 
-/// `check_placement` with upstream's `-disallow_one_site_gaps`.
+/// `check_placement` with the one-site-gap decision supplied.
 ///
-/// ⚠️ **The one-site-gap check is OFF unless asked for**, exactly as upstream gates it on
-/// `disallow_one_site_gaps_`. Running it by default would fail designs the reference passes.
+/// ℹ️ Exposed for tests, which need to exercise both settings on one design. Production callers
+/// want [`check_placement`], which derives it the way upstream does.
 pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool) -> Report {
     let ys = row_ys(db);
     let sw = site_width(db);
@@ -243,7 +251,9 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool) -> Report {
             "one_site_gap: PlacementDRC's reading, where a square off the grid counts as \
              OCCUPIED — Place.cpp reads the same test the other way".into());
     } else {
-        out.not_checked.push("one_site_gap (not requested: -disallow_one_site_gaps is off)".into());
+        out.not_checked.push(
+            "one_site_gap (the technology HAS a one-site master, so upstream does not apply it)"
+                .into());
     }
     match drc_grid.as_ref().map(|g| g.blocked_layer_status()) {
         Some((true, n)) => out.limitations.push(format!(
