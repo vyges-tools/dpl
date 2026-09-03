@@ -246,6 +246,31 @@ pub fn init_position(
     (gx.clamp(0, (grid_w - width).max(0)), gy.clamp(0, (grid_h - height).max(0)))
 }
 
+/// `updateDrcHistoryCosts` — make the squares under a DRC-violating cell more expensive.
+///
+/// For every active cell whose CURRENT position fails a `PlacementDRC` rule, every square of its
+/// footprint gets `hist_cost += HIST_INCREMENT * drcCount`.
+///
+/// ⛔ **NOT deduped, unlike [`update_history_costs`].** That one carries a generation stamp so a
+/// square shared by several active cells is bumped once; this one has no such guard, so a square
+/// under two DRC-violating cells is bumped TWICE. The asymmetry is upstream's, in two functions
+/// twenty lines apart — transcribed, not tidied.
+///
+/// ⚠️ **The bump is `drcCount`, not 1.** A position failing two rules earns twice the pressure of
+/// one failing a single rule.
+///
+/// 🔑 **It prices a different fault from `updateHistoryCosts`.** That one prices an OVERUSED
+/// square; this one prices a POSITION. A cell can sit alone on its squares, overusing nothing,
+/// and still be stuck somewhere it must be pushed off — without this the loop builds no pressure
+/// to move it and the run converges with the violation in place.
+pub fn update_drc_history_costs(pixels: &mut [NegPixel], footprints: &[(Vec<usize>, i32)]) {
+    for (fp, count) in footprints {
+        for &pid in fp {
+            pixels[pid].hist_cost += consts::HIST_INCREMENT * *count as f64;
+        }
+    }
+}
+
 /// `updateHistoryCosts` — make contested squares more expensive for the next iteration.
 ///
 /// For every square under an active cell, **deduped so a square shared by several cells is bumped
@@ -1787,6 +1812,32 @@ mod tests {
     }
 
     #[test]
+    fn the_drc_history_bump_is_not_deduped() {
+        // ⛔ The asymmetry with `update_history_costs`, and it is upstream's: that function
+        // carries a generation stamp and bumps a shared square ONCE; this one has no guard, so a
+        // square under two DRC-violating cells is bumped TWICE. Two functions twenty lines apart.
+        let mut p = vec![px(1)];
+        update_drc_history_costs(&mut p, &[(vec![0], 1), (vec![0], 1)]);
+        assert_eq!(p[0].hist_cost, 3.0, "two bumps of +1, not one");
+        // ⚠️ And the bump is the COUNT, not 1: two failed rules earn twice the pressure.
+        let mut q = vec![px(1)];
+        update_drc_history_costs(&mut q, &[(vec![0], 2)]);
+        assert_eq!(q[0].hist_cost, 3.0);
+    }
+
+    #[test]
+    fn the_drc_history_prices_a_position_not_an_overlap() {
+        // 🔑 The reason both updates exist. A cell alone on its square overuses nothing, so
+        // `update_history_costs` never touches it — but if its POSITION violates a rule the loop
+        // must still build pressure to move it, or the run converges with the violation in place.
+        let mut p = vec![px(1)];
+        update_history_costs(&mut p, &[vec![0]]);
+        assert_eq!(p[0].hist_cost, 1.0, "not overused, so the congestion history is untouched");
+        update_drc_history_costs(&mut p, &[(vec![0], 1)]);
+        assert_eq!(p[0].hist_cost, 2.0, "but the DRC history prices it anyway");
+    }
+
+    #[test]
     fn history_accumulates_across_iterations() {
         // 🔑 This is what makes the negotiation terminate: a square fought over repeatedly keeps
         // getting dearer until the contest resolves rather than oscillating.
@@ -2517,7 +2568,9 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
     // `totalViolations > 0`. Bumping history on a converged iteration would price up squares that
     // nobody is contesting.
     //
-    // ⬜ `updateDrcHistoryCosts` belongs here and is not built; it is named in `NOT_DONE`.
+    // ⛔ **BOTH updates run, in this order**: `updateHistoryCosts` then `updateDrcHistoryCosts`.
+    // They price two different faults — an overused square and a DRC-violating POSITION — and a
+    // cell can be perfectly un-overlapped and still stuck on a position it must be pushed off.
     if violations > 0 {
         let footprints: Vec<Vec<usize>> = active
             .iter()
@@ -2538,6 +2591,46 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
             })
             .collect();
         update_history_costs(&mut ctx.grid.pixels, &footprints);
+
+        // `updateDrcHistoryCosts` — bump every square under a cell that is CURRENTLY violating a
+        // DRC rule, so the loop builds pressure to move it off that position over iterations.
+        //
+        // ⛔ **NOT deduped, unlike `updateHistoryCosts` right above it.** That one carries a
+        // generation stamp so a square shared by several active cells is bumped once; this one
+        // has no such guard, so a square under two DRC-violating cells is bumped TWICE. The
+        // asymmetry is upstream's — transcribed, not tidied.
+        //
+        // ⚠️ **The bump is `drcCount`, not 1** — a position failing two rules gets twice the
+        // pressure of one failing a single rule.
+        //
+        // 🔑 **Counting every cell BEFORE bumping any is equivalent to upstream's interleaved
+        // loop, and only because `countDRCViolations` never reads `hist_cost`.** It reads
+        // occupancy and capacity, which this block does not touch. Stated here because the
+        // rewrite is forced by the borrow checker and would otherwise look like a liberty.
+        let drc_footprints: Vec<(Vec<usize>, i32)> = active
+            .iter()
+            .filter(|&&i| !cells[i].fixed)
+            .filter_map(|&i| {
+                let c = &cells[i];
+                let n = (ctx.drc_violations)(c, c.x, c.y, ctx.grid);
+                if n <= 0 {
+                    return None;
+                }
+                let mut f = Vec::new();
+                for dy in 0..c.height {
+                    for dx in 0..c.width {
+                        let (gx, gy) = (c.x + dx, c.y + dy);
+                        if gx >= 0 && gy >= 0
+                            && (gx as usize) < ctx.grid.width && (gy as usize) < ctx.grid.height
+                        {
+                            f.push(gy as usize * ctx.grid.width + gx as usize);
+                        }
+                    }
+                }
+                Some((f, n))
+            })
+            .collect();
+        update_drc_history_costs(&mut ctx.grid.pixels, &drc_footprints);
     }
     violations
 }
@@ -2616,7 +2709,6 @@ pub const NOT_DONE: &[&str] = &[
     // ⚠️ `checkPadding` runs, but with a padding of zero: `set_placement_padding` is unbuilt, so
     // the scan is never widened and nothing ever reserves a square it does not occupy.
     "padding values (set_placement_padding, padding_reserved_by)",
-    "drc_history_costs (updateDrcHistoryCosts)",
 ];
 
 /// `NegotiationLegalizer::legalize` — the DEFAULT detailed-placement path.
