@@ -1436,11 +1436,81 @@ mod tests {
             grid,
             window: &|_c, x, y| (-4, 4, vec![y; 1].into_iter().map(|_| y).collect()),
             placeable: &|c, x, _y| x >= 0 && x + c.width <= 8,
-            drc_violations: &|_, _, _| 0,
+            drc_violations: &|_, _, _, _| 0,
             max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
             max_disp_threshold: consts::MAX_DISP_THRESHOLD,
             drc_penalty: consts::DRC_PENALTY,
         }
+    }
+
+    #[test]
+    fn a_drc_violation_alone_still_counts_as_a_violation() {
+        // ⛔ The bug this pins: the count was `grid.total_overuse()`, so a design whose ONLY
+        // fault was a DRC violation reported ZERO and the driver declared convergence on the
+        // first iteration. Measured on `multi_height_one_site_gap_disallow`.
+        let mut grid = NegGrid::build(6, 1, &|_, _| true);
+        let mut cells = vec![sweep_cell("a", 0, 1)];
+        grid.add_usage(0, 0, 1, 1, 1);
+        let mut ctx = SweepCtx {
+            grid: &mut grid,
+            window: &|_c, x, y| (-x, 0, vec![y]),   // pinned in place: no candidate but its own
+            placeable: &|_, x, _| (0..6).contains(&x),
+            // Always dirty, wherever it sits.
+            drc_violations: &|_, _, _, _| 1,
+            max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
+            max_disp_threshold: consts::MAX_DISP_THRESHOLD,
+            drc_penalty: consts::DRC_PENALTY,
+        };
+        let v = negotiation_iter(&mut cells, &mut vec![0], 0, &mut ctx);
+        assert_eq!(grid.total_overuse(), 0, "no square is overused");
+        assert!(v > 0, "and yet the iteration must report a violation, not converge");
+    }
+
+    #[test]
+    fn a_bystander_made_illegal_is_pulled_into_the_active_set() {
+        // ⛔ A cell outside the active set can be made illegal by a neighbour's move. Without
+        // this it is never revisited and the run converges with the violation still there.
+        let mut grid = NegGrid::build(6, 1, &|_, _| true);
+        let mut cells = vec![sweep_cell("mover", 0, 1), sweep_cell("bystander", 4, 1)];
+        for c in &cells {
+            grid.add_usage(c.x, c.y, c.width, c.height, 1);
+        }
+        let mut ctx = SweepCtx {
+            grid: &mut grid,
+            window: &|_c, x, y| (-x, 0, vec![y]),
+            placeable: &|_, x, _| (0..6).contains(&x),
+            // Only the bystander is dirty — the active cell is fine.
+            drc_violations: &|c, _, _, _| i32::from(c.name == "bystander"),
+            max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
+            max_disp_threshold: consts::MAX_DISP_THRESHOLD,
+            drc_penalty: consts::DRC_PENALTY,
+        };
+        let mut active = vec![0];
+        let v = negotiation_iter(&mut cells, &mut active, 0, &mut ctx);
+        assert_eq!(active, vec![0, 1], "the bystander joined the active set");
+        assert!(v > 0, "and was counted");
+    }
+
+    #[test]
+    fn history_is_not_bumped_on_a_clean_iteration() {
+        // ⚠️ `updateHistoryCosts` is guarded by `totalViolations > 0`. Bumping it on a converged
+        // iteration prices up squares nobody is contesting.
+        let mut grid = NegGrid::build(4, 1, &|_, _| true);
+        let mut cells = vec![sweep_cell("a", 1, 1)];
+        grid.add_usage(1, 0, 1, 1, 1);
+        let before = grid.at(1, 0).hist_cost;
+        let mut ctx = SweepCtx {
+            grid: &mut grid,
+            window: &|_c, x, y| (-x, 3 - x, vec![y]),
+            placeable: &|_, x, _| (0..4).contains(&x),
+            drc_violations: &|_, _, _, _| 0,
+            max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
+            max_disp_threshold: consts::MAX_DISP_THRESHOLD,
+            drc_penalty: consts::DRC_PENALTY,
+        };
+        let v = negotiation_iter(&mut cells, &mut vec![0], 0, &mut ctx);
+        assert_eq!(v, 0, "nothing is wrong");
+        assert_eq!(grid.at(1, 0).hist_cost, before, "so history did not move");
     }
 
     #[test]
@@ -1458,12 +1528,12 @@ mod tests {
             grid: &mut grid,
             window: &|_c, x, y| (-x, 3 - x, vec![y]),
             placeable: &|c, x, _| x >= 0 && x + c.width <= 4,
-            drc_violations: &|_, _, _| 0,
+            drc_violations: &|_, _, _, _| 0,
             max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
             max_disp_threshold: consts::MAX_DISP_THRESHOLD,
             drc_penalty: consts::DRC_PENALTY,
         };
-        negotiation_iter(&mut cells, &[0], 0, &mut ctx);
+        negotiation_iter(&mut cells, &mut vec![0], 0, &mut ctx);
         assert!(cells[0].x >= 2, "moved off the blockage, to {}", cells[0].x);
     }
 
@@ -1479,7 +1549,7 @@ mod tests {
         assert!(grid.total_overuse() > 0, "the fixture must start overlapping");
 
         let mut ctx = sweep_ctx(&mut grid);
-        let overuse = negotiation_iter(&mut cells, &[0, 1], 0, &mut ctx);
+        let overuse = negotiation_iter(&mut cells, &mut vec![0, 1], 0, &mut ctx);
         assert_eq!(overuse, 0, "one sweep resolved it: {:?}",
                    cells.iter().map(|c| (c.name.clone(), c.x)).collect::<Vec<_>>());
         assert_ne!(cells[0].x, cells[1].x, "the two cells no longer share a site");
@@ -1492,7 +1562,7 @@ mod tests {
         let mut cells = vec![sweep_cell("solo", 3, 2)];
         grid.add_usage(3, 0, 2, 1, 1);
         let mut ctx = sweep_ctx(&mut grid);
-        negotiation_iter(&mut cells, &[0], 0, &mut ctx);
+        negotiation_iter(&mut cells, &mut vec![0], 0, &mut ctx);
         assert_eq!(cells[0].x, 3, "an uncontested cell stays at its init position");
         assert_eq!(grid.total_overuse(), 0);
     }
@@ -1503,7 +1573,7 @@ mod tests {
         let mut cells = vec![SweepCell { fixed: true, ..sweep_cell("fix", 2, 2) }];
         grid.blockade(2, 0, 2, 1);
         let mut ctx = sweep_ctx(&mut grid);
-        negotiation_iter(&mut cells, &[0], 0, &mut ctx);
+        negotiation_iter(&mut cells, &mut vec![0], 0, &mut ctx);
         assert_eq!(cells[0].x, 2);
     }
 
@@ -1514,7 +1584,7 @@ mod tests {
         let mut cells = vec![sweep_cell("a", 3, 2)];
         grid.add_usage(3, 0, 2, 1, 1);
         let mut ctx = sweep_ctx(&mut grid);
-        negotiation_iter(&mut cells, &[0], consts::ISOLATION_PT, &mut ctx);
+        negotiation_iter(&mut cells, &mut vec![0], consts::ISOLATION_PT, &mut ctx);
         assert_eq!(cells[0].x, 3, "untouched, and its usage was never ripped up");
         assert_eq!(grid.at(3, 0).usage, 1, "usage is intact — the skip happened before rip-up");
     }
@@ -1572,7 +1642,15 @@ pub struct SweepCtx<'a> {
     /// Can this cell's footprint legally sit here, ignoring congestion?
     pub placeable: &'a dyn Fn(&SweepCell, i32, i32) -> bool,
     /// How many of `PlacementDRC`'s four checks a position fails.
-    pub drc_violations: &'a dyn Fn(&SweepCell, i32, i32) -> i32,
+    ///
+    /// ⚠️ **Takes the grid**, because three of the four rules read neighbouring squares. It is
+    /// passed in rather than captured so the sweep can still hold the grid mutably; every call
+    /// site reborrows it immutably for the duration of the check.
+    ///
+    /// 🔑 Called AFTER the cell has been ripped up, so the grid the rules see does not contain
+    /// the cell being placed — which is what upstream's `ripUp` (an `erasePixel` on the DPL
+    /// grid) arranges before `findBestLocation` runs.
+    pub drc_violations: &'a dyn Fn(&SweepCell, i32, i32, &NegGrid) -> i32,
     pub max_disp_multiplier: f64,
     pub max_disp_threshold: i64,
     pub drc_penalty: f64,
@@ -1589,8 +1667,8 @@ pub struct SweepCtx<'a> {
 /// 5. `place` — restore usage at the chosen position.
 ///
 /// Returns the grid's total overuse afterwards.
-pub fn negotiation_iter(cells: &mut [SweepCell], active: &[usize], iter: i32, ctx: &mut SweepCtx)
-    -> i32
+pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: i32,
+                        ctx: &mut SweepCtx) -> i32
 {
     // 1. Order the sweep.
     let mut keys: Vec<SortKey> = active
@@ -1664,7 +1742,7 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &[usize], iter: i32, ct
             if cost > best.0 || (cost == best.0 && cand.rank >= best.1) {
                 continue; // loses, or ties with a losing rank — skip the costly DRC term
             }
-            cost += drc_penalty * (ctx.drc_violations)(&c, cand.x, cand.y) as f64;
+            cost += drc_penalty * (ctx.drc_violations)(&c, cand.x, cand.y, ctx.grid) as f64;
             if cost < best.0 || (cost == best.0 && cand.rank < best.1) {
                 best = (cost, cand.rank, cand.x, cand.y);
             }
@@ -1675,7 +1753,78 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &[usize], iter: i32, ct
         cells[i].y = best.3;
         ctx.grid.add_usage(best.2, best.3, c.width, c.height, 1);
     }
-    ctx.grid.total_overuse()
+
+    // 6. Count what is left. ⛔ **NOT `grid.total_overuse()`.**
+    //
+    // Upstream sums per-square overuse over the ACTIVE cells' footprints — so a square shared by
+    // two active cells is counted twice — and then adds **one per illegal active cell**, where
+    // illegal is the full `isCellLegal` including the DRC checks.
+    //
+    // ⚠️ Returning grid overuse alone made a design whose only fault was a DRC violation report
+    // ZERO and converge on the first iteration. Measured on
+    // `multi_height_one_site_gap_disallow`: a genuine one-site gap between two cells, one sweep,
+    // "converged", gap still there.
+    let mut violations = 0;
+    for &i in active.iter() {
+        if cells[i].fixed {
+            continue;
+        }
+        let c = &cells[i];
+        for dy in 0..c.height {
+            for dx in 0..c.width {
+                if let (Ok(gx), Ok(gy)) = (usize::try_from(c.x + dx), usize::try_from(c.y + dy)) {
+                    if gx < ctx.grid.width && gy < ctx.grid.height {
+                        violations += ctx.grid.at(gx, gy).overuse();
+                    }
+                }
+            }
+        }
+        if !cell_is_legal(c, ctx) {
+            violations += 1;
+        }
+    }
+
+    // 7. ⛔ **Pull in bystanders that a move has just made illegal.** A cell outside the active
+    // set can acquire a one-site gap because its neighbour moved; without this it is never
+    // revisited and the run converges with the violation in place.
+    let in_active: std::collections::HashSet<usize> = active.iter().copied().collect();
+    for i in 0..cells.len() {
+        if cells[i].fixed || in_active.contains(&i) {
+            continue;
+        }
+        if !cell_is_legal(&cells[i], ctx) {
+            active.push(i);
+            violations += 1;
+        }
+    }
+
+    // 8. History, and ⚠️ **only when something is still wrong** — upstream guards the update with
+    // `totalViolations > 0`. Bumping history on a converged iteration would price up squares that
+    // nobody is contesting.
+    //
+    // ⬜ `updateDrcHistoryCosts` belongs here and is not built; it is named in `NOT_DONE`.
+    if violations > 0 {
+        let footprints: Vec<Vec<usize>> = active
+            .iter()
+            .map(|&i| {
+                let c = &cells[i];
+                let mut f = Vec::new();
+                for dy in 0..c.height {
+                    for dx in 0..c.width {
+                        let (gx, gy) = (c.x + dx, c.y + dy);
+                        if gx >= 0 && gy >= 0
+                            && (gx as usize) < ctx.grid.width && (gy as usize) < ctx.grid.height
+                        {
+                            f.push(gy as usize * ctx.grid.width + gx as usize);
+                        }
+                    }
+                }
+                f
+            })
+            .collect();
+        update_history_costs(&mut ctx.grid.pixels, &footprints);
+    }
+    violations
 }
 
 /// The squares a cell at `(x, y)` would cover, as `(usage, capacity, hist_cost)` — `None` for a
@@ -1702,7 +1851,7 @@ fn footprint_of<'a>(c: &SweepCell, x: i32, y: i32, grid: &'a NegGrid)
 }
 
 fn cell_is_legal(c: &SweepCell, ctx: &SweepCtx) -> bool {
-    if !(ctx.placeable)(c, c.x, c.y) || (ctx.drc_violations)(c, c.x, c.y) > 0 {
+    if !(ctx.placeable)(c, c.x, c.y) || (ctx.drc_violations)(c, c.x, c.y, ctx.grid) > 0 {
         return false;
     }
     footprint_is_legal(c, c.x, c.y, ctx.grid)
@@ -1745,6 +1894,10 @@ use vyges_opendb::Db;
 pub const NOT_DONE: &[&str] = &[
     "groups_and_regions (respectsFence / initFenceRegions)",
     "master_symmetry (checkMasterSym)",
+    // ⚠️ ONE of `countDRCViolations`' four terms is evaluated (one-site gaps). The other three
+    // need the occupant's identity or its master's edge list, so the DRC penalty is an
+    // UNDER-count — it never over-reports, but it will prefer a location upstream would not.
+    "drc: padding, edge_spacing and blocked_layers are not evaluated by the legalizer",
     "drc_history_costs (updateDrcHistoryCosts)",
     "diamondRecovery on stall",
 ];
@@ -1888,13 +2041,48 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         ch <= 1 || power.compatible(&masters[i], y, ch)
     };
 
+    // `checkDRC`'s one-site-gap term, from OCCUPANCY alone.
+    //
+    // ⛔ **`disallow_one_site_gaps_` is DERIVED**: `importDb` sets it to
+    // `!odb::hasOneSiteMaster(db_)`. Where a one-site-wide master exists the gap is fillable and
+    // upstream does not apply the rule at all.
+    //
+    // 🔑 `checkOneSiteGap` asks only whether a square holds A cell, never WHICH — so
+    // `NegGrid.usage > 0` answers it exactly. `ripUp`/`place` keep usage in step through the
+    // sweep, and `blockade` gives a fixed cell `usage = 1`, so fixed neighbours count too.
+    //
+    // ⬜ The other three `PlacementDRC` rules are NOT wired here: padding and edge spacing need
+    // the OCCUPANT'S IDENTITY (a class-pair table and a master edge list), which this grid does
+    // not carry. They stay in `NOT_DONE`.
+    let one_site_gaps_disallowed = !db.has_one_site_master();
+    let gap_ok = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
+        let (cw, ch) = dims[i];
+        crate::drc::check_one_site_gap(
+            one_site_gaps_disallowed, x, x + cw, y, y + ch,
+            crate::drc::EdgeReading::OffGridIsOccupied,
+            &|px, py| {
+                if px < 0 || py < 0 || px as usize >= g.width || py as usize >= g.height {
+                    None // off the grid
+                } else {
+                    Some(g.at(px as usize, py as usize).usage > 0)
+                }
+            })
+    };
+
     // 4. Who starts illegal.
+    //
+    // ⛔ Upstream's seeding scan is `isCellLegal`, which CALLS `checkDRC`. Leaving the DRC out
+    // here would seed a cell that violates a placement rule as already legal, and the sweep would
+    // never look at it again.
     let mut illegal: Vec<usize> = Vec::new();
     for i in 0..cells.len() {
         let c = &cells[i];
         // ⛔ The SAME footprint test the sweep's isolation skip uses — capacity AND overuse.
         // Testing overuse alone here let a cell inside a hard blockage seed as legal.
-        if !footprint_is_legal(c, c.x, c.y, &ngrid) || !site_ok(i, c.x, c.y) {
+        if !footprint_is_legal(c, c.x, c.y, &ngrid)
+            || !site_ok(i, c.x, c.y)
+            || !gap_ok(i, c.x, c.y, &ngrid)
+        {
             illegal.push(i);
         }
     }
@@ -1972,13 +2160,21 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             (w.dx_lo, w.dx_hi, w.rows)
         };
         let placeable = |c: &SweepCell, x: i32, y: i32| site_ok(by_name[c.name.as_str()], x, y);
-        // ⚠️ `updateDrcHistoryCosts` is NOT built — reported in `not_done`, and 0 here means the
-        // DRC term never fires, so the sweep is congestion-only. It is not silently treated as
-        // clean anywhere the caller cannot see.
-        let drc = |_: &SweepCell, _: i32, _: i32| 0;
+        // `countDRCViolations`, as far as this engine can evaluate it.
+        //
+        // ⚠️ **One of upstream's four terms**, so the penalty is an UNDER-count: padding, edge
+        // spacing and blocked layers contribute 0 here and are named in `not_done`. A cost
+        // function missing a term does not fail — it quietly prefers different locations.
+        let idx_of: std::collections::HashMap<&str, usize> =
+            index.iter().map(|&i| (names[i].as_str(), i)).collect();
+        let drc = |c: &SweepCell, x: i32, y: i32, g: &NegGrid| -> i32 {
+            if gap_ok(idx_of[c.name.as_str()], x, y, g) { 0 } else { 1 }
+        };
 
         let mut ctx_cells = cells;
-        let mut violations = 0;
+        // ⚠️ The active set GROWS during the run — `negotiationIter` appends bystanders a move
+        // has just made illegal — so it is owned by the driver and passed mutably.
+        let mut active_set = active;
         let outcome = {
             let mut iterate = |iter: i32| -> i32 {
                 let mut ctx = SweepCtx {
@@ -1988,31 +2184,13 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
                     max_disp_threshold: consts::MAX_DISP_THRESHOLD,
                     drc_penalty: consts::DRC_PENALTY,
                 };
-                violations = negotiation_iter(&mut ctx_cells, &active, iter, &mut ctx);
-                let footprints: Vec<Vec<usize>> = ctx_cells
-                    .iter()
-                    .map(|c| {
-                        let mut f = Vec::new();
-                        for dy in 0..c.height {
-                            for dx in 0..c.width {
-                                let (gx, gy) = (c.x + dx, c.y + dy);
-                                if gx >= 0 && gy >= 0
-                                    && (gx as usize) < ngrid.width && (gy as usize) < ngrid.height
-                                {
-                                    f.push(gy as usize * ngrid.width + gx as usize);
-                                }
-                            }
-                        }
-                        f
-                    })
-                    .collect();
-                update_history_costs(&mut ngrid.pixels, &footprints);
-                violations
+                // ⛔ The history update lives INSIDE the iteration, gated on the violation count,
+                // exactly where upstream puts it.
+                negotiation_iter(&mut ctx_cells, &mut active_set, iter, &mut ctx)
             };
             run_negotiation(consts::MAX_ITER_NEG, consts::MAX_ITER_NEG2, &mut iterate, || {})
         };
         cells = ctx_cells;
-        let _ = violations;
         outcome
     };
 
