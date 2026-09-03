@@ -238,7 +238,16 @@ impl Grid {
     /// 🔑 `y_end` is likewise measured from the SNAPPED row's Y (`gridEndY(gridYToDbu(grid_y) +
     /// height)`), not from the cell's raw `y`.
     pub fn covering(&self, x: i32, y: i32, w: i32, h: i32) -> (i64, i64, i64, i64) {
-        let xlo = (x.div_euclid(self.site_width)) as i64;
+        // ⛔ **`x / site_width`, NOT `div_euclid`.** `Grid::gridX` is plain C++ integer division,
+        // which TRUNCATES TOWARD ZERO; `div_euclid` FLOORS. They agree for non-negative `x` and
+        // differ for every negative one not exactly on a site boundary — measured, `-190 / 380` is
+        // `0` in C++ and `-1` under `div_euclid`.
+        //
+        // ⚠️ Negative core-relative x is reachable: a cell hanging left of the core, or an
+        // unplaced instance the DEF left at (0,0) in a design whose core does not start there.
+        // See `cpp-to-rust-numeric-reference.md` §11 — upstream's helper is *named* `divFloor` and
+        // does not floor.
+        let xlo = (x / self.site_width) as i64;
         let xhi = xlo + ((w + self.site_width - 1) / self.site_width).max(1) as i64;
         let ylo = match self.grid_snap_down_y(y) {
             Some(v) => v as i64,
