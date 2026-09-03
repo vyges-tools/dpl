@@ -1571,6 +1571,10 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &[usize], iter: i32, ct
     sort_by_negotiation_order(&mut keys);
 
     let drc_penalty = ctx.drc_penalty * (1.0 + iter as f64);
+    // ⚠️ Hoisted and reused across cells. It held one allocation per cell per iteration, which on
+    // a design with thousands of active cells and hundreds of iterations is millions of them for
+    // a buffer whose contents are discarded each time.
+    let mut cands: Vec<Candidate> = Vec::new();
 
     for key in &keys {
         let i = key.idx;
@@ -1596,7 +1600,7 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &[usize], iter: i32, ct
         let congestion_floor = c.width as f64 * c.height as f64;
         let mut best = (INF_COST, ScanRank { window: 0, row_pos: usize::MAX, dx: i32::MAX },
                         c.x, c.y);
-        let mut cands = Vec::new();
+        cands.clear();
         enumerate_candidates(
             c.init_x, c.init_y, c.x, c.y, &irows, ilo, ihi, &crows, clo, chi,
             &|d| {
@@ -1606,14 +1610,14 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &[usize], iter: i32, ct
             },
             &mut cands,
         );
-        for cand in cands {
+        for &cand in &cands {
             if !(ctx.placeable)(&c, cand.x, cand.y) {
                 continue;
             }
             let target = target_cost(cand.x, cand.y, c.init_x, c.init_y,
                                      ctx.max_disp_multiplier, ctx.max_disp_threshold);
-            let fp = footprint_of(&c, cand.x, cand.y, ctx.grid);
-            let mut cost = negotiation_cost(fp.into_iter(), target, best.0);
+            let mut cost = negotiation_cost(
+                footprint_of(&c, cand.x, cand.y, ctx.grid), target, best.0);
             if cost > best.0 || (cost == best.0 && cand.rank >= best.1) {
                 continue; // loses, or ties with a losing rank — skip the costly DRC term
             }
@@ -1631,20 +1635,27 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &[usize], iter: i32, ct
     ctx.grid.total_overuse()
 }
 
-fn footprint_of(c: &SweepCell, x: i32, y: i32, grid: &NegGrid) -> Vec<Option<(i32, i32, f64)>> {
-    let mut out = Vec::with_capacity((c.width * c.height) as usize);
-    for dy in 0..c.height {
-        for dx in 0..c.width {
-            let (gx, gy) = (x + dx, y + dy);
-            if gx < 0 || gy < 0 || gx as usize >= grid.width || gy as usize >= grid.height {
-                out.push(None);
-            } else {
-                let p = grid.at(gx as usize, gy as usize);
-                out.push(Some((p.usage, p.capacity, p.hist_cost)));
-            }
+/// The squares a cell at `(x, y)` would cover, as `(usage, capacity, hist_cost)` — `None` for a
+/// square off the grid.
+///
+/// ⛔ **Lazy, and it must stay lazy.** `findBestLocation` evaluates this for every candidate in
+/// the window — hundreds per cell per iteration — so a version that collected into a `Vec`
+/// allocated once per candidate. Measured 2026-09-02 on `aes` and `ibex`: with the allocating
+/// version neither finished inside a 120-second budget. `negotiationCost` also aborts early once
+/// the running cost passes the incumbent, and a lazy iterator means the squares past that point
+/// are never even read.
+fn footprint_of<'a>(c: &SweepCell, x: i32, y: i32, grid: &'a NegGrid)
+    -> impl Iterator<Item = Option<(i32, i32, f64)>> + 'a
+{
+    let (w, h) = (c.width, c.height);
+    (0..h).flat_map(move |dy| (0..w).map(move |dx| (x + dx, y + dy))).map(move |(gx, gy)| {
+        if gx < 0 || gy < 0 || gx as usize >= grid.width || gy as usize >= grid.height {
+            None
+        } else {
+            let p = grid.at(gx as usize, gy as usize);
+            Some((p.usage, p.capacity, p.hist_cost))
         }
-    }
-    out
+    })
 }
 
 fn cell_is_legal(c: &SweepCell, ctx: &SweepCtx) -> bool {
@@ -1652,7 +1663,6 @@ fn cell_is_legal(c: &SweepCell, ctx: &SweepCtx) -> bool {
         return false;
     }
     footprint_of(c, c.x, c.y, ctx.grid)
-        .into_iter()
         .all(|sq| matches!(sq, Some((u, cap, _)) if cap > 0 && (u - 1).max(0) == 0))
 }
 
