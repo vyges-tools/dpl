@@ -5,19 +5,31 @@ use vyges_opendb::Db;
 
 /// The machine-readable contract `vyges mcp` and the docs generator read.
 ///
-/// ⛔ **`maturity` is `partial`, and that is the honest word.** Three of upstream's nine check
-/// families are evaluated. A descriptor that claimed otherwise would be the defect this suite has
-/// already hit twice — `pad` called five shipped commands "not implemented", `tap` said "NOTHING
-/// IS PLACED" after scoring 9 of 9.
+/// ⛔ **`maturity` is `partial`, and that is the honest word.** Seven of upstream's nine check
+/// families are evaluated, and 35 of its 63 `detailed_placement` cases are outside what this
+/// engine implements at all. A descriptor that claimed otherwise would be the defect this suite
+/// has already hit twice — `pad` called five shipped commands "not implemented", `tap` said
+/// "NOTHING IS PLACED" after scoring 9 of 9.
+///
+/// ⚠️ **And it hit this engine too, in the OTHER direction**: this descriptor said
+/// *"`detailed_placement` (legalization) is NOT implemented ... never makes one legal"* while
+/// legalization was matching the reference on every comparable case. ⟹ **A descriptor rots
+/// toward whatever was true when it was written**, understating as readily as overstating, and
+/// nothing fails when it does. It is read by `vyges mcp` and rendered verbatim into the docs.
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
   "openroad_pin": "945a9f48dc6e5cc91d865daa92c45a1094cb682c",
   "name": "dpl",
-  "summary": "detailed placement: legality checking over the design database",
+  "summary": "detailed placement: legality checking and legalization over the design database",
   "maturity": "partial",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
-    "SCOPE: `check-placement` only. `detailed_placement` (legalization) is NOT implemented, so this engine reports whether a placement is legal and never makes one legal.",
+    "LEGALIZATION is implemented and is the default path: the NEGOTIATION legalizer, which is what upstream's `detailed_placement` runs when `-use_diamond_legalizer` is absent. `--use-diamond-legalizer` selects the other one. The two produce DIFFERENT placements, so the report names which ran.",
+    "Correlated at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c: `detailed_placement` matches the reference on 28 of 28 comparable cases from its own regression suite, including aes (21340 components), ibex (34184) and gcd (549). The agreement is sweep-level, not final-placement only -- upstream's per-iteration debug trace and this engine's match line for line.",
+    "BUT 35 of upstream's 63 `detailed_placement` cases are OUTSIDE that number and are not scored at all: 12 ship no golden, 8 need filler placement, 7 declare REGIONS/GROUPS, 7 need placement padding values, 1 needs both. `28 of 28` is a claim about what the corpus asks, not about every design.",
+    "Two of `countDRCViolations` four terms are NOT evaluated -- `checkEdgeSpacing` (needs each master's LEF58 cell-edge list) and `checkBlockedLayers`. Nothing in the comparable corpus exercises either, so their absence is invisible to the score rather than proven harmless.",
+    "Every instance the model filter excluded is named and counted in `filtered_out` on every run. A filter that drops instances silently is indistinguishable from a design that has none of them.",
+    "`-disallow_one_site_gaps` is NOT accepted: upstream deprecated it (DPL-3/DPL-4) and derives the setting from `hasOneSiteMaster()`, so the flag cannot change the result. `-incremental` is not implemented and is named in `not_done`.",
     "SEVEN of upstream's NINE check families are evaluated: site alignment, placed, overlap, in_rows, padding, blocked_layers and one_site_gap. What is NOT evaluated is named in the report's `not_checked` field on every run -- region_placement needs regions, edge_spacing needs each master's LEF58 cell-edge list -- because a clean verdict from a partial checker must not read as a complete one. Families that ran under a restriction are named in `limitations` rather than left to be inferred.",
     "Site alignment is CORE-RELATIVE: upstream compares `cell->getLeft() % siteWidth` where getLeft() is relative to core_.xMin(). Measured on aes.defok, reading it as an absolute coordinate reports every one of 21340 cells misaligned on a design the reference calls clean.",
     "A site-alignment failure removes the cell from the overlap comparison entirely. That is a side effect of upstream's `continue`, not a separate rule: checkOverlap is what paints a cell into its pixels, so a cell that was skipped is never there for a later cell to collide with.",
@@ -30,33 +42,93 @@ const DESCRIBE: &str = r#"{
     "optional": [{ "arg": "out", "flag": "-o" }],
     "emits_json": true
   },
+  "commands": [
+    {
+      "name": "check-placement",
+      "summary": "report whether a placement is legal, family by family",
+      "args_template": ["check-placement", "{odb}"],
+      "optional": [{ "arg": "out", "flag": "-o" }],
+      "assertion": { "id": "placement-legal", "field": "status", "pass_when": { "eq": "clean" } }
+    },
+    {
+      "name": "detailed-placement",
+      "summary": "legalize the placement -- negotiated congestion by default",
+      "args_template": ["detailed-placement", "{odb}"],
+      "optional": [
+        { "arg": "out_odb", "flag": "--out-odb", "description": "write the legalized database here" },
+        { "arg": "dry_run", "flag": "--dry-run", "description": "legalize and report, write nothing" },
+        { "arg": "use_diamond_legalizer", "flag": "--use-diamond-legalizer", "description": "use the diamond search instead of negotiation" },
+        { "arg": "max_displacement", "flag": "--max-displacement", "description": "cap the move at N sites and M rows, 'N' or 'N,M' (default 500,100)" },
+        { "arg": "site_search_window", "flag": "--site-search-window", "description": "base search width along the row, in sites (default 20)" },
+        { "arg": "row_search_window", "flag": "--row-search-window", "description": "base search height, in rows (default 5)" },
+        { "arg": "drc_penalty", "flag": "--drc-penalty", "description": "cost added per DRC violation at a candidate site (default 5)" },
+        { "arg": "disable_window_extension", "flag": "--disable-window-extension", "description": "do not widen the search past a macro or a wall" }
+      ],
+      "assertion": { "id": "placement-legalized", "field": "status", "pass_when": { "eq": "legalized" } }
+    }
+  ],
   "inputs": {
     "type": "object",
     "required": ["odb"],
-    "properties": { "odb": { "type": "string", "description": "the design database to check" } }
+    "properties": {
+      "odb": { "type": "string", "description": "the design database to check or legalize" },
+      "out_odb": { "type": "string", "description": "write the legalized database here" },
+      "max_displacement": { "type": "string", "description": "move cap, 'SITES' or 'SITES,ROWS'" },
+      "site_search_window": { "type": "integer", "description": "base search width in sites" },
+      "row_search_window": { "type": "integer", "description": "base search height in rows" },
+      "drc_penalty": { "type": "number", "description": "cost per DRC violation at a candidate" },
+      "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
+    }
   },
   "consumes": ["odb"],
-  "produces": ["placement_check"],
-  "artifacts": [{ "role": "placement_check", "field": "report_path" }],
+  "produces": ["placement_check", "odb"],
+  "artifacts": [
+    { "role": "placement_check", "field": "report_path" },
+    { "role": "odb", "field": "out_odb" }
+  ],
   "assertion": { "id": "placement-legal", "field": "status", "pass_when": { "eq": "clean" } }
 }"#;
 
 const USAGE: &str = "\
-vyges physical dpl — detailed placement: legality checking over the design database
+vyges physical dpl — detailed placement: legality checking and legalization over the design database
 
 USAGE:
   vyges physical dpl check-placement    <design.odb> [--json] [-o FILE]
-  vyges physical dpl detailed-placement <design.odb> [--out-odb FILE] [--dry-run]
-                                        [--use-diamond-legalizer]
+  vyges physical dpl detailed-placement <design.odb> [--out-odb FILE] [--dry-run] [OPTIONS]
   vyges physical dpl --describe | --help | --version
+
+OPTIONS:
+  --out-odb FILE            write the legalized database here (default: nothing is written)
+  --dry-run                 legalize and report, write no database
+  --use-diamond-legalizer   use the diamond search instead of negotiation (upstream's flag)
+  --max-displacement N[,M]  cap the move at N sites and M rows (default: 500,100)
+  --site-search-window N    base search width along the row, in sites (default: 20)
+  --row-search-window N     base search height, in rows (default: 5)
+  --drc-penalty F           cost added per DRC violation at a candidate site (default: 5)
+  --disable-window-extension  do not widen the search window past a macro or a wall
+  -o FILE                   write the report to FILE instead of stdout
+  --json                    emit JSON (the default)
+  --describe                print a machine-readable JSON description of the command
+
+EXIT STATUS:
+  0  legalized   every cell was seated; the database was written unless --dry-run
+  0  clean       check-placement found no violation
+  0  vacuous     the run placed nothing -- NOT a completed legalization; read the count
+  1  failed      a cell could not be seated, or a check family found violations
+  2  error       usage error, an unreadable database, or a failed write
 
 ⛔ SCOPE: legalization runs the NEGOTIATION legalizer, which is upstream's default path;
    `--use-diamond-legalizer` selects the diamond one, as upstream's own flag does. Whichever
-   runs, what it does NOT implement is named in `not_done` on every run rather than omitted.
+   runs, what it does NOT implement is named in `not_done` on every run rather than omitted,
+   and every instance the model filter excluded is named in `filtered_out`.
 
 ⚠️ Seven of upstream's nine check families are evaluated. `region_placement` and `edge_spacing`
    are reported in `not_checked` rather than passed over in silence, and a family that ran under
    a restriction says so in `limitations`.
+
+ℹ️ `-disallow_one_site_gaps` has no equivalent here ON PURPOSE: upstream deprecated it and
+   derives the setting from `hasOneSiteMaster()`, so the flag cannot change the result.
+   `-incremental` is not implemented and is named in `not_done`.
 ";
 
 fn main() -> ExitCode {
@@ -100,12 +172,73 @@ fn legalize(args: &[String]) -> ExitCode {
     // `isUseNegotiationLegalizer()` is `!use_diamond_legalizer_` — so NEGOTIATION is the default
     // path and the diamond one is opt-in (4 of 67 upstream cases pass `-use_diamond_legalizer`).
     let (mut odb, mut out_odb, mut dry, mut diamond) = (None, None, false, false);
+    // ⛔ Defaults are upstream's, in `negotiate::Options` — not repeated here, so there is one
+    // place to be wrong about them.
+    let mut opts = vyges_dpl::negotiate::Options::default();
+    // `-max_displacement disp|{disp_x disp_y}`: ONE value sets both axes, two set them
+    // separately. Upstream accepts a Tcl list; the shell equivalent is `X` or `X,Y`.
+    let mut num = |i: &mut usize, what: &str| -> Option<String> {
+        *i += 1;
+        match args.get(*i) {
+            Some(v) => Some(v.clone()),
+            None => { eprintln!("vyges-dpl: {what} needs a value"); None }
+        }
+    };
+    let mut bad = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--out-odb" => { i += 1; out_odb = args.get(i).cloned(); }
             "--dry-run" => dry = true,
             "--use-diamond-legalizer" => diamond = true,
+            "--disable-window-extension" => opts.disable_window_extension = true,
+            "--max-displacement" => match num(&mut i, "--max-displacement") {
+                None => bad = true,
+                Some(v) => {
+                    let (a, b) = v.split_once(',').unwrap_or((v.as_str(), v.as_str()));
+                    match (a.trim().parse::<i32>(), b.trim().parse::<i32>()) {
+                        (Ok(x), Ok(y)) if x >= 0 && y >= 0 => {
+                            opts.max_displacement_x = x;
+                            opts.max_displacement_y = y;
+                        }
+                        _ => {
+                            eprintln!("vyges-dpl: --max-displacement wants SITES or SITES,ROWS \
+                                       (non-negative), got `{v}`");
+                            bad = true;
+                        }
+                    }
+                }
+            },
+            o @ ("--site-search-window" | "--row-search-window") => {
+                match num(&mut i, o).map(|v| (v.trim().parse::<i32>(), v)) {
+                    Some((Ok(n), _)) if n >= 0 => {
+                        if o == "--site-search-window" { opts.site_search_window = n }
+                        else { opts.row_search_window = n }
+                    }
+                    Some((_, v)) => {
+                        eprintln!("vyges-dpl: {o} wants a non-negative integer, got `{v}`");
+                        bad = true;
+                    }
+                    None => bad = true,
+                }
+            }
+            "--drc-penalty" => match num(&mut i, "--drc-penalty").map(|v| (v.trim().parse::<f64>(), v)) {
+                Some((Ok(n), _)) if n >= 0.0 => opts.drc_penalty = n,
+                Some((_, v)) => {
+                    eprintln!("vyges-dpl: --drc-penalty wants a non-negative number, got `{v}`");
+                    bad = true;
+                }
+                None => bad = true,
+            },
+            // ⚠️ Accepted and REFUSED rather than silently ignored. Upstream deprecated it
+            // (DPL-3) because the value is derived from `hasOneSiteMaster`; a flag that cannot
+            // change the answer must not look as though it did.
+            "--disallow-one-site-gaps" => {
+                eprintln!("vyges-dpl: --disallow-one-site-gaps is not accepted: upstream \
+                           deprecated it and derives the setting from hasOneSiteMaster(), so \
+                           the flag cannot change the result");
+                bad = true;
+            }
             a if a.starts_with('-') => {
                 eprintln!("vyges-dpl: unknown option `{a}`");
                 return ExitCode::from(2);
@@ -113,6 +246,9 @@ fn legalize(args: &[String]) -> ExitCode {
             a => odb = Some(a.to_string()),
         }
         i += 1;
+    }
+    if bad {
+        return ExitCode::from(2);
     }
     let Some(path) = odb else {
         eprintln!("vyges-dpl: detailed-placement needs <design.odb>\n\n{USAGE}");
@@ -122,8 +258,10 @@ fn legalize(args: &[String]) -> ExitCode {
         Ok(d) => d,
         Err(e) => { eprintln!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
     };
+    // ⚠️ The tunables belong to the NEGOTIATION legalizer — upstream's setters are on
+    // `NegotiationLegalizer`, and `diamondDPL` reads only the displacement caps.
     let res = match if diamond { vyges_dpl::place::legalize(&db) }
-                    else { vyges_dpl::negotiate::legalize(&db) } {
+                    else { vyges_dpl::negotiate::legalize_with(&db, opts) } {
         Ok(r) => r,
         Err(e) => { eprintln!("vyges-dpl: {e}"); return ExitCode::from(2); }
     };
@@ -285,13 +423,15 @@ mod descriptor_tests {
     }
 
     #[test]
-    fn maturity_is_partial_while_six_families_are_unchecked() {
-        // 🔑 The claim and the code have to move together: if the NOT_CHECKED list empties, this
-        // fails and forces the maturity word to be revisited rather than left behind.
-        let remaining = vyges_dpl::check::NOT_CHECKED.len();
-        if remaining > 0 {
+    fn maturity_is_partial_while_anything_is_unbuilt() {
+        // 🔑 The claim and the code have to move together: if BOTH lists empty, this fails and
+        // forces the maturity word to be revisited rather than left behind.
+        let unchecked = vyges_dpl::check::NOT_CHECKED.len();
+        let undone = vyges_dpl::negotiate::NOT_DONE.len();
+        if unchecked > 0 || undone > 0 {
             assert_eq!(json()["maturity"], "partial",
-                       "{remaining} check families are unimplemented, so maturity is not `structured`");
+                       "{unchecked} check families and {undone} legalizer families are unbuilt, \
+                        so maturity is not `structured`");
         }
     }
 
@@ -302,17 +442,53 @@ mod descriptor_tests {
             assert!(text.contains(family),
                     "`{family}` is not evaluated and the descriptor does not say so");
         }
-        assert!(text.contains("detailed_placement"),
-                "the descriptor must say legalization is not implemented");
+    }
+
+    #[test]
+    fn the_descriptor_does_not_understate_what_the_engine_does() {
+        // ⛔ **This engine's descriptor rotted in the UNDERSTATING direction**, which the suite
+        // had only ever seen the other way round. It said *"`detailed_placement` (legalization)
+        // is NOT implemented ... never makes one legal"* for as long as legalization was
+        // matching the reference on every comparable case — and the test that was supposed to
+        // guard the descriptor ASSERTED that sentence, so it aged with it.
+        //
+        // 🔑 ⟹ **A guard written as "the descriptor must say we cannot do X" becomes a guard
+        // that we never do X.** Pin what IS true and let the negative claims fall out.
+        let text = json()["provenance_limitations"].to_string();
+        assert!(text.contains("LEGALIZATION is implemented"),
+                "legalization is implemented and the descriptor must say so");
+        for stale in ["is NOT implemented", "never makes one legal"] {
+            assert!(!text.contains(stale), "the descriptor still carries the stale claim `{stale}`");
+        }
+        // ⚠️ And the number must not be quotable without its caveat: 28 of 28 is a claim about
+        // what the corpus asks, and 35 of its 63 cases are not scored at all.
+        assert!(text.contains("28 of 28"), "the correlation result belongs in the contract");
+        assert!(text.contains("35 of upstream's 63"),
+                "the corpus caveat must travel with the number it qualifies");
     }
 
     #[test]
     fn every_command_the_help_advertises_is_dispatched() {
         // ⚠️ `--describe` was advertised in USAGE before it existed. That is the same class of
         // stale claim, one direction over.
-        for cmd in ["check-placement", "--describe", "--help", "--version"] {
+        for cmd in ["check-placement", "detailed-placement", "--describe", "--help", "--version"] {
             assert!(USAGE.contains(cmd), "`{cmd}` is dispatched but not in --help");
         }
+    }
+
+    #[test]
+    fn every_option_the_parser_accepts_is_documented() {
+        // ⛔ An option that works and is undocumented is as bad as one that is documented and
+        // does not: the generated CLI reference page IS `--help`, verbatim.
+        for flag in ["--out-odb", "--dry-run", "--use-diamond-legalizer", "--max-displacement",
+                     "--site-search-window", "--row-search-window", "--drc-penalty",
+                     "--disable-window-extension", "-o", "--json"] {
+            assert!(USAGE.contains(flag), "`{flag}` is accepted but not in --help");
+        }
+        // 🔑 And the two upstream options deliberately NOT offered must say why they are absent,
+        // or the next reader will file their absence as an oversight.
+        assert!(USAGE.contains("disallow_one_site_gaps") && USAGE.contains("incremental"),
+                "an option refused on purpose must be documented as refused");
     }
 
     #[test]

@@ -2709,7 +2709,51 @@ pub const NOT_DONE: &[&str] = &[
     // ⚠️ `checkPadding` runs, but with a padding of zero: `set_placement_padding` is unbuilt, so
     // the scan is never widened and nothing ever reserves a square it does not occupy.
     "padding values (set_placement_padding, padding_reserved_by)",
+    // ⬜ `-incremental`: upstream clears `setPlaced(false)` on every movable cell unless it is
+    // given. This engine has no per-cell `placed` flag, so the flag would be inert.
+    "incremental placement (-incremental)",
 ];
+
+/// The tunables `detailed_placement` exposes, with upstream's own defaults.
+///
+/// ⛔ **Defaults transcribed, not chosen.** `Opendp::detailedPlacement` treats a max displacement
+/// of `0` as "unset" and substitutes **500 sites / 100 rows**; the window, row and penalty
+/// setters are only called when the Tcl passed a value, so their defaults are the
+/// `NegotiationLegalizer` member initialisers. A changed default is a changed algorithm, and the
+/// oracle prints these back — `DPL-0005` names the displacement caps and `DPL-1103`/`DPL-1104`
+/// the window and penalty — so they can be checked against a run rather than trusted.
+///
+/// ⚠️ **`-disallow_one_site_gaps` is deliberately NOT here.** Upstream deprecated it: both
+/// `detailed_placement` and `check_placement` warn (DPL-3 / DPL-4) and then ignore it, because
+/// the value is DERIVED — `importDb` sets it from `!odb::hasOneSiteMaster(db_)`. Accepting a flag
+/// that cannot change the answer would promise a control this engine does not have.
+///
+/// ⬜ **`-incremental` is not here either, and that is a gap rather than a decision.** It sets
+/// `incremental_` and, when false, clears `setPlaced(false)` on every movable cell before
+/// legalizing. This engine does not model a per-cell `placed` flag, so the flag would be inert;
+/// it is named in `NOT_DONE` instead of accepted and dropped.
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    pub max_displacement_x: i32,
+    pub max_displacement_y: i32,
+    pub site_search_window: i32,
+    pub row_search_window: i32,
+    pub drc_penalty: f64,
+    pub disable_window_extension: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            max_displacement_x: 500,
+            max_displacement_y: 100,
+            site_search_window: consts::SITE_SEARCH_WINDOW,
+            row_search_window: consts::ROW_SEARCH_WINDOW,
+            drc_penalty: consts::DRC_PENALTY,
+            disable_window_extension: false,
+        }
+    }
+}
 
 /// `NegotiationLegalizer::legalize` — the DEFAULT detailed-placement path.
 ///
@@ -2729,6 +2773,11 @@ pub const NOT_DONE: &[&str] = &[
 ///    after each, diamond recovery on a 3-iteration stall;
 /// 6. sync back: grid units → absolute DBU, ⚠️ **orientation from the row landed in**.
 pub fn legalize(db: &Db) -> Result<Legalized, String> {
+    legalize_with(db, Options::default())
+}
+
+/// [`legalize`] with the tunables `detailed_placement` exposes.
+pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
     let grid = Grid::build(db)?;
     let core = grid.core;
     let (gw, gh) = (grid.row_site_count as i32, grid.row_count as i32);
@@ -3088,8 +3137,11 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         for &idx in &illegal {
             let seed = &cells[idx];
             let site_window = effective_site_window(
-                consts::SITE_SEARCH_WINDOW, seed.width, 500, true);
-            let row_cap = effective_row_cap(consts::ROW_SEARCH_WINDOW, seed.height, 100, true);
+                opts.site_search_window, seed.width, opts.max_displacement_x,
+                !opts.disable_window_extension);
+            let row_cap = effective_row_cap(opts.row_search_window, seed.height,
+                                            opts.max_displacement_y,
+                                            !opts.disable_window_extension);
             let (xlo, xhi) = (seed.x - site_window, seed.x + seed.width + site_window);
             let ylo = (seed.y - row_cap).max(0);
             let yhi = (seed.y + seed.height + row_cap).min(gh - 1);
@@ -3143,9 +3195,11 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             let open_at = |px: i32| (0..ch).all(|dy| (0..cw).all(|dx| cap_at(px + dx, y + dy) > 0));
             let w = build_search_window(
                 x, y,
-                consts::SITE_SEARCH_WINDOW, consts::ROW_SEARCH_WINDOW,
-                effective_row_cap(consts::ROW_SEARCH_WINDOW, c.height, 100, true),
-                500, 100, true,
+                opts.site_search_window, opts.row_search_window,
+                effective_row_cap(opts.row_search_window, c.height, opts.max_displacement_y,
+                                  !opts.disable_window_extension),
+                opts.max_displacement_x, opts.max_displacement_y,
+                !opts.disable_window_extension,
                 &off_die,
                 &open_at,
                 c.height, gh,
@@ -3285,7 +3339,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
                     fixed_paint: &fixed_paint,
                     max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
                     max_disp_threshold: consts::MAX_DISP_THRESHOLD,
-                    drc_penalty: consts::DRC_PENALTY,
+                    drc_penalty: opts.drc_penalty,
                 }
             };
         }
@@ -3331,12 +3385,11 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
                     // past the last index, and the candidate is generated and then refused —
                     // transcribed rather than tightened.
                     let bounds = (
-                        // 500 sites / 100 rows: `max_displacement_x_` / `_y_`, the same
-                        // defaults the search windows above are capped by.
-                        (c.x - 500).max(0) as i64,
-                        (c.y - 100).max(0) as i64,
-                        (c.x + 500).min(gw) as i64,
-                        (c.y + 100).min(gh) as i64,
+                        // `max_displacement_x_` / `_y_`, the same caps the search windows use.
+                        (c.x - opts.max_displacement_x).max(0) as i64,
+                        (c.y - opts.max_displacement_y).max(0) as i64,
+                        (c.x + opts.max_displacement_x).min(gw) as i64,
+                        (c.y + opts.max_displacement_y).min(gh) as i64,
                     );
                     let found = crate::place::diamond_points(
                         c.x as i64, c.y as i64, bounds, &calc_dist, 200_000,

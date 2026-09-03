@@ -7,6 +7,17 @@ vyges physical dpl check-placement    design.odb
 vyges physical dpl detailed-placement design.odb --out-odb out.odb
 ```
 
+`detailed-placement` takes upstream's own tunables — `--max-displacement`,
+`--site-search-window`, `--row-search-window`, `--drc-penalty`,
+`--disable-window-extension`, `--use-diamond-legalizer` — with upstream's defaults. Run
+`--help` for the full list, and `--describe` for the machine-readable contract.
+
+ℹ️ Two of upstream's options are deliberately absent. `-disallow_one_site_gaps` is **deprecated
+there** (it warns DPL-3 and ignores the flag, because the setting is derived from
+`hasOneSiteMaster()`), so accepting it would promise a control that cannot change the answer;
+this engine refuses it with that explanation rather than accepting it silently. `-incremental`
+is unimplemented and named in `not_done`.
+
 ## Scope — read this before the correctness section
 
 ⛔ **Every run names what it did NOT do.** `check-placement` reports `not_checked` (families it
@@ -24,8 +35,16 @@ diamond search outward from each cell's own position — mirroring upstream's fl
 ⚠️ The two produce **different placements**, so the report says which one ran. Comparing one
 legalizer's output against the other's expected result measures nothing.
 
-⬜ Not implemented, and named in `not_done` on every run: groups and regions, master symmetry,
-DRC history costs, and the diamond-search recovery a stalled negotiation falls back on.
+⬜ Not implemented, and named in `not_done` on every run: groups and regions, placement padding
+values, incremental placement, and two of `countDRCViolations`' four terms — `checkEdgeSpacing`
+(needs each master's LEF58 cell-edge list) and `checkBlockedLayers`.
+
+⚠️ **Nothing in the comparable corpus exercises those two DRC terms**, so their absence is
+invisible to the score rather than shown to be harmless. `checkPadding` was in exactly that
+position until it was built, and wiring it moved `aes` by 5,700 cells.
+
+Every run also names, in `filtered_out`, each instance the model filter excluded — a filter that
+drops instances silently is indistinguishable from a design that has none of them.
 
 ### Checking
 
@@ -44,6 +63,30 @@ rows, padding, blocked layers and one-site gaps.
 🔑 The checker came first on purpose. It is the oracle — it needs no legalizer to be correct in
 order to be useful — and upstream's own suite leans on it harder: **77 of 92 `.tcl` tests call
 `check_placement`, 68 call `detailed_placement`**.
+
+## Status
+
+✅ **Legalization matches the reference on every comparable case in its own regression suite** —
+**28 of 28**, at pin `945a9f48dc6e5cc91d865daa92c45a1094cb682c`, including the three large
+designs:
+
+| design | components | result |
+| --- | ---: | --- |
+| `aes` | 21,340 | identical |
+| `ibex` | 34,184 | identical |
+| `gcd` | 549 | identical |
+| the other 25 cases | — | identical |
+
+🔑 **The agreement is sweep-level, not final-placement only.** Upstream's own per-iteration debug
+trace and this engine's match line for line — same cell, same order, same chosen position, every
+iteration. A matching output can be coincidence; a matching decision sequence is the algorithm.
+
+⛔ **That is a claim about what this corpus asks, not about every design.** 35 of upstream's 63
+`detailed_placement` cases are outside it and are not scored at all: 12 ship no golden, 8 need
+filler placement, 7 declare regions or groups, 7 need placement padding values, 1 needs both.
+
+⚠️ **Every score is scoped to one upstream commit.** A score quoted without its pin says nothing:
+the reference moves.
 
 ## Correctness
 
