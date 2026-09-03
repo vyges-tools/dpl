@@ -989,11 +989,12 @@ pub enum Outcome {
 /// iteration (isolation point = 0)" and "Phase 2 – isolation point active"), and the code at
 /// `NegotiationLegalizerPass.cpp:314` — `if (iter >= kIsolationPt && isCellLegal(idx))` — is what
 /// runs. Transcribed from the code.
-pub fn run_negotiation(
+pub fn run_negotiation<S>(
     max_iter_neg: i32,
     max_iter_neg2: i32,
-    mut iterate: impl FnMut(i32) -> i32,
-    mut diamond_recovery: impl FnMut(),
+    state: &mut S,
+    mut iterate: impl FnMut(&mut S, i32) -> i32,
+    mut diamond_recovery: impl FnMut(&mut S),
 ) -> Outcome {
     let mut stalled_phase_1 = None;
     let mut final_violations = -1;
@@ -1006,7 +1007,7 @@ pub fn run_negotiation(
         let mut last = -1;
         for i in 0..count {
             let actual = start + i;
-            let violations = iterate(actual);
+            let violations = iterate(state, actual);
             last = violations;
             if violations == 0 {
                 return Outcome::Converged { phase: phase as u8 + 1, iter: i };
@@ -1014,7 +1015,7 @@ pub fn run_negotiation(
             if violations == prev {
                 stall += 1;
                 if stall == 3 {
-                    diamond_recovery();
+                    diamond_recovery(state);
                     // ⛔ BREAK, not return. Phase 1 falls through into phase 2; only a phase-2
                     // stall ends the run.
                     if phase == 1 {
@@ -1761,8 +1762,9 @@ mod tests {
     #[test]
     fn converging_in_phase_one_stops_immediately() {
         let mut seen = Vec::new();
-        let out = run_negotiation(400, 1000, |i| { seen.push(i); if i < 3 { 5 - i } else { 0 } },
-                                  || panic!("recovery must not run on a converging design"));
+        let out = run_negotiation(400, 1000, &mut (),
+                                  |_, i| { seen.push(i); if i < 3 { 5 - i } else { 0 } },
+                                  |_| panic!("recovery must not run on a converging design"));
         assert_eq!(out, Outcome::Converged { phase: 1, iter: 3 });
         assert_eq!(seen, vec![0, 1, 2, 3], "no iteration past convergence");
     }
@@ -1770,7 +1772,7 @@ mod tests {
     #[test]
     fn three_identical_counts_are_a_stall_and_call_recovery() {
         let mut recovered = 0;
-        let out = run_negotiation(400, 1000, |_| 7, || recovered += 1);
+        let out = run_negotiation(400, 1000, &mut (), |_, _| 7, |_| recovered += 1);
         // ⛔ A count that never moves stalls TWICE: once in phase 1, which breaks into phase 2,
         // and once in phase 2, which ends the run. Recovery therefore runs once per phase.
         assert_eq!(out, Outcome::StalledIntoRecovery { phase: 2, iter: 3, violations: 7 });
@@ -1782,12 +1784,12 @@ mod tests {
         // 🔑 The property the `break` exists for: after recovery, phase 2 gets its full run.
         // ⚠️ This fails if phase 1 RETURNS on a stall — `iters` would stop at 3.
         let mut iters = Vec::new();
-        let out = run_negotiation(400, 5, |i| {
+        let out = run_negotiation(400, 5, &mut (), |_, i| {
             iters.push(i);
             // Constant through the phase-1 stall, then a sequence that never repeats so phase 2
             // exhausts rather than stalling too.
             if iters.len() <= 4 { 7 } else { 100 - iters.len() as i32 }
-        }, || {});
+        }, |_| {});
         assert_eq!(&iters[..4], &[0, 1, 2, 3], "phase 1 stalled at its 4th iteration");
         assert_eq!(&iters[4..], &[400, 401, 402, 403, 404],
                    "phase 2 ran all 5 of its iterations, counter continuing from 400");
@@ -1800,8 +1802,9 @@ mod tests {
         // ⚠️ Not "no improvement": a count that rises then falls is progress.
         let seq = [4, 4, 5, 5, 5, 5];
         let mut n = 0;
-        let out = run_negotiation(400, 1000, |_| { let v = seq[n.min(seq.len() - 1)]; n += 1; v },
-                                  || {});
+        let out = run_negotiation(400, 1000, &mut (),
+                                  |_, _| { let v = seq[n.min(seq.len() - 1)]; n += 1; v },
+                                  |_| {});
         // 4,4 -> stall 1; 5 resets; 5,5 -> stall 2; 5 -> stall 3 at index 5. Phase 1 then breaks
         // into phase 2, where the count is still a constant 5 and it stalls again.
         assert_eq!(out, Outcome::StalledIntoRecovery { phase: 2, iter: 3, violations: 5 });
@@ -1811,7 +1814,7 @@ mod tests {
     fn phase_two_continues_the_iteration_counter() {
         // ⛔ The isolation point and the DRC penalty both read this number.
         let mut iters = Vec::new();
-        run_negotiation(3, 2, |i| { iters.push(i); 1 + (iters.len() as i32 % 2) }, || {});
+        run_negotiation(3, 2, &mut (), |_, i| { iters.push(i); 1 + (iters.len() as i32 % 2) }, |_| {});
         assert_eq!(&iters[..3], &[0, 1, 2], "phase 1");
         assert_eq!(&iters[3..], &[3, 4], "phase 2 continues from 3, it does not restart at 0");
     }
@@ -1820,7 +1823,7 @@ mod tests {
     fn exhausting_both_phases_is_not_an_error_here() {
         // ⚠️ Upstream reports non-convergence through the caller's numViolations().
         let mut n = 0;
-        let out = run_negotiation(2, 2, |_| { n += 1; n }, || {});
+        let out = run_negotiation(2, 2, &mut (), |_, _| { n += 1; n }, |_| {});
         assert!(matches!(out, Outcome::Exhausted { .. }));
         assert_eq!(n, 4, "both phases ran to their limits");
     }
@@ -2487,7 +2490,6 @@ pub const NOT_DONE: &[&str] = &[
     // the scan is never widened and nothing ever reserves a square it does not occupy.
     "padding values (set_placement_padding, padding_reserved_by)",
     "drc_history_costs (updateDrcHistoryCosts)",
-    "diamondRecovery on stall",
 ];
 
 /// `NegotiationLegalizer::legalize` — the DEFAULT detailed-placement path.
@@ -2906,27 +2908,148 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             count
         };
 
-        let mut ctx_cells = cells;
+        // `Opendp::canBePlaced` — `diamondSearch`'s acceptance test, and a DIFFERENT question
+        // from `isCellLegal`.
+        //
+        // ⛔ **It demands an EMPTY square, not merely an un-overused one.** Negotiation tolerates
+        // overlap and prices it; the diamond search does not tolerate it at all. A recovery that
+        // reused `isCellLegal` would hand a stuck cell a square another cell already holds.
+        //
+        // ⚠️ **The one-site-gap term here uses `Place.cpp`'s edge reading**, where an off-grid
+        // square holds NO cell — the opposite of `PlacementDRC`'s. A cell one empty site from the
+        // core edge is clean here and a violation there. See [`crate::drc::EdgeReading`].
+        let can_be_placed = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
+            let (cw, ch) = dims[i];
+            // `bin_y >= getRowCount()`, then `x_end > getRowSiteCount()`.
+            if x < 0 || y < 0 || y >= gh || x + cw > gw || y + ch > gh {
+                return false;
+            }
+            for dy in 0..ch {
+                for dx in 0..cw {
+                    let (gx, gy) = ((x + dx) as usize, (y + dy) as usize);
+                    // `!pixel->is_valid` and `pixel->cell` — both refuse.
+                    if g.at(gx, gy).capacity == 0 || g.occupant(x + dx, y + dy).is_some() {
+                        return false;
+                    }
+                }
+            }
+            // Bottom-row site orientation, `checkMasterSym`, and the multi-row power stack.
+            if !site_ok(i, x, y) {
+                return false;
+            }
+            if !crate::drc::check_one_site_gap(
+                one_site_gaps_disallowed, x, x + cw, y, y + ch,
+                crate::drc::EdgeReading::OffGridIsEmpty,
+                &|px, py| {
+                    if px < 0 || py < 0 || px as usize >= g.width || py as usize >= g.height {
+                        None
+                    } else {
+                        Some(g.occupant(px, py).is_some())
+                    }
+                })
+            {
+                return false;
+            }
+            // The trailing `drc_engine_->checkDRC(...)`.
+            pad_ok(i, x, y, g) && gap_ok(i, x, y, g)
+        };
+
+        // ⚠️ **`calcDist` is in DBU, not in grid steps** — `|dx| * site_width` plus the DBU
+        // distance between the two rows. On a design with rows of differing heights a step up is
+        // not a step across, and ordering the diamond by grid steps visits candidates in a
+        // different order and so returns a different site.
+        let row_dbu = |r: i64| -> i64 {
+            grid.row_y.get(usize::try_from(r).unwrap_or(usize::MAX)).copied().unwrap_or(0) as i64
+        };
+        let calc_dist = |a: (i64, i64), b: (i64, i64)| -> i64 {
+            (a.0 - b.0).abs() * sw as i64 + (row_dbu(a.1) - row_dbu(b.1)).abs()
+        };
+
         // ⚠️ The active set GROWS during the run — `negotiationIter` appends bystanders a move
-        // has just made illegal — so it is owned by the driver and passed mutably.
-        let mut active_set = active;
-        let outcome = {
-            let mut iterate = |iter: i32| -> i32 {
-                let mut ctx = SweepCtx {
-                    grid: &mut ngrid, window: &window, placeable: &placeable,
+        // has just made illegal — so it lives in the run state with everything else the two
+        // callbacks both touch.
+        struct Run {
+            cells: Vec<SweepCell>,
+            active: Vec<usize>,
+            grid: NegGrid,
+        }
+        let mut run = Run { cells, active, grid: ngrid };
+        // ⚠️ A macro rather than a closure: the two callbacks below each borrow the grid for a
+        // different lifetime, and a closure returning `SweepCtx<'_>` cannot be generic over both.
+        macro_rules! ctx_for {
+            ($g:expr) => {
+                SweepCtx {
+                    grid: $g, window: &window, placeable: &placeable,
                     drc_violations: &drc,
                     fixed_paint: &fixed_paint,
                     max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
                     max_disp_threshold: consts::MAX_DISP_THRESHOLD,
                     drc_penalty: consts::DRC_PENALTY,
-                };
+                }
+            };
+        }
+        let outcome = run_negotiation(
+            consts::MAX_ITER_NEG,
+            consts::MAX_ITER_NEG2,
+            &mut run,
+            |r, iter| {
+                let mut ctx = ctx_for!(&mut r.grid);
                 // ⛔ The history update lives INSIDE the iteration, gated on the violation count,
                 // exactly where upstream puts it.
-                negotiation_iter(&mut ctx_cells, &mut active_set, iter, &mut ctx)
-            };
-            run_negotiation(consts::MAX_ITER_NEG, consts::MAX_ITER_NEG2, &mut iterate, || {})
-        };
-        cells = ctx_cells;
+                negotiation_iter(&mut r.cells, &mut r.active, iter, &mut ctx)
+            },
+            |r| {
+                // `diamondRecovery` — the stall escape hatch, run once per phase.
+                //
+                // ⛔ **Rip up FIRST.** `diamondSearch` reads the occupancy map through
+                // `canBePlaced`, so a cell still stamped where it sits blocks itself and the
+                // search returns its own square or nothing.
+                //
+                // 🔑 **A cell with no legal site is put BACK where it was**, not dropped:
+                // upstream's `else` branch re-places it at its current position "so the
+                // negotiation loop can keep trying". Leaving it ripped up would lose its usage
+                // and its stamp and make the next iteration's counts wrong.
+                let active = r.active.clone();
+                for idx in active {
+                    let c = r.cells[idx].clone();
+                    if c.fixed {
+                        continue;
+                    }
+                    {
+                        let ctx = ctx_for!(&mut r.grid);
+                        if cell_is_legal(&c, &ctx) {
+                            continue;
+                        }
+                    }
+                    r.grid.erase_cell(idx, c.x, c.y, c.width, c.height);
+                    r.grid.add_usage(c.x, c.y, c.width, c.height, -1);
+                    // Upstream's bounds: the DPL displacement budget around the CURRENT
+                    // position, clipped to the grid. ⚠️ `x_max`/`y_max` clip to the COUNTS, one
+                    // past the last index, and the candidate is generated and then refused —
+                    // transcribed rather than tightened.
+                    let bounds = (
+                        // 500 sites / 100 rows: `max_displacement_x_` / `_y_`, the same
+                        // defaults the search windows above are capped by.
+                        (c.x - 500).max(0) as i64,
+                        (c.y - 100).max(0) as i64,
+                        (c.x + 500).min(gw) as i64,
+                        (c.y + 100).min(gh) as i64,
+                    );
+                    let found = crate::place::diamond_points(
+                        c.x as i64, c.y as i64, bounds, &calc_dist, 200_000,
+                    )
+                    .into_iter()
+                    .find(|&(px, py)| can_be_placed(idx, px as i32, py as i32, &r.grid));
+                    let (nx, ny) = found.map_or((c.x, c.y), |(px, py)| (px as i32, py as i32));
+                    r.cells[idx].x = nx;
+                    r.cells[idx].y = ny;
+                    r.grid.add_usage(nx, ny, c.width, c.height, 1);
+                    r.grid.paint_cell(idx, nx, ny, c.width, c.height);
+                }
+            },
+        );
+        cells = run.cells;
+        ngrid = run.grid;
         outcome
     };
 
