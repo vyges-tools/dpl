@@ -183,6 +183,22 @@ pub fn cell_width_in_sites(master_width: i64, site_width: i64) -> i32 {
     (1).max((master_width as f64 / site_width as f64).round() as i32)
 }
 
+/// `Grid::gridWidth` — a cell's width in the DPL grid, `divCeil(width, site_width)`.
+///
+/// ⛔ **Not the same as [`cell_width_in_sites`], which ROUNDS.** `NegCell::width` rounds and
+/// drives usage, capacity, cost and `inDie`; this ceils and drives the occupancy stamp,
+/// `checkPadding`, `checkOneSiteGap` and `checkPixels`. For a master 263.16 sites wide the two
+/// answer 263 and 264, and the extra column decides whether a neighbour may sit there.
+///
+/// ⚠️ `divCeil` upstream is `ceil(double(a) / b)` — a float divide, so it is exact here rather
+/// than the usual integer `(a + b - 1) / b` (which would overflow on a large enough width).
+pub fn grid_width_in_sites(master_width: i64, site_width: i64) -> i32 {
+    if site_width <= 0 {
+        return 1;
+    }
+    (master_width as f64 / site_width as f64).ceil() as i32
+}
+
 /// The starting grid position — `gridX` for x, **`gridRoundY`** for y, then clamped.
 ///
 /// ⚠️ **`x` FLOORS and `y` ROUNDS.** `diamondDPL`'s `legalGridPt` snaps y DOWN instead; this
@@ -1734,6 +1750,26 @@ mod tests {
     }
 
     #[test]
+    fn the_model_width_and_the_grid_width_are_two_different_numbers() {
+        // ⛔ `NegCell::width` ROUNDS and `Grid::gridWidth` CEILS, and a cell whose width is not a
+        // whole number of sites gets two different answers. The first drives usage, capacity,
+        // cost and `inDie`; the second drives the occupancy stamp, `checkPadding`,
+        // `checkOneSiteGap` and `checkPixels`.
+        //
+        // ⚠️ Measured on `macro_placed_not_fixed`: a 100000-dbu macro on a 380-dbu site is
+        // 263.16 sites. Upstream stamps 264 columns and refuses a cell on the last one; we
+        // stamped 263 and put `u3` one site left of the reference's answer.
+        assert_eq!(cell_width_in_sites(100_000, 380), 263, "round");
+        assert_eq!(grid_width_in_sites(100_000, 380), 264, "divCeil");
+        // 🔑 They agree for an exact multiple, which is why a corpus of ordinary std cells can
+        // hide the difference completely — every Nangate45 cell here is a whole number of sites.
+        assert_eq!(cell_width_in_sites(1140, 380), grid_width_in_sites(1140, 380));
+        // ⚠️ And they differ in BOTH directions: 1.4 sites rounds to 1 and ceils to 2.
+        assert_eq!(cell_width_in_sites(532, 380), 1);
+        assert_eq!(grid_width_in_sites(532, 380), 2);
+    }
+
+    #[test]
     fn cell_width_rounds_rather_than_ceils() {
         // ⛔ The difference from Grid::gridWidth, which uses divCeil.
         assert_eq!(cell_width_in_sites(140, 100), 1, "1.4 sites rounds DOWN to 1");
@@ -1906,7 +1942,7 @@ mod tests {
             let mut cells = vec![sweep_cell("mover", 0, 1), sweep_cell("blocker", 0, 1)];
             for (i, c) in cells.iter().enumerate() {
                 grid.add_usage(c.x, c.y, c.width, c.height, 1);
-                grid.paint_cell(i, c.x, c.y, c.width, c.height);
+                grid.paint_cell(i, c.x, c.y, c.paint_width, c.height);
             }
             // The blocker painted last, so it owns the slot and the mover's rip-up leaves it.
             let drc = move |_c: &SweepCell, x: i32, y: i32, g: &NegGrid| -> i32 {
@@ -1922,7 +1958,7 @@ mod tests {
 
     fn sweep_cell(name: &str, x: i32, w: i32) -> SweepCell {
         SweepCell { name: name.into(), x, y: 0, init_x: x, init_y: 0,
-                    width: w, height: 1, fixed: false }
+                    width: w, height: 1, paint_width: w, fixed: false }
     }
 
     /// A one-row grid of `width` sites, all valid.
@@ -2148,6 +2184,22 @@ pub struct SweepCell {
     pub init_y: i32,
     pub width: i32,
     pub height: i32,
+    /// The cell's width in the DPL GRID, `Grid::gridWidth` — `divCeil(width, site_width)`.
+    ///
+    /// ⛔ **A SECOND width, and it is not the same number as `width`.** `NegCell::width` is
+    /// `round(width / site_width)` and drives usage, capacity, cost and `inDie`; `gridWidth` is
+    /// `divCeil` and drives the occupancy stamp and every `PlacementDRC` / `checkPixels` test.
+    /// They differ by one site for any master whose width is not a whole number of sites.
+    ///
+    /// ⚠️ Measured on `macro_placed_not_fixed`: a 100000-dbu macro on a 380-dbu site is 263.16
+    /// sites — `round` 263, `divCeil` 264. Upstream stamps column 310 and refuses to place a
+    /// cell there; we did not stamp it, and put `u3` one site left of the reference's answer.
+    ///
+    /// 🔑 The HEIGHT has the same split — `gridHeight(master)` against
+    /// `gridEndY(gridYToDbu(y) + height)` — but the two agree wherever a master's height matches
+    /// the rows it sits on, which is every design in this corpus. Kept as one field, and stated
+    /// here because they are still two different questions.
+    pub paint_width: i32,
     pub fixed: bool,
 }
 
@@ -2193,11 +2245,14 @@ pub struct SweepCtx<'a> {
 /// cell still occupies (see [`NegPixel::cell`]). Upstream calls this before counting violations
 /// so the scan sees the true placement rather than the holes the sweep punched.
 pub fn sync_all_cells_to_grid(cells: &[SweepCell], fixed: &[FixedPaint], grid: &mut NegGrid) {
+    // ⛔ `paint_width`, not `width` — the occupancy map is the DPL grid's and is measured with
+    // `gridWidth`. Painting the re-sync with one width and the sweep with the other leaves a
+    // map that disagrees with itself between iterations.
     for (i, c) in cells.iter().enumerate() {
-        grid.erase_cell(i, c.x, c.y, c.width, c.height);
+        grid.erase_cell(i, c.x, c.y, c.paint_width, c.height);
     }
     for (i, c) in cells.iter().enumerate() {
-        grid.paint_cell(i, c.x, c.y, c.width, c.height);
+        grid.paint_cell(i, c.x, c.y, c.paint_width, c.height);
     }
     for &(idx, x, y, w, h) in fixed {
         grid.paint_cell(idx, x, y, w, h);
@@ -2283,7 +2338,7 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
         // ⛔ `ripUp` is `eraseCellFromDplGrid` THEN `addUsage(-1)` — both halves. The occupancy
         // stamp has to go too, or `findBestLocation`'s DRC term sees the cell as still sitting
         // where it was and refuses to put it back there.
-        ctx.grid.erase_cell(i, c.x, c.y, c.width, c.height);
+        ctx.grid.erase_cell(i, c.x, c.y, c.paint_width, c.height);
         ctx.grid.add_usage(c.x, c.y, c.width, c.height, -1);
 
         // 4. Enumerate and score.
@@ -2328,7 +2383,7 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
         cells[i].y = best.3;
         // `place` is `addUsage(+1)` then `syncCellToDplGrid`, which is a `paintPixel`.
         ctx.grid.add_usage(best.2, best.3, c.width, c.height, 1);
-        ctx.grid.paint_cell(i, best.2, best.3, c.width, c.height);
+        ctx.grid.paint_cell(i, best.2, best.3, c.paint_width, c.height);
         moves_count += 1;
         if tracing {
             eprintln!("Negotiation iter {}, cell {}, moves {}, best location {}, {}",
@@ -2617,7 +2672,9 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         ngrid.add_usage(gx, gy, cw, ch, 1);
         cells.push(SweepCell {
             name: name.clone(), x: gx, y: gy, init_x: gx, init_y: gy,
-            width: cw, height: ch, fixed: false,
+            width: cw, height: ch,
+            paint_width: grid_width_in_sites(w as i64, sw as i64),
+            fixed: false,
         });
         sites.push(db.master_get_site(&master));
         masters.push(master.clone());
@@ -2659,6 +2716,12 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     // ⚠️ Geometry is copied out so the closures below do not borrow `cells` — the sweep needs it
     // mutably. The dimensions never change during a run, so the copy cannot go stale.
     let dims: Vec<(i32, i32)> = cells.iter().map(|c| (c.width, c.height)).collect();
+    // ⛔ **The DPL grid's footprint, and it is a DIFFERENT one.** `dims` is the negotiation
+    // model's (`round` width) and answers usage, capacity, cost and `inDie`; this is
+    // `Grid::gridWidth`'s (`divCeil`) and answers the occupancy stamp, `checkPadding`,
+    // `checkOneSiteGap` and `checkPixels`. Handing either question the other's footprint is a
+    // one-site error on every master whose width is not a whole number of sites.
+    let dpl_dims: Vec<(i32, i32)> = cells.iter().map(|c| (c.paint_width, c.height)).collect();
     let power = PowerModel::build(db, &grid, &levels);
 
     // `isValidRow`, transcribed. ⛔ **The site map is consulted at the BOTTOM ROW and at the
@@ -2724,7 +2787,8 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     // does not carry. They stay in `NOT_DONE`.
     let one_site_gaps_disallowed = !db.has_one_site_master();
     let gap_ok = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
-        let (cw, ch) = dims[i];
+        // `checkOneSiteGap` measures the cell with `grid_->gridWidth(cell)`.
+        let (cw, ch) = dpl_dims[i];
         crate::drc::check_one_site_gap(
             one_site_gaps_disallowed, x, x + cw, y, y + ch,
             crate::drc::EdgeReading::OffGridIsOccupied,
@@ -2758,7 +2822,8 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     // ℹ️ Padding VALUES are still not implemented — `set_placement_padding` cases are skipped —
     // so the scan is never widened and `padding_reserved_by` is always empty. See `NOT_DONE`.
     let pad_ok = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
-        let (cw, ch) = dims[i];
+        // `checkPadding` walks `x .. x + grid_->gridWidth(cell)`, widened by the padding.
+        let (cw, ch) = dpl_dims[i];
         crate::drc::check_padding(
             x, x + cw, y, y + ch, 0, 0, classes[i],
             &|px, py| {
@@ -2919,22 +2984,49 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         // square holds NO cell — the opposite of `PlacementDRC`'s. A cell one empty site from the
         // core edge is clean here and a violation there. See [`crate::drc::EdgeReading`].
         let can_be_placed = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
-            let (cw, ch) = dims[i];
+            // `checkPixels`' bounds are `x_end = x + gridWidth(cell)` and
+            // `y_end = gridEndY(gridYToDbu(y) + height)` — the DPL footprint, not the model's.
+            let (cw, ch) = dpl_dims[i];
             // `bin_y >= getRowCount()`, then `x_end > getRowSiteCount()`.
             if x < 0 || y < 0 || y >= gh || x + cw > gw || y + ch > gh {
                 return false;
             }
             for dy in 0..ch {
+                let first_row = dy == 0;
                 for dx in 0..cw {
                     let (gx, gy) = ((x + dx) as usize, (y + dy) as usize);
                     // `!pixel->is_valid` and `pixel->cell` — both refuse.
                     if g.at(gx, gy).capacity == 0 || g.occupant(x + dx, y + dy).is_some() {
                         return false;
                     }
+                    // ⛔ **`first_row && !getSiteOrientation(x1, y1, site)`, per COLUMN.**
+                    // `isValidRow` asks this once, at the cell's own x; `checkPixels` asks it at
+                    // every column of the bottom row. Two functions, two questions — sharing one
+                    // predicate between them makes the diamond search accept what upstream
+                    // refuses.
+                    if first_row && grid.site_orient_at(gx as i64, gy as i64, &sites[i]).is_none() {
+                        return false;
+                    }
                 }
             }
-            // Bottom-row site orientation, `checkMasterSym`, and the multi-row power stack.
-            if !site_ok(i, x, y) {
+            // ⛔ **A master with NO SITE is refused here, and that is not an oversight.**
+            // `getSiteOrientation(x, y, nullptr)` finds no entry and returns nullopt, so the
+            // loop above rejects a siteless master at EVERY position on the die — while
+            // `isValidRow` skips the whole site block under `if (site != nullptr)` and accepts
+            // it anywhere. The asymmetry is upstream's and it decides a case:
+            //
+            // ⚠️ Measured on `macro_placed_not_fixed`, whose macro is PLACED and so movable:
+            // upstream reports "recovered 4/5 stuck cells" — the four std cells move and the
+            // macro cannot. Ours recovered the macro too, which shifted its footprint and freed
+            // the column `u3` then took, one site left of the reference's answer.
+            let Some(orient) = grid.site_orient_at(x as i64, y as i64, &sites[i]) else {
+                return false;
+            };
+            // `checkMasterSym`, then the multi-row power stack.
+            if !check_master_sym(sym[i].0, sym[i].1, sym[i].2, &orient) {
+                return false;
+            }
+            if ch > 1 && !power.compatible(&masters[i], y, ch) {
                 return false;
             }
             if !crate::drc::check_one_site_gap(
@@ -3009,6 +3101,8 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
                 // upstream's `else` branch re-places it at its current position "so the
                 // negotiation loop can keep trying". Leaving it ripped up would lose its usage
                 // and its stamp and make the next iteration's counts wrong.
+                let tracing = std::env::var_os("DPL_TRACE_NEGOTIATION").is_some();
+                let (mut recovered, mut considered) = (0, 0);
                 let active = r.active.clone();
                 for idx in active {
                     let c = r.cells[idx].clone();
@@ -3021,7 +3115,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
                             continue;
                         }
                     }
-                    r.grid.erase_cell(idx, c.x, c.y, c.width, c.height);
+                    r.grid.erase_cell(idx, c.x, c.y, c.paint_width, c.height);
                     r.grid.add_usage(c.x, c.y, c.width, c.height, -1);
                     // Upstream's bounds: the DPL displacement budget around the CURRENT
                     // position, clipped to the grid. ⚠️ `x_max`/`y_max` clip to the COUNTS, one
@@ -3044,7 +3138,18 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
                     r.cells[idx].x = nx;
                     r.cells[idx].y = ny;
                     r.grid.add_usage(nx, ny, c.width, c.height, 1);
-                    r.grid.paint_cell(idx, nx, ny, c.width, c.height);
+                    r.grid.paint_cell(idx, nx, ny, c.paint_width, c.height);
+                    considered += 1;
+                    if found.is_some() {
+                        recovered += 1;
+                        if tracing {
+                            eprintln!("diamondRecovery: cell {} recovered at ({}, {}).",
+                                      c.name, nx, ny);
+                        }
+                    }
+                }
+                if tracing {
+                    eprintln!("diamond recovery: recovered {recovered}/{considered} stuck cells.");
                 }
             },
         );
