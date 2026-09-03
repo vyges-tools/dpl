@@ -446,6 +446,36 @@ pub fn negotiation_cost(
     cost
 }
 
+/// `Opendp::checkMasterSym` — may this master take the orientation the row imposes?
+///
+/// ⛔ **The question is asked of the MASTER's LEF `SYMMETRY`, not of the cell's current
+/// orientation.** `isValidRow` reads the row's required orientation from
+/// `getSiteOrientation(gridX, rowIdx, site)` and asks whether the master is allowed to be turned
+/// that way; a master with no `SYMMETRY` line can only sit `R0`.
+///
+/// 🔑 **`R0` is unconditional and every other orientation needs a bit.** The three compound cases
+/// are conjunctions, not disjunctions: `R180` is a flip about both axes and needs BOTH `X` and
+/// `Y`; `MXR90`/`MYR90` need `ROT90` AND `X` AND `Y`. Reading either as an `or` would accept
+/// masters upstream refuses, on exactly the designs that mix orientations.
+///
+/// ⚠️ **An orientation this function does not recognise is REFUSED, not waved through** —
+/// upstream's `default:` arm returns false. A row whose orientation string we failed to parse
+/// must not silently become a legal row for every master.
+///
+/// Reference: `Opendp::checkMasterSym`, `src/dpl/src/Place.cpp`, and the `Symmetry_X` /
+/// `Symmetry_Y` / `Symmetry_ROT90` bits from `src/dpl/src/util/symmetry.h`.
+pub fn check_master_sym(sym_x: bool, sym_y: bool, sym_r90: bool, orient: &str) -> bool {
+    match orient {
+        "R0" => true,
+        "MX" => sym_x,
+        "MY" => sym_y,
+        "R180" => sym_x && sym_y,
+        "R90" | "R270" => sym_r90,
+        "MXR90" | "MYR90" => sym_r90 && sym_x && sym_y,
+        _ => false,
+    }
+}
+
 /// Why a candidate position is not legal. `Legal` is the only passing value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Legality {
@@ -943,6 +973,33 @@ mod tests {
 
     fn k(overuse: i32, height: i32, width: i32, idx: usize) -> SortKey {
         SortKey { overuse, height, width, idx }
+    }
+
+    #[test]
+    fn the_master_symmetry_gate_matches_the_switch_in_the_source() {
+        // ⛔ Upstream's `Opendp::checkMasterSym`, arm for arm. R0 is unconditional; MX/MY each
+        // need their own bit; R180 and the two mirrored-rotations are CONJUNCTIONS.
+        let none = (false, false, false);
+        let (x, y, r) = ((true, false, false), (false, true, false), (false, false, true));
+        let all = (true, true, true);
+        let ck = |s: (bool, bool, bool), o: &str| check_master_sym(s.0, s.1, s.2, o);
+
+        assert!(ck(none, "R0"), "R0 needs no symmetry at all");
+        assert!(ck(x, "MX") && !ck(y, "MX"));
+        assert!(ck(y, "MY") && !ck(x, "MY"));
+        // ⛔ AND, not OR — the trap this test exists for.
+        assert!(!ck(x, "R180") && !ck(y, "R180"), "one axis is not enough for R180");
+        assert!(ck((true, true, false), "R180"));
+        assert!(ck(r, "R90") && ck(r, "R270") && !ck(all_but_r90(), "R90"));
+        assert!(!ck(r, "MXR90"), "ROT90 alone is not enough");
+        assert!(ck(all, "MXR90") && ck(all, "MYR90"));
+        // ⚠️ Unknown orientations are REFUSED, not waved through: upstream's `default:` arm.
+        assert!(!ck(all, "FS"), "a DEF-style name is not a dbOrientType and must not pass");
+        assert!(!ck(all, ""));
+    }
+
+    fn all_but_r90() -> (bool, bool, bool) {
+        (true, true, false)
     }
 
     #[test]
@@ -2146,7 +2203,6 @@ use vyges_opendb::Db;
 /// omits a check reports fewer violations than it earned.
 pub const NOT_DONE: &[&str] = &[
     "groups_and_regions (respectsFence / initFenceRegions)",
-    "master_symmetry (checkMasterSym)",
     // ⚠️ TWO of `countDRCViolations`' four terms are evaluated (padding/overlap and one-site
     // gaps). The other two need the master's edge list or its blocked layers, so the DRC penalty
     // is still an UNDER-count — it never over-reports, but it will prefer a location upstream
@@ -2204,6 +2260,8 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     let mut cells: Vec<SweepCell> = Vec::new();
     let mut sites: Vec<String> = Vec::new();
     let mut masters: Vec<String> = Vec::new();
+    // `(SYMMETRY X, Y, R90)` from each movable cell's master, for `checkMasterSym`.
+    let mut sym: Vec<(bool, bool, bool)> = Vec::new();
     // ⛔ **The occupancy map needs the fixed cells too.** They are not in the sweep — nothing
     // moves them — but `PlacementDRC` reads every occupant through `pixel->cell`, so leaving
     // them out makes each check blind to exactly the obstacles that matter most.
@@ -2255,6 +2313,11 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         sites.push(db.master_get_site(&master));
         masters.push(master.clone());
         cell_types.push(mtype.clone());
+        sym.push((
+            db.master_get_symmetry_x(&master),
+            db.master_get_symmetry_y(&master),
+            db.master_get_symmetry_r90(&master),
+        ));
     }
 
     // Indices past the movable cells, so `pixel->cell` names exactly one occupant either way.
@@ -2316,10 +2379,15 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             return false;
         }
         // The bottom row must OFFER this cell's site, at this x.
-        if !grid.site_valid_at(x as i64, y as i64, &sites[i]) {
+        // ⛔ Upstream tests `getSiteOrientation(...)` for a value here and refuses the row when
+        // it has none — the site being absent and the site being present are the same question.
+        let Some(orient) = grid.site_orient_at(x as i64, y as i64, &sites[i]) else {
+            return false;
+        };
+        // `checkMasterSym` — the master must be ALLOWED to take the orientation this row imposes.
+        if !check_master_sym(sym[i].0, sym[i].1, sym[i].2, &orient) {
             return false;
         }
-        // ⬜ `checkMasterSym` belongs here and is not built.
         // ⚠️ The power test is last: it is the expensive one, and upstream reaches it only for a
         // multi-row master.
         ch <= 1 || power.compatible(&masters[i], y, ch)
