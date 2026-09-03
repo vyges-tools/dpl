@@ -137,6 +137,84 @@ pub fn check_padding(
     true
 }
 
+/// `checkBlockedLayers` — does any square under the cell block a layer the cell uses?
+///
+/// `pixel.blocked_layers & cell.used_layers` over the footprint; any overlap fails.
+///
+/// ℹ️ `blocked_layers` is set by `Grid::markBlocked` from **vertical M2/M3 special-net wires only**
+/// (`routing_level` 2 or 3, `getDir() != horizontal`), so this is narrower than it sounds: it is
+/// about power straps crossing a cell, not about routing in general.
+pub fn check_blocked_layers(
+    x: i32, x_end: i32, y: i32, y_end: i32, used_layers: u32,
+    blocked_at: &dyn Fn(i32, i32) -> Option<u32>,
+) -> bool {
+    for gy in y..y_end {
+        for gx in x..x_end {
+            if let Some(blocked) = blocked_at(gx, gy) {
+                if blocked & used_layers != 0 {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Which spelling of the one-site-gap neighbour test to use.
+///
+/// ⛔ **Upstream implements this check TWICE, and the two disagree at the core edge.**
+///
+/// | | `cellAtSite(x, y)` |
+/// | --- | --- |
+/// | `Place.cpp::checkPixels` | `pixel != nullptr && pixel->cell` — off-grid means NO cell |
+/// | `PlacementDRC::checkOneSiteGap` | `pixel == nullptr \|\| pixel->cell` — off-grid means THERE IS one |
+///
+/// ⚠️ In `PlacementDRC` that makes `cellAtSite` **byte-identical to `isAbutted`**, which reads like
+/// a copy-paste slip rather than a decision. The consequence is real: a cell one empty site from
+/// the core edge is a violation under `PlacementDRC` and clean under `Place.cpp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeReading {
+    /// `PlacementDRC`'s: off-grid counts as occupied. **This engine's default** — it is the
+    /// behaviour of the file being transcribed.
+    OffGridIsOccupied,
+    /// `Place.cpp`'s: off-grid counts as empty.
+    OffGridIsEmpty,
+}
+
+/// `checkOneSiteGap` — forbid leaving exactly one empty site between two cells.
+///
+/// Scanned per row: the square immediately left of the cell and the one immediately right. A
+/// violation is *"that square is empty **and** the one beyond it holds a cell"* — i.e. a gap
+/// exactly one site wide, which no filler can occupy.
+///
+/// ⚠️ **Off by default.** Upstream returns `true` immediately unless `disallow_one_site_gap_` is
+/// set, so a design that never asks for it is never checked.
+pub fn check_one_site_gap(
+    enabled: bool, x: i32, x_end: i32, y: i32, y_end: i32,
+    reading: EdgeReading,
+    // `None` = off the grid; `Some(true)` = a cell is here.
+    occupied_at: &dyn Fn(i32, i32) -> Option<bool>,
+) -> bool {
+    if !enabled {
+        return true;
+    }
+    // `isAbutted`: off-grid or occupied — either way there is no gap to worry about.
+    let is_abutted = |gx: i32, gy: i32| occupied_at(gx, gy).is_none_or(|c| c);
+    let cell_at_site = |gx: i32, gy: i32| match reading {
+        EdgeReading::OffGridIsOccupied => occupied_at(gx, gy).is_none_or(|c| c),
+        EdgeReading::OffGridIsEmpty => occupied_at(gx, gy).unwrap_or(false),
+    };
+    for gy in y..y_end {
+        if !is_abutted(x - 1, gy) && cell_at_site(x - 2, gy) {
+            return false;
+        }
+        if !is_abutted(x_end, gy) && cell_at_site(x_end + 1, gy) {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +293,57 @@ mod tests {
         // ℹ️ That is the core edge, not a violation.
         let off = |_: i32, _: i32| None;
         assert!(check_padding(0, 4, 0, 2, 3, 3, Class::Cr, &off));
+    }
+
+    #[test]
+    fn a_blocked_layer_the_cell_uses_fails_it() {
+        let m2 = 1 << 2;
+        let m3 = 1 << 3;
+        let blocked = |gx: i32, _: i32| Some(if gx == 1 { m2 } else { 0 });
+        assert!(!check_blocked_layers(0, 3, 0, 1, m2, &blocked), "the cell uses M2, M2 is blocked");
+        assert!(check_blocked_layers(0, 3, 0, 1, m3, &blocked), "it uses M3 only: clear");
+        assert!(check_blocked_layers(0, 1, 0, 1, m2, &blocked), "square 1 is outside the footprint");
+    }
+
+    #[test]
+    fn one_site_gap_is_off_unless_asked_for() {
+        // ⚠️ A design that never enables it is never checked.
+        let always_bad = |_: i32, _: i32| Some(true);
+        assert!(check_one_site_gap(false, 0, 1, 0, 1, EdgeReading::OffGridIsOccupied,
+                                   &always_bad));
+    }
+
+    #[test]
+    fn exactly_one_empty_site_between_two_cells_is_the_violation() {
+        // Cell occupies [0,1). Square 2 is empty, square 3 holds a cell -> a one-site gap.
+        let occ = |gx: i32, _: i32| Some(matches!(gx, 3));
+        assert!(!check_one_site_gap(true, 0, 2, 0, 1, EdgeReading::OffGridIsEmpty, &occ));
+        // Move the neighbour one further out and the gap is two sites: legal.
+        let occ2 = |gx: i32, _: i32| Some(matches!(gx, 4));
+        assert!(check_one_site_gap(true, 0, 2, 0, 1, EdgeReading::OffGridIsEmpty, &occ2));
+    }
+
+    #[test]
+    fn the_gap_is_checked_on_the_left_side_too() {
+        // ⚠️ Added after a mutation that changed the LEFT neighbour distance survived: the
+        // right-side test alone cannot catch it. Cell at [5,7); square 4 empty, square 3 holds a
+        // cell -> a one-site gap on the left.
+        let occ = |gx: i32, _: i32| Some(matches!(gx, 3));
+        assert!(!check_one_site_gap(true, 5, 7, 0, 1, EdgeReading::OffGridIsEmpty, &occ));
+        // One further out is a two-site gap: legal.
+        let occ2 = |gx: i32, _: i32| Some(matches!(gx, 2));
+        assert!(check_one_site_gap(true, 5, 7, 0, 1, EdgeReading::OffGridIsEmpty, &occ2));
+    }
+
+    #[test]
+    fn the_two_upstream_readings_disagree_at_the_core_edge() {
+        // ⛔ The cell sits at [0,2); square 2 is empty and square 3 is OFF THE GRID.
+        // PlacementDRC calls off-grid occupied, so this is a violation; Place.cpp does not.
+        let occ = |gx: i32, _: i32| if gx >= 3 { None } else { Some(false) };
+        assert!(!check_one_site_gap(true, 0, 2, 0, 1, EdgeReading::OffGridIsOccupied, &occ),
+                "PlacementDRC's reading flags it");
+        assert!(check_one_site_gap(true, 0, 2, 0, 1, EdgeReading::OffGridIsEmpty, &occ),
+                "Place.cpp's reading does not");
     }
 
     #[test]
