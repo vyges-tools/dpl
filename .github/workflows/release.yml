@@ -7,10 +7,18 @@
 #
 # Produces vyges-dpl-<rust-triple>.tar.gz assets whose names + contents match what the vyges CLI
 # expects: install_one() fetches `vyges-dpl-<target>.tar.gz` from
-# github.com/vyges-tools/fin/releases/latest/download/ and extracts a `vyges-dpl` binary.
+# github.com/vyges-tools/dpl/releases/latest/download/ and extracts a `vyges-dpl` binary.
 #
-# This has to exist BEFORE `ifp` is added to the CLI's install list: an engine listed with no
-# release behind it turns every `vyges install loom` into a 404 and a failed install.
+# This has to exist BEFORE `dpl` is added to the CLI's install list: an engine listed with no
+# release behind it turns every `vyges install physical` into a 404 and a failed install --
+# which is what happened to `ant`, and is why release-suite.sh gates the two lists against each
+# other.
+#
+# ⚠️ The two names above were `fin` and `ifp` until 2026-09-02: this file was copied from a
+# sibling and the header kept pointing at the repo it came from, naming a download URL that
+# would have served somebody else's binary. Only the comment was wrong -- the job below always
+# built and packaged `vyges-dpl` -- but a comment that names the wrong repo is read as the
+# contract, and this one sat directly above the URL it got wrong.
 #
 # Trigger: push a tag `v*` (publishes a Release with all three assets), or run manually to smoke
 # the build (workflow_dispatch uploads artifacts only, no Release).
