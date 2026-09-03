@@ -66,16 +66,35 @@ order to be useful — and upstream's own suite leans on it harder: **77 of 92 `
 
 ## Status
 
-✅ **Legalization matches the reference on every comparable case in its own regression suite** —
-**28 of 28**, at pin `945a9f48dc6e5cc91d865daa92c45a1094cb682c`, including the three large
-designs:
+⚠️ **REGRESSED at the current pin — 18 of 28 comparable cases** at
+`7d490b8ecd357199c0c0e9f3e32becd5eb507c34`, down from **28 of 28** at the previous pin
+`945a9f48dc6e5cc91d865daa92c45a1094cb682c`. **A score is only true of one commit**, and this is
+what that rule looks like when it bites.
 
-| design | components | result |
+⛔ **The regression is upstream moving, not a defect introduced here.** OpenROAD reworked the
+negotiation legalizer's INITIAL SNAPPING across seven commits and refreshed 24 of its own goldens.
+🔑 **All ten failing cases are exactly the comparable cases whose golden upstream changed, and no
+other case moved** — so nothing here broke; three named mechanisms are simply not transcribed yet:
+
+| not yet transcribed | what it changes |
+| --- | --- |
+| `Grid::gridRoundX` | the initial x now **rounds** to the nearest site where it truncated |
+| `displacementInSites` / `rowDispInSites` | displacement is measured in **site widths on both axes**, so a row jump is no longer priced as one step |
+| `initialSnap()` | a dedicated diamond search for the initial snap |
+
+At the previous pin the agreement covered the three large designs:
+
+| design | components | result at `945a9f4` |
 | --- | ---: | --- |
 | `aes` | 21,340 | identical |
 | `ibex` | 34,184 | identical |
 | `gcd` | 549 | identical |
 | the other 25 cases | — | identical |
+
+⚠️ **And the denominator is short.** Upstream ships **69** `.tcl` cases calling
+`detailed_placement`, not 63: five (`report_failures`, `fragmented_row03`, `pad02`, `fillers8`,
+`obstruction2`) wrap it as `catch { detailed_placement }`, so the harness's command filter does not
+see them and they are scored by nothing. All five are error-path cases.
 
 🔑 **The agreement is sweep-level, not final-placement only.** Upstream's own per-iteration debug
 trace and this engine's match line for line — same cell, same order, same chosen position, every
