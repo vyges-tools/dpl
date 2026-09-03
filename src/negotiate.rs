@@ -624,14 +624,59 @@ pub fn target_cost_from_disp(disp: i64, multiplier: f64, threshold: i64) -> f64 
     disp as f64 + multiplier * (disp - threshold).max(0) as f64
 }
 
-/// `targetCost` — displacement measured from the cell's INIT position.
+/// `rowDispInSites` — a row jump priced in SITE WIDTHS, not counted as one step.
+///
+/// ⛔ **Upstream `c53381e83f` (*"equalize weight of heigh and width of a site"*, in the
+/// `945a9f4` → `7d490b8` window) with its own reason:**
+///
+/// > A row is several site widths tall (7.4x on nangate45), so adding raw row and site counts
+/// > would price a row jump like a single site step.
+///
+/// The conversion goes through the REAL per-row origins, so non-uniform (hybrid) row heights are
+/// exact rather than assumed equal — upstream caches them in `row_y_dbu_`; ours is `Grid::row_y`,
+/// which already carries `row_count + 1` entries with the last being the top of the core, the same
+/// shape upstream adopted.
+///
+/// 🔑 **The origin cancels**, because this is a difference of two entries — so it does not matter
+/// that `row_y` here is core-relative where upstream's is absolute.
+///
+/// ⚠️ **`+ site_width / 2` then integer division: it ROUNDS.** Both operands are non-negative
+/// (`dy` is an absolute value), so the truncation is a floor and the result is nearest-with-ties-up.
+pub fn row_disp_in_sites(row_y: &[i32], site_width: i32, y_from: i32, y_to: i32) -> i64 {
+    let a = row_y[y_from.clamp(0, row_y.len() as i32 - 1) as usize] as i64;
+    let b = row_y[y_to.clamp(0, row_y.len() as i32 - 1) as usize] as i64;
+    let dy = (b - a).abs();
+    let sw = site_width as i64;
+    (dy + sw / 2) / sw
+}
+
+/// `displacementInSites` — **the one definition of displacement: site widths on BOTH axes.**
+///
+/// ⛔ **This REPLACED `NegCell::displacement()`, which upstream deleted** in `c53381e83f`. The old
+/// one was `|x - init_x| + |y - init_y|` with y counted in ROWS, so one row of vertical movement
+/// cost the same as one site of horizontal movement — on nangate45 that under-priced a row jump by
+/// 7.4x.
+///
+/// ⚠️ **It is not only the cost that moves.** `findBestLocation`'s wavefront is ordered by this
+/// quantity, so re-pricing it re-orders which candidates are tried and therefore which ties are
+/// broken. See [`enumerate_candidates`].
+pub fn displacement_in_sites(
+    row_y: &[i32], site_width: i32, init_x: i32, init_y: i32, at_x: i32, at_y: i32,
+) -> i64 {
+    (at_x - init_x).abs() as i64 + row_disp_in_sites(row_y, site_width, init_y, at_y)
+}
+
+/// `targetCost` — displacement measured from the cell's INIT position, in SITE WIDTHS on both axes.
 ///
 /// ⛔ **From `init_x`/`init_y`, NOT from where the cell currently sits.** The init position is
 /// where global placement put it, and it does not move as the cell is ripped up and re-placed
 /// across iterations. Measuring from the current position instead would let a cell drift
 /// arbitrarily far over many iterations, one cheap step at a time.
-pub fn target_cost(x: i32, y: i32, init_x: i32, init_y: i32, multiplier: f64, threshold: i64) -> f64 {
-    let disp = (x - init_x).abs() as i64 + (y - init_y).abs() as i64;
+pub fn target_cost(
+    row_y: &[i32], site_width: i32, x: i32, y: i32, init_x: i32, init_y: i32,
+    multiplier: f64, threshold: i64,
+) -> f64 {
+    let disp = displacement_in_sites(row_y, site_width, init_x, init_y, x, y);
     target_cost_from_disp(disp, multiplier, threshold)
 }
 
@@ -1156,28 +1201,48 @@ pub struct Candidate {
 /// ordering around the current position "gives no usable bound here". Every candidate is offered
 /// and the per-candidate prune does the work.
 pub fn enumerate_candidates(
+    row_y: &[i32], site_width: i32,
     init_x: i32, init_y: i32, cur_x: i32, cur_y: i32,
     init_rows: &[i32], init_dx_lo: i32, init_dx_hi: i32,
     curr_rows: &[i32], curr_dx_lo: i32, curr_dx_hi: i32,
     prune: &dyn Fn(i64) -> bool,
     out: &mut Vec<Candidate>,
 ) {
-    let max_dy = init_rows.iter().map(|ty| (ty - init_y).abs()).max().unwrap_or(0);
-    let max_d = max_dy + (-init_dx_lo).max(init_dx_hi);
+    // ⛔ **The wavefront is measured in SITE WIDTHS on both axes**, not in rows plus sites.
+    // Upstream `c53381e83f` caches exactly this vector per call, for the reason it gives at the
+    // site: `findBestLocation` prices every position in every active cell's window on every
+    // iteration, so the conversion is hoisted out of the inner loop rather than redone per
+    // candidate. ⟹ Re-pricing the wavefront REORDERS it, which moves tie-breaking as well as cost.
+    let row_disp: Vec<i64> = init_rows
+        .iter()
+        .map(|&ty| row_disp_in_sites(row_y, site_width, init_y, ty))
+        .collect();
+    let max_row_disp = row_disp.iter().copied().max().unwrap_or(0);
+    // `dx_lo <= 0 <= dx_hi` always holds — see `horizontal_window_bounds`.
+    let max_horiz_disp = (-init_dx_lo).max(init_dx_hi) as i64;
+    let max_d = max_row_disp + max_horiz_disp;
 
     'waves: for d in 0..=max_d {
-        if prune(d as i64) {
+        if prune(d) {
             break 'waves; // ⛔ break, not continue — the floor only rises
         }
         for (row_pos, &ty) in init_rows.iter().enumerate() {
-            let rem = d - (ty - init_y).abs();
-            if rem < 0 {
+            // Landing on the wavefront means spending what is left of its budget horizontally,
+            // so the candidates sit exactly `horiz_disp` either side.
+            let horiz_disp = d - row_disp[row_pos];
+            // ⚠️ **The upper bound is upstream's and we did not have it.** Without it a row whose
+            // vertical cost is cheap keeps generating candidates past the window's own dx limit,
+            // which the `dx_lo`/`dx_hi` tests below then reject one at a time — same answer, but
+            // only because those tests exist. Upstream rejects the whole wavefront row up front.
+            if horiz_disp < 0 || horiz_disp > max_horiz_disp {
                 continue;
             }
+            let rem = horiz_disp as i32;
             if -rem >= init_dx_lo {
                 out.push(Candidate { x: init_x - rem, y: ty,
                                      rank: ScanRank { window: 0, row_pos, dx: -rem } });
             }
+            // `horiz_disp == 0` would retry the column the call above just took.
             if rem > 0 && rem <= init_dx_hi {
                 out.push(Candidate { x: init_x + rem, y: ty,
                                      rank: ScanRank { window: 0, row_pos, dx: rem } });
@@ -1200,6 +1265,15 @@ pub fn enumerate_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rows exactly ONE SITE tall, so `row_disp_in_sites` returns the raw row delta.
+    ///
+    /// 🔑 **Chosen so tests written before displacement was measured in site widths keep their
+    /// meaning.** Under the old rule a row step and a site step cost the same; with a one-site row
+    /// they still do, so these tests go on asking the question they were written to ask. A test
+    /// that needs a REAL row height states its own table — see the hybrid cases.
+    const TEST_SITE_WIDTH: i32 = 1;
+    const TEST_ROW_Y: &[i32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
     fn k(overuse: i32, height: i32, width: i32, idx: usize) -> SortKey {
         SortKey { overuse, height, width, idx }
@@ -1443,9 +1517,9 @@ mod tests {
     #[test]
     fn displacement_is_measured_from_the_init_position() {
         // ⛔ Not from where the cell currently sits — that would let it drift across iterations.
-        assert_eq!(target_cost(5, 0, 5, 0, 1.0, 100), 0.0, "at its init position, no cost");
-        assert_eq!(target_cost(7, 0, 5, 0, 1.0, 100), 2.0);
-        assert_eq!(target_cost(3, 0, 5, 0, 1.0, 100), 2.0, "symmetric");
+        assert_eq!(target_cost(TEST_ROW_Y, TEST_SITE_WIDTH, 5, 0, 5, 0, 1.0, 100), 0.0, "at its init position, no cost");
+        assert_eq!(target_cost(TEST_ROW_Y, TEST_SITE_WIDTH, 7, 0, 5, 0, 1.0, 100), 2.0);
+        assert_eq!(target_cost(TEST_ROW_Y, TEST_SITE_WIDTH, 3, 0, 5, 0, 1.0, 100), 2.0, "symmetric");
     }
 
     #[test]
@@ -1927,6 +2001,59 @@ mod tests {
     /// *"x floors: 2.55 sites -> 2"*). It was a faithful transcription of upstream code that
     /// upstream has since decided was wrong, and it aged with it — the same shape as a descriptor
     /// that pins what we CANNOT do. Pin what upstream does NOW, and name the commit.
+    /// ⛔ **A row is several sites TALL, and displacement must say so.** Upstream `c53381e83f`:
+    /// *"A row is several site widths tall (7.4x on nangate45), so adding raw row and site counts
+    /// would price a row jump like a single site step."*
+    ///
+    /// nangate45: site 190 DBU, row 1400 DBU — 7.37 sites, which rounds to 7.
+    #[test]
+    fn a_row_jump_is_priced_in_site_widths_not_as_one_step() {
+        // Rows every 1400 DBU on a 190 DBU site, as nangate45.
+        let rows: Vec<i32> = (0..6).map(|i| i * 1400).collect();
+        assert_eq!(row_disp_in_sites(&rows, 190, 0, 0), 0, "no jump, no cost");
+        assert_eq!(
+            row_disp_in_sites(&rows, 190, 0, 1),
+            7,
+            "1400/190 = 7.37 -> 7 sites, NOT 1"
+        );
+        assert_eq!(row_disp_in_sites(&rows, 190, 0, 2), 15, "2800/190 = 14.7 -> 15");
+        assert_eq!(row_disp_in_sites(&rows, 190, 3, 1), 15, "symmetric — it is an absolute value");
+    }
+
+    /// ⚠️ **The conversion goes through the real per-row origins**, so HYBRID rows — different
+    /// heights in one design — are exact rather than assumed uniform. A table of `i * height`
+    /// could not tell these apart.
+    #[test]
+    fn hybrid_rows_are_priced_from_their_real_origins() {
+        // Alternating 800 / 1600 DBU rows on a 200 DBU site.
+        let rows = [0, 800, 2400, 3200, 4800];
+        assert_eq!(row_disp_in_sites(&rows, 200, 0, 1), 4, "800/200 = 4");
+        assert_eq!(row_disp_in_sites(&rows, 200, 1, 2), 8, "1600/200 = 8, twice the row above");
+        assert_eq!(row_disp_in_sites(&rows, 200, 0, 2), 12, "2400/200 = 12, and it is not 2 rows");
+    }
+
+    /// 🔑 `(dy + site_width/2) / site_width` — it ROUNDS, and both operands are non-negative so
+    /// the integer division is a floor. Half a site goes UP.
+    #[test]
+    fn the_row_conversion_rounds_rather_than_truncating() {
+        let rows = [0, 100, 150, 250];
+        assert_eq!(row_disp_in_sites(&rows, 100, 0, 2), 2, "150/100 = 1.5 -> 2, a tie goes up");
+        assert_eq!(row_disp_in_sites(&rows, 100, 0, 3), 3, "250/100 = 2.5 -> 3");
+        assert_eq!(row_disp_in_sites(&rows, 100, 0, 1), 1, "exactly one site");
+    }
+
+    /// The whole point: displacement is ONE quantity, in site widths, on both axes.
+    #[test]
+    fn displacement_adds_horizontal_sites_to_converted_rows() {
+        let rows: Vec<i32> = (0..4).map(|i| i * 1400).collect();
+        // 3 sites right, one row up: 3 + 7.
+        assert_eq!(displacement_in_sites(&rows, 190, 10, 0, 13, 1), 10);
+        // Same row: purely horizontal.
+        assert_eq!(displacement_in_sites(&rows, 190, 10, 0, 13, 0), 3);
+        // ⛔ Under the DELETED `NegCell::displacement()` both of these were 4 and 3 -- a row jump
+        // priced as a single step, which is exactly what upstream removed.
+    }
+
     #[test]
     fn the_start_position_rounds_on_both_axes() {
         // Rows every 10 units; the cell sits at y=17, nearer row 2 (y=20) than row 1 (y=10).
@@ -2040,7 +2167,7 @@ mod tests {
 
     fn enumerate(init_rows: &[i32], lo: i32, hi: i32) -> Vec<Candidate> {
         let mut v = Vec::new();
-        enumerate_candidates(10, 5, 10, 5, init_rows, lo, hi, &[], 0, 0, &|_| false, &mut v);
+        enumerate_candidates(TEST_ROW_Y, TEST_SITE_WIDTH, 10, 5, 10, 5, init_rows, lo, hi, &[], 0, 0, &|_| false, &mut v);
         v
     }
 
@@ -2071,7 +2198,7 @@ mod tests {
         // ⚠️ Upstream is only *entitled* to `break` because `targetCostFromDisp` is monotone — but
         // the test for which spelling was written needs the case that distinguishes them.
         let mut v = Vec::new();
-        enumerate_candidates(10, 5, 10, 5, &[5], -5, 5, &[], 0, 0, &|d| d == 2, &mut v);
+        enumerate_candidates(TEST_ROW_Y, TEST_SITE_WIDTH, 10, 5, 10, 5, &[5], -5, 5, &[], 0, 0, &|d| d == 2, &mut v);
         let reach = v.iter().map(|c| (c.x - 10).abs()).max().unwrap_or(0);
         assert_eq!(reach, 1, "must BREAK at d == 2, so d >= 3 is never offered; got reach {reach}");
         assert!(!v.is_empty(), "wavefronts 0 and 1 were still offered");
@@ -2080,11 +2207,11 @@ mod tests {
     #[test]
     fn the_second_window_runs_only_when_the_cell_is_displaced() {
         let mut same = Vec::new();
-        enumerate_candidates(10, 5, 10, 5, &[5], 0, 0, &[9], -1, 1, &|_| false, &mut same);
+        enumerate_candidates(TEST_ROW_Y, TEST_SITE_WIDTH, 10, 5, 10, 5, &[5], 0, 0, &[9], -1, 1, &|_| false, &mut same);
         assert!(same.iter().all(|c| c.rank.window == 0), "undisplaced: no second window");
 
         let mut moved = Vec::new();
-        enumerate_candidates(10, 5, 30, 9, &[5], 0, 0, &[9], -1, 1, &|_| false, &mut moved);
+        enumerate_candidates(TEST_ROW_Y, TEST_SITE_WIDTH, 10, 5, 30, 9, &[5], 0, 0, &[9], -1, 1, &|_| false, &mut moved);
         assert!(moved.iter().any(|c| c.rank.window == 1), "displaced: the second window runs");
     }
 
@@ -2143,6 +2270,8 @@ mod tests {
             placeable: &|c, x, _y| x >= 0 && x + c.width <= 8,
             drc_violations: &|_, _, _, _| 0,
             fixed_paint: &[],
+            row_y: TEST_ROW_Y,
+            site_width: TEST_SITE_WIDTH,
             max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
             max_disp_threshold: consts::MAX_DISP_THRESHOLD,
             drc_penalty: consts::DRC_PENALTY,
@@ -2164,6 +2293,8 @@ mod tests {
             // Always dirty, wherever it sits.
             drc_violations: &|_, _, _, _| 1,
             fixed_paint: &[],
+            row_y: TEST_ROW_Y,
+            site_width: TEST_SITE_WIDTH,
             max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
             max_disp_threshold: consts::MAX_DISP_THRESHOLD,
             drc_penalty: consts::DRC_PENALTY,
@@ -2189,6 +2320,8 @@ mod tests {
             // Only the bystander is dirty — the active cell is fine.
             drc_violations: &|c, _, _, _| i32::from(c.name == "bystander"),
             fixed_paint: &[],
+            row_y: TEST_ROW_Y,
+            site_width: TEST_SITE_WIDTH,
             max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
             max_disp_threshold: consts::MAX_DISP_THRESHOLD,
             drc_penalty: consts::DRC_PENALTY,
@@ -2213,6 +2346,8 @@ mod tests {
             placeable: &|_, x, _| (0..4).contains(&x),
             drc_violations: &|_, _, _, _| 0,
             fixed_paint: &[],
+            row_y: TEST_ROW_Y,
+            site_width: TEST_SITE_WIDTH,
             max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
             max_disp_threshold: consts::MAX_DISP_THRESHOLD,
             drc_penalty: consts::DRC_PENALTY,
@@ -2239,6 +2374,8 @@ mod tests {
             placeable: &|c, x, _| x >= 0 && x + c.width <= 4,
             drc_violations: &|_, _, _, _| 0,
             fixed_paint: &[],
+            row_y: TEST_ROW_Y,
+            site_width: TEST_SITE_WIDTH,
             max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
             max_disp_threshold: consts::MAX_DISP_THRESHOLD,
             drc_penalty: consts::DRC_PENALTY,
@@ -2401,6 +2538,19 @@ pub struct SweepCtx<'a> {
     pub drc_violations: &'a dyn Fn(&SweepCell, i32, i32, &NegGrid) -> i32,
     /// Fixed-cell footprints, repainted into the occupancy map after every re-sync.
     pub fixed_paint: &'a [FixedPaint],
+    /// Per-row y origins in DBU, so a row jump can be priced in SITE WIDTHS.
+    ///
+    /// 🔑 **Upstream caches exactly this** — `row_y_dbu_`, filled in `initFromDb` from
+    /// `Grid::gridYToDbu` — and for the reason it states there: `findBestLocation` prices every
+    /// position in every active cell's window on every iteration, so the per-row conversion is
+    /// hoisted rather than recomputed per candidate. Non-uniform (hybrid) row heights are then
+    /// exact rather than assumed equal.
+    ///
+    /// ⚠️ It carries `row_count + 1` entries, the last being the top of the core rather than a
+    /// row — the same shape upstream adopted (*"one extra entry for the core top edge"*). Only
+    /// DIFFERENCES are ever taken, so it does not matter that ours is core-relative.
+    pub row_y: &'a [i32],
+    pub site_width: i32,
     pub max_disp_multiplier: f64,
     pub max_disp_threshold: i64,
     pub drc_penalty: f64,
@@ -2527,6 +2677,7 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
                         c.x, c.y);
         cands.clear();
         enumerate_candidates(
+            ctx.row_y, ctx.site_width,
             c.init_x, c.init_y, c.x, c.y, &irows, ilo, ihi, &crows, clo, chi,
             &|d| {
                 target_cost_from_disp(d, ctx.max_disp_multiplier, ctx.max_disp_threshold)
@@ -2539,7 +2690,8 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
             if !(ctx.placeable)(&c, cand.x, cand.y) {
                 continue;
             }
-            let target = target_cost(cand.x, cand.y, c.init_x, c.init_y,
+            let target = target_cost(ctx.row_y, ctx.site_width,
+                                     cand.x, cand.y, c.init_x, c.init_y,
                                      ctx.max_disp_multiplier, ctx.max_disp_threshold);
             let mut cost = negotiation_cost(
                 footprint_of(&c, cand.x, cand.y, ctx.grid), target, best.0);
@@ -3388,6 +3540,8 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
                     grid: $g, window: &window, placeable: &placeable,
                     drc_violations: &drc,
                     fixed_paint: &fixed_paint,
+                    row_y: &grid.row_y,
+                    site_width: sw,
                     max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
                     max_disp_threshold: consts::MAX_DISP_THRESHOLD,
                     drc_penalty: opts.drc_penalty,
