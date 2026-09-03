@@ -15,10 +15,10 @@
 //!
 //! ⚠️ **Only ILLEGAL cells are negotiated** — a cell that is already legal is left where it is.
 //!
-//! ⬜ **Status: the model and the ordering are built; the iteration core is not.** `findBestLocation`
-//! (the cost function), `ripUp`/`place`, the history update and phase 2 remain. The full call
-//! sequence is recorded in `vyges-tools-internal/docs/openroad/dpl/negotiation-legalizer.md` so
-//! the next pass builds from a read reference rather than re-reading 2,315 lines.
+//! ⬜ **Status: the legalizer runs end to end.** What it does NOT implement is listed in
+//! [`NOT_DONE`] and reported on every run — a legalizer that quietly omits a check reports fewer
+//! violations than it earned. The call sequence each function transcribes is stated in that
+//! function's own doc comment, at the site, rather than in a document that would drift from it.
 
 /// Which instances enter the negotiation model — `initFromDb`'s filter.
 ///

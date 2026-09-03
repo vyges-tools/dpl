@@ -75,17 +75,24 @@ pub fn has_padding_conflict(a: Class, b: Class, same_cell: bool) -> bool {
     !same_cell && !allow_padding_overlap(a, b) && !allow_overlap(a, b)
 }
 
-/// The pair rule, as the comment table in `PlacementDRC.cpp` states it.
+/// Which rule governs a pair of classes, as `PlacementDRC::hasPaddingConflict` applies it.
 ///
-/// ```text
-///     CR WT BL SP
-/// CR   P  P  P  O
-/// WT   P  O  P  O
-/// BL   P  P  -  O
-/// SP   O  O  O  O
+/// | | CR | WT | BL | SP |
+/// | --- | --- | --- | --- | --- |
+/// | **CR** | padded | padded | padded | plain |
+/// | **WT** | padded | plain | padded | plain |
+/// | **BL** | padded | padded | *allowed* | plain |
+/// | **SP** | plain | plain | plain | plain |
 ///
-/// P = no padded overlap   O = no overlap, padding ignored   - = overlap allowed
-/// ```
+/// - **padded** — the PADDED footprints may not overlap;
+/// - **plain** — the bodies may not overlap, and padding is ignored;
+/// - ***allowed*** — no overlap check at all, so two macros may sit on top of each other.
+///
+/// ⚠️ **Symmetric, and the diagonal is not uniform**: CR/CR is padded, WT/WT and SP/SP are plain,
+/// BL/BL is unchecked. A reader who assumes a class never conflicts with itself gets three of the
+/// four wrong.
+///
+/// 🔑 The rules apply to FIXED and PLACED instances alike — being fixed does not exempt a cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairRule {
     /// `P` — the padded footprints may not overlap.

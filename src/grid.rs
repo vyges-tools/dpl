@@ -311,8 +311,10 @@ impl Grid {
         //
         // ⚠️ Negative core-relative x is reachable: a cell hanging left of the core, or an
         // unplaced instance the DEF left at (0,0) in a design whose core does not start there.
-        // See `cpp-to-rust-numeric-reference.md` §11 — upstream's helper is *named* `divFloor` and
-        // does not floor.
+        // ⛔ Upstream's helper is *named* `divFloor` and does NOT floor — its body is
+        // `return dividend / divisor;`. A reader who trusts the name writes `div_euclid` and is
+        // wrong for exactly the negative coordinates above. Its siblings `divRound` and `divCeil`
+        // DO go through `double` and so match Rust's `f64::round`/`ceil` directly.
         let xlo = (x / self.site_width) as i64;
         let xhi = xlo + ((w + self.site_width - 1) / self.site_width).max(1) as i64;
         let ylo = match self.grid_snap_down_y(y) {
