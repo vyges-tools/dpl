@@ -1444,6 +1444,30 @@ mod tests {
     }
 
     #[test]
+    fn a_cell_on_a_zero_capacity_square_is_illegal() {
+        // ⛔ `blockage01`: a hard placement blockage reaches the legality test ONLY through
+        // capacity. A scan that tests overuse alone calls this cell legal and never moves it.
+        let mut grid = NegGrid::build(4, 1, &|x, _| x >= 2); // sites 0-1 blocked
+        let mut cells = vec![sweep_cell("a", 0, 1)];
+        grid.add_usage(0, 0, 1, 1, 1);
+        assert!(!footprint_is_legal(&cells[0], 0, 0, &grid), "site 0 has capacity 0");
+        assert!(footprint_is_legal(&cells[0], 2, 0, &grid), "site 2 does not");
+
+        // ⚠️ And the sweep moves it out, rather than leaving it where it started.
+        let mut ctx = SweepCtx {
+            grid: &mut grid,
+            window: &|_c, x, y| (-x, 3 - x, vec![y]),
+            placeable: &|c, x, _| x >= 0 && x + c.width <= 4,
+            drc_violations: &|_, _, _| 0,
+            max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
+            max_disp_threshold: consts::MAX_DISP_THRESHOLD,
+            drc_penalty: consts::DRC_PENALTY,
+        };
+        negotiation_iter(&mut cells, &[0], 0, &mut ctx);
+        assert!(cells[0].x >= 2, "moved off the blockage, to {}", cells[0].x);
+    }
+
+    #[test]
     fn a_sweep_separates_two_overlapping_cells() {
         // 🔑 The end-to-end property the whole engine exists for: two cells on the same site,
         // one sweep, no overlap left.
@@ -1681,8 +1705,31 @@ fn cell_is_legal(c: &SweepCell, ctx: &SweepCtx) -> bool {
     if !(ctx.placeable)(c, c.x, c.y) || (ctx.drc_violations)(c, c.x, c.y) > 0 {
         return false;
     }
-    footprint_of(c, c.x, c.y, ctx.grid)
-        .all(|sq| matches!(sq, Some((u, cap, _)) if cap > 0 && (u - 1).max(0) == 0))
+    footprint_is_legal(c, c.x, c.y, ctx.grid)
+}
+
+/// `isCellLegal`'s FINAL loop: every square of the footprint must have capacity and no overuse.
+///
+/// ⛔ **`capacity == 0` is how a BLOCKAGE reaches this test.** `Grid::markBlocked` only sets
+/// `is_valid = false` on the squares a hard placement blockage covers; `buildGrid` then turns that
+/// into `capacity = is_valid ? 1 : 0`. Nothing earlier in `isCellLegal` — not `inDie`, not
+/// `isValidRow`, not `getSiteOrientation` — looks at validity, so **without this loop a cell
+/// sitting inside a hard blockage reports as perfectly legal**.
+///
+/// ⚠️ Measured on `blockage01`: the design has a hard blockage over sites 0..15 of every row and
+/// an instance the DEF leaves at `(0, 0)`. Our seeding scan tested overuse alone, called the cell
+/// legal, never negotiated it, and left it inside the blockage at `3800`; the reference moves it
+/// to `9880`, the first site past the blockage.
+///
+/// 🔑 `overuse()` is `max(0, usage - capacity)` and the cell IS counted in `usage` here, so a
+/// cell alone on its own square reads 0.
+///
+/// ⬜ **Untested, and it cannot be tested from here.** `buildGrid` only ever assigns capacity 0
+/// or 1, so `usage - capacity` and `usage - 1` agree on every square this engine can build. The
+/// expression is upstream's; a test asserting it would pass either way and prove nothing.
+fn footprint_is_legal(c: &SweepCell, x: i32, y: i32, grid: &NegGrid) -> bool {
+    footprint_of(c, x, y, grid)
+        .all(|sq| matches!(sq, Some((u, cap, _)) if cap > 0 && (u - cap).max(0) == 0))
 }
 
 // ── the driver ───────────────────────────────────────────────────────────────────────────────
@@ -1817,14 +1864,9 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     let mut illegal: Vec<usize> = Vec::new();
     for i in 0..cells.len() {
         let c = &cells[i];
-        let overused = (0..c.height).any(|dy| {
-            (0..c.width).any(|dx| {
-                let (gx, gy) = (c.x + dx, c.y + dy);
-                gx >= 0 && gy >= 0 && (gx as usize) < ngrid.width && (gy as usize) < ngrid.height
-                    && ngrid.at(gx as usize, gy as usize).overuse() > 0
-            })
-        });
-        if overused || !site_ok(i, c.x, c.y) {
+        // ⛔ The SAME footprint test the sweep's isolation skip uses — capacity AND overuse.
+        // Testing overuse alone here let a cell inside a hard blockage seed as legal.
+        if !footprint_is_legal(c, c.x, c.y, &ngrid) || !site_ok(i, c.x, c.y) {
             illegal.push(i);
         }
     }
