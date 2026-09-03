@@ -241,10 +241,22 @@ impl NegPixel {
 
 /// The key `sortByNegotiationOrder` sorts on.
 ///
-/// ⛔ **`(overuse DESC, height DESC, width DESC, idx ASC)`** — and the trailing index is the
-/// determinism tie-break, the same role `sequence` plays in `diamondSearch`. Upstream builds this
-/// as a decorate-sort and its comment records that the decorated form *"yields identical results
-/// to scoring (a, b) directly"*, so the decoration is a speed-up rather than a behaviour change.
+/// ⛔ **`(overuse DESC, height ASC, width ASC, idx ASC)`** — overuse descending, then the
+/// **SMALLEST** cells first. The trailing index is the determinism tie-break, the same role
+/// `sequence` plays in `diamondSearch`. Upstream builds this as a decorate-sort and its comment
+/// records that the decorated form *"yields identical results to scoring (a, b) directly"*, so
+/// the decoration is a speed-up rather than a behaviour change.
+///
+/// ⚠️ **Only the overuse key is descending, and getting the other two backwards is quiet.** This
+/// read `height DESC, width DESC` until 2026-09-02. Nothing could catch it while every cell in
+/// the sweep was there for OVERLAP — the first key separated them and the rest never ran. It
+/// became visible the moment DRC violations started putting non-overused cells into the sweep,
+/// where overuse ties at 0 for everyone and the height key decides.
+///
+/// 🔑 Measured on `multi_height_one_site_gap_disallow`: a single-height and a double-height cell
+/// with a one-site gap between them. Smallest-first moves the SINGLE-height cell one site, which
+/// is the reference's answer; tallest-first moves the double-height one instead and both cells
+/// end up somewhere upstream never puts them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortKey {
     pub overuse: i32,
@@ -255,12 +267,12 @@ pub struct SortKey {
 
 impl Ord for SortKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Most-overused first, then tallest, then widest, then lowest index.
+        // Most-overused first, then SHORTEST, then NARROWEST, then lowest index.
         other
             .overuse
             .cmp(&self.overuse)
-            .then(other.height.cmp(&self.height))
-            .then(other.width.cmp(&self.width))
+            .then(self.height.cmp(&other.height))
+            .then(self.width.cmp(&other.width))
             .then(self.idx.cmp(&other.idx))
     }
 }
@@ -885,11 +897,23 @@ mod tests {
     }
 
     #[test]
-    fn equal_overuse_breaks_on_height_then_width() {
+    fn equal_overuse_breaks_on_height_then_width_smallest_first() {
+        // ⛔ **Only `overuse` is descending.** Height and width are ASCENDING — the smallest
+        // cells are negotiated first. This test asserted the opposite until 2026-09-02.
         let mut v = [k(2, 1, 9, 0), k(2, 3, 1, 1), k(2, 1, 2, 2)];
         sort_by_negotiation_order(&mut v);
-        // Tallest first; then among the height-1 pair the wider one.
-        assert_eq!(v.iter().map(|s| s.idx).collect::<Vec<_>>(), [1, 0, 2]);
+        // Shortest first; among the two height-1 keys, the narrower one.
+        assert_eq!(v.iter().map(|s| s.idx).collect::<Vec<_>>(), [2, 0, 1]);
+    }
+
+    #[test]
+    fn overuse_still_outranks_a_smaller_cell() {
+        // ⚠️ The keys are not independent: a tiny cell with no overuse must NOT jump ahead of a
+        // big one that is overlapping. Reversing height without keeping overuse first would do
+        // exactly that.
+        let mut v = [k(0, 1, 1, 0), k(5, 9, 9, 1)];
+        sort_by_negotiation_order(&mut v);
+        assert_eq!(v.iter().map(|s| s.idx).collect::<Vec<_>>(), [1, 0]);
     }
 
     #[test]
