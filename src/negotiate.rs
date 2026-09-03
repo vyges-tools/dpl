@@ -33,6 +33,84 @@ pub fn enters_model(placement_status: &str, core_auto_placeable: bool) -> bool {
     placement_status != "NONE" && core_auto_placeable
 }
 
+/// `initFromDb`'s snap — a cell whose rounded start lands on invalid sites moves to the nearest
+/// valid one, by a four-direction linear scan (upstream's shape is `Opendp::moveHopeless`).
+///
+/// ⛔ **This runs BEFORE anything else looks at the cell, and it moves `init_x`/`init_y` as well
+/// as `x`/`y`.** The start position is what `targetCost` measures displacement from for the whole
+/// run, so a cell snapped here is negotiated from its new home, not pulled back toward the DEF
+/// position it could never have occupied.
+///
+/// 🔑 **Its effect is usually that NOTHING is negotiated at all.** On `fragmented_row02` the one
+/// cell rounds into the gap between two row fragments; upstream snaps it onto the right fragment
+/// and then reports *"0 illegal cells"*. Treating it as illegal instead hands it to the sweep,
+/// which legalizes it into a different row entirely.
+///
+/// ⛔ **Four separate scans, each stopping at its OWN first valid position**, then the shortest
+/// of the four wins. Not one expanding diamond: the left scan may walk five sites and still lose
+/// to a right scan that walked two.
+///
+/// ⚠️ **The distances are in DBU, and the vertical one is NOT a row count.** Rows may differ in
+/// height, so a row one step away can be further in DBU than a site five steps away. Comparing
+/// rows against sites would pick a different winner on exactly the hybrid designs this matters on.
+///
+/// ⚠️ **The comparison is strict `<`, so an exact tie keeps the EARLIER direction** — left, then
+/// right, then below, then above.
+///
+/// ℹ️ Region containment (`isInRegionOk`) is part of upstream's test and is not evaluated here:
+/// designs declaring REGIONS/GROUPS are out of this engine's scope and are skipped whole.
+/// `valid_site` must answer for the cell's FULL footprint, which is why it takes the origin only.
+pub fn snap_to_valid_site(
+    init_x: i32,
+    init_y: i32,
+    width: i32,
+    height: i32,
+    grid_w: i32,
+    grid_h: i32,
+    site_width: i64,
+    row_y: &[i32],
+    valid_site: &dyn Fn(i32, i32) -> bool,
+) -> Option<(i32, i32)> {
+    if valid_site(init_x, init_y) {
+        return None; // already legal geometry — upstream does not enter the search at all
+    }
+    let row_dbu = |r: i32| -> i64 {
+        row_y.get(usize::try_from(r).unwrap_or(usize::MAX)).copied().unwrap_or(0) as i64
+    };
+    let init_y_dbu = row_dbu(init_y);
+    let mut best: Option<(i64, i32, i32)> = None;
+    let mut offer = |dist: i64, x: i32, y: i32| {
+        if best.is_none_or(|(d, _, _)| dist < d) {
+            best = Some((dist, x, y));
+        }
+    };
+    for x in (0..init_x).rev() {
+        if valid_site(x, init_y) {
+            offer((init_x - x) as i64 * site_width, x, init_y);
+            break;
+        }
+    }
+    for x in (init_x + 1)..=(grid_w - width) {
+        if valid_site(x, init_y) {
+            offer((x - init_x) as i64 * site_width, x, init_y);
+            break;
+        }
+    }
+    for y in (0..init_y).rev() {
+        if valid_site(init_x, y) {
+            offer(init_y_dbu - row_dbu(y), init_x, y);
+            break;
+        }
+    }
+    for y in (init_y + 1)..=(grid_h - height) {
+        if valid_site(init_x, y) {
+            offer(row_dbu(y) - init_y_dbu, init_x, y);
+            break;
+        }
+    }
+    best.map(|(_, x, y)| (x, y))
+}
+
 /// `dbMaster::isCoreAutoPlaceable` — may the placer touch an instance of this master at all?
 ///
 /// ⛔ **This is the model filter, and it is about the master's CLASS, never about whether the
@@ -1029,6 +1107,58 @@ mod tests {
 
     fn k(overuse: i32, height: i32, width: i32, idx: usize) -> SortKey {
         SortKey { overuse, height, width, idx }
+    }
+
+    #[test]
+    fn the_snap_takes_the_shortest_of_four_independent_scans() {
+        // ⛔ Four separate scans, each stopping at its OWN first valid position, then the
+        // shortest wins — not one expanding diamond. Row 0 is a fragmented row: sites 0..=13 and
+        // 17.. are valid, 14/15/16 are the gap, and a 4-site cell rounds to x = 15.
+        //
+        // ⚠️ Measured against upstream on `fragmented_row02`: it logs "rounds to an invalid
+        // initial position ... will search for the nearest valid site" and lands at dbu 34460,
+        // which is site 17 — the RIGHT scan, two sites out, beating a left scan five sites out.
+        let row_y = [0, 2800];
+        let valid = |x: i32, y: i32| -> bool {
+            if x < 0 || y < 0 || x + 4 > 31 || y >= 2 {
+                return false;
+            }
+            if y == 1 {
+                return true; // the unfragmented row above
+            }
+            (0..4).all(|dx| { let s = x + dx; s <= 13 || s >= 17 })
+        };
+        assert_eq!(
+            snap_to_valid_site(15, 0, 4, 1, 31, 2, 380, &row_y, &valid),
+            Some((17, 0)),
+            "right is 2 sites = 760 dbu; left is 5 sites = 1900; above is a whole row = 2800",
+        );
+        // 🔑 A position that is already valid is not snapped at all — upstream never enters the
+        // search, and entering it would move cells that had no reason to move.
+        assert_eq!(snap_to_valid_site(0, 0, 4, 1, 31, 2, 380, &row_y, &valid), None);
+    }
+
+    #[test]
+    fn the_snap_measures_rows_in_dbu_not_in_row_counts() {
+        // ⛔ Rows may differ in height, so ONE row up can be further than several sites across.
+        // Comparing row counts against site counts picks a different winner on hybrid designs.
+        // Here the row above is 9000 dbu away while a site is 380, so the horizontal scan wins
+        // even at eight sites out; make the rows short and the vertical scan takes it.
+        let valid = |x: i32, y: i32| -> bool { y == 1 || (y == 0 && x >= 8) };
+        let tall = [0, 9000];
+        assert_eq!(snap_to_valid_site(0, 0, 1, 1, 31, 2, 380, &tall, &valid), Some((8, 0)),
+                   "8 sites = 3040 dbu beats one 9000-dbu row");
+        let short = [0, 100];
+        assert_eq!(snap_to_valid_site(0, 0, 1, 1, 31, 2, 380, &short, &valid), Some((0, 1)),
+                   "the same row, 100 dbu up, now wins");
+    }
+
+    #[test]
+    fn an_exact_tie_keeps_the_earlier_direction() {
+        // ⚠️ The comparison is strict `<`, so left beats right at equal distance. A `<=` would
+        // silently prefer the LAST direction scanned and nothing in the corpus would say so.
+        let valid = |x: i32, y: i32| -> bool { y == 0 && (x == 3 || x == 7) };
+        assert_eq!(snap_to_valid_site(5, 0, 1, 1, 31, 1, 380, &[0], &valid), Some((3, 0)));
     }
 
     #[test]
@@ -2412,6 +2542,23 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             x as i64, y as i64, core.0 as i64, core.1 as i64, sw as i64,
             &grid.row_y, cw, ch, gw, gh,
         );
+        // ⛔ **The snap, and it happens BEFORE the seeding.** `gridX`/`gridRoundY` do not ask
+        // whether a site exists where they land, so a cell in a sparse or fragmented row rounds
+        // onto invalid pixels. Upstream moves it to the nearest valid site and moves `init_x` /
+        // `init_y` with it — see [`snap_to_valid_site`]. Seeding first and snapping after would
+        // leave usage at the unreachable square.
+        let (gx, gy) = snap_to_valid_site(
+            gx, gy, cw, ch, gw, gh, sw as i64, &grid.row_y,
+            &|x, y| {
+                if x < 0 || y < 0 || x + cw > gw || y + ch > gh {
+                    return false;
+                }
+                (0..ch).all(|dy| (0..cw).all(|dx| {
+                    grid.pixel((x + dx) as i64, (y + dy) as i64).is_some_and(|p| p.is_valid)
+                }))
+            },
+        )
+        .unwrap_or((gx, gy));
         // ⛔ Seeded where the cell IS. `init_x/init_y` are the same point and never move again —
         // `targetCost` measures displacement from them for the whole run.
         ngrid.add_usage(gx, gy, cw, ch, 1);
