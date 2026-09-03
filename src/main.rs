@@ -228,6 +228,10 @@ fn check(args: &[String]) -> ExitCode {
         "cells_checked": report.cells_checked,
         "violations": report.failures.len(),
         "not_checked": report.not_checked,
+        // ⛔ **Emitted, because a field the command drops might as well not exist.** These are the
+        // families that DID run but could not see everything — the reader who treats "checked" as
+        // "checked completely" is exactly who this is for.
+        "limitations": report.limitations,
         "failures": report.failures,
     });
     let text = serde_json::to_string_pretty(&json).expect("the report is valid JSON");
