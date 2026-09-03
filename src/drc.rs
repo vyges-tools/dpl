@@ -744,3 +744,229 @@ mod binding_tests {
         assert!(blocks_layer(2, 500, 500));
     }
 }
+
+// ── power-rail alignment ─────────────────────────────────────────────────────────────────────
+
+/// `Architecture::Row::Power_*` — which supply a rail carries.
+///
+/// ⚠️ **`Unknown` is not a third value to compare; it is a WILDCARD.** Every comparison in
+/// `powerCompatible` treats an unknown on either side as a match, so a technology whose power
+/// intent cannot be read degenerates to "always compatible" rather than "never".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Power {
+    Unknown,
+    Vdd,
+    Vss,
+}
+
+/// `getMasterPwrs` — a master's top and bottom supply, from its POWER/GROUND pin geometry.
+///
+/// Takes the Y CENTRE of every pin box on a **ROUTING** layer (wells, implants and cuts are
+/// skipped) and asks which supply reaches highest and which reaches lowest.
+///
+/// ⛔ **Both a power AND a ground pin must be present**, or both rails are `Unknown`. A master
+/// with only a VDD pin says nothing about its bottom rail.
+///
+/// ⚠️ Returns `(top, bottom)` — upstream's order, and the call site immediately assigns
+/// `setTopPowerType(first)`, `setBottomPowerType(second)`. Reversing them silently flips every
+/// row's parity.
+pub fn master_power(pwr_y_centres: &[i32], gnd_y_centres: &[i32]) -> (Power, Power) {
+    if pwr_y_centres.is_empty() || gnd_y_centres.is_empty() {
+        return (Power::Unknown, Power::Unknown);
+    }
+    let (min_p, max_p) = (
+        *pwr_y_centres.iter().min().unwrap(), *pwr_y_centres.iter().max().unwrap());
+    let (min_g, max_g) = (
+        *gnd_y_centres.iter().min().unwrap(), *gnd_y_centres.iter().max().unwrap());
+    let top = if max_p > max_g { Power::Vdd } else { Power::Vss };
+    let bot = if min_p < min_g { Power::Vdd } else { Power::Vss };
+    (top, bot)
+}
+
+/// `orientFlipsY` — does this orientation swap a master's top and bottom rails?
+///
+/// ⚠️ **`None` for the rotations**, and the caller LEAVES THE ROW UNKNOWN rather than guessing.
+/// `MY` mirrors about Y, which does not touch the rails, so it groups with `R0`.
+pub fn orient_flips_y(orient: &str) -> Option<bool> {
+    match orient {
+        "MX" | "FS" | "R180" | "S" => Some(true),
+        "R0" | "N" | "MY" | "FN" => Some(false),
+        // R90 / R270 / MXR90 / MYR90 — a rotation, so the rails are not top-and-bottom any more.
+        _ => None,
+    }
+}
+
+/// `inferR0RowPower` — the whole design's R0 rail convention, from the first master that shows it.
+///
+/// ⛔ **The FIRST single-height CORE master whose top and bottom differ wins**, in the block's own
+/// instance order. Not a vote, not the commonest — the first. So the answer depends on instance
+/// order, which is why it must be iterated in the same order the reference does.
+///
+/// Returns `(top, bottom)` for a row at `R0`, or both `Unknown` if no master settles it — in
+/// which case upstream leaves EVERY row unknown and `powerCompatible` becomes a no-op.
+pub fn infer_r0_row_power(candidates: impl Iterator<Item = (Power, Power)>) -> (Power, Power) {
+    for (top, bot) in candidates {
+        if bot != Power::Unknown && top != Power::Unknown && bot != top {
+            return (top, bot);
+        }
+    }
+    (Power::Unknown, Power::Unknown)
+}
+
+/// The `(bottom, top)` a row carries, given the design's R0 convention and the row's orientation.
+///
+/// ⚠️ **A row whose orientation is a rotation keeps `Unknown`** — `orientFlipsY` returns nullopt
+/// and upstream `continue`s past the row without assigning.
+pub fn row_power(r0_top: Power, r0_bot: Power, orient: &str) -> (Power, Power) {
+    match orient_flips_y(orient) {
+        Some(true) => (r0_top, r0_bot),
+        Some(false) => (r0_bot, r0_top),
+        None => (Power::Unknown, Power::Unknown),
+    }
+}
+
+/// `Architecture::powerCompatible` — may this cell start in this row?
+///
+/// Returns `(compatible, flip)`.
+///
+/// ⛔ **A single-height cell is ALWAYS compatible.** The single-height branch computes `flip` and
+/// then `return true` unconditionally — it never refuses. Only a multi-row cell can be rejected.
+/// ⚠️ That is upstream's behaviour and the comment there says as much ("beyond the current
+/// goal"); transcribed rather than tightened.
+///
+/// For a multi-row cell: the cell's rails must match the bottom of its first row and the top of
+/// its last, with `Unknown` matching anything. If not, the rails are SWAPPED and re-tested — a
+/// match then means the cell is legal **flipped**.
+///
+/// ⛔ **A cell running off the top of the row array is refused**, before any rail is compared.
+pub fn power_compatible(
+    cell_bot: Power, cell_top: Power,
+    row_lo: usize, rows_spanned: usize, num_rows: usize,
+    row_bottom_power: &dyn Fn(usize) -> Power,
+    row_top_power: &dyn Fn(usize) -> Power,
+) -> (bool, bool) {
+    if rows_spanned == 0 {
+        return (false, false);
+    }
+    let hi = row_lo + rows_spanned - 1;
+    if hi >= num_rows {
+        return (false, false); // off the top of the chip
+    }
+    let (row_bot, row_top) = (row_bottom_power(row_lo), row_top_power(hi));
+
+    if hi == row_lo {
+        // Single height: `flip` is computed, and the answer is `true` regardless.
+        let flip = (cell_bot != row_bot && cell_bot != Power::Unknown
+                    && row_bot != Power::Unknown)
+            || (cell_top != row_top && cell_top != Power::Unknown && row_top != Power::Unknown);
+        return (true, flip);
+    }
+
+    let matches = |c: Power, r: Power| c == r || c == Power::Unknown || r == Power::Unknown;
+    if matches(cell_bot, row_bot) && matches(cell_top, row_top) {
+        return (true, false);
+    }
+    if matches(cell_top, row_bot) && matches(cell_bot, row_top) {
+        return (true, true); // legal, but only flipped
+    }
+    (false, false)
+}
+
+#[cfg(test)]
+mod power_tests {
+    use super::*;
+    use Power::{Unknown, Vdd, Vss};
+
+    #[test]
+    fn a_master_needs_both_a_power_and_a_ground_pin() {
+        // ⛔ One supply alone says nothing about the other rail.
+        assert_eq!(master_power(&[100], &[]), (Unknown, Unknown));
+        assert_eq!(master_power(&[], &[0]), (Unknown, Unknown));
+        assert_eq!(master_power(&[], &[]), (Unknown, Unknown));
+    }
+
+    #[test]
+    fn the_supply_reaching_highest_is_the_top_rail() {
+        // VDD at the top of the cell, VSS at the bottom — the ordinary R0 standard cell.
+        assert_eq!(master_power(&[2800], &[0]), (Vdd, Vss));
+        // Flipped: VSS on top.
+        assert_eq!(master_power(&[0], &[2800]), (Vss, Vdd));
+    }
+
+    #[test]
+    fn the_extremes_decide_not_the_pin_count() {
+        // ⚠️ min/max, so a cell with many mid-height VDD boxes and one high VSS reads VSS on top.
+        assert_eq!(master_power(&[1000, 1200, 1400], &[0, 2800]), (Vss, Vss));
+    }
+
+    #[test]
+    fn a_rotation_leaves_the_row_unknown() {
+        // ⛔ Not "assume R0" — upstream skips the row entirely.
+        assert_eq!(orient_flips_y("R90"), None);
+        assert_eq!(row_power(Vdd, Vss, "R90"), (Unknown, Unknown));
+        // MY mirrors about Y and does NOT swap the rails.
+        assert_eq!(orient_flips_y("MY"), Some(false));
+        assert_eq!(row_power(Vdd, Vss, "MY"), (Vss, Vdd));
+        assert_eq!(row_power(Vdd, Vss, "FS"), (Vdd, Vss), "MX/FS swaps them");
+    }
+
+    #[test]
+    fn the_first_master_that_settles_it_wins() {
+        // ⛔ First, not commonest — masters that say nothing are skipped, not counted.
+        let c = [(Unknown, Unknown), (Vdd, Vdd), (Vss, Vdd), (Vdd, Vss)];
+        assert_eq!(infer_r0_row_power(c.into_iter()), (Vss, Vdd),
+                   "the third entry is the first with two known, different rails");
+        assert_eq!(infer_r0_row_power([(Vdd, Vdd)].into_iter()), (Unknown, Unknown),
+                   "equal rails settle nothing");
+    }
+
+    #[test]
+    fn a_single_height_cell_is_never_refused() {
+        // ⛔ The single-height branch returns true unconditionally, mismatch or not.
+        let bot = |_: usize| Vss;
+        let top = |_: usize| Vdd;
+        assert_eq!(power_compatible(Vss, Vdd, 0, 1, 4, &bot, &top), (true, false));
+        let (ok, flip) = power_compatible(Vdd, Vss, 0, 1, 4, &bot, &top);
+        assert!(ok, "still compatible");
+        assert!(flip, "but it wants flipping");
+    }
+
+    #[test]
+    fn a_multi_row_cell_on_the_wrong_parity_is_refused_unless_flipping_fixes_it() {
+        // Rows alternate: even rows VSS at the bottom, VDD on top; odd rows the reverse.
+        let bot = |r: usize| if r % 2 == 0 { Vss } else { Vdd };
+        let top = |r: usize| if r % 2 == 0 { Vdd } else { Vss };
+        // A double-height cell VSS-bottom / VSS-top spanning rows 0..1: row 0 bottom is VSS ✓,
+        // row 1 top is VSS ✓.
+        assert_eq!(power_compatible(Vss, Vss, 0, 2, 4, &bot, &top), (true, false));
+        // Starting at row 1 instead: bottom VDD, top VDD — the cell's VSS/VSS matches neither
+        // way round.
+        assert_eq!(power_compatible(Vss, Vss, 1, 2, 4, &bot, &top), (false, false));
+        // ⚠️ A TWO-row span in an alternating stack has the same supply at both ends
+        // (`bot(0)` and `top(1)` are both VSS), so flipping can never rescue a mismatch there.
+        assert_eq!(power_compatible(Vdd, Vss, 0, 2, 4, &bot, &top), (false, false));
+        // A THREE-row span is what exercises the flip: `bot(0)` is VSS and `top(2)` is VDD, so a
+        // VDD-bottom / VSS-top cell matches only the other way round.
+        assert_eq!(power_compatible(Vdd, Vss, 0, 3, 4, &bot, &top), (true, true));
+        assert_eq!(power_compatible(Vss, Vdd, 0, 3, 4, &bot, &top), (true, false),
+                   "the same span the right way round needs no flip");
+    }
+
+    #[test]
+    fn unknown_matches_anything() {
+        // ⚠️ The wildcard, and why an unreadable technology degenerates to always-compatible.
+        let bot = |_: usize| Vss;
+        let top = |_: usize| Vdd;
+        assert_eq!(power_compatible(Unknown, Unknown, 0, 2, 4, &bot, &top), (true, false));
+        let u = |_: usize| Unknown;
+        assert_eq!(power_compatible(Vdd, Vdd, 0, 2, 4, &u, &u), (true, false));
+    }
+
+    #[test]
+    fn a_cell_running_off_the_top_is_refused_before_any_rail_is_read() {
+        // ⛔ The bounds test comes FIRST, so it fires even where the rails would have matched.
+        let bot = |_: usize| Unknown;
+        let top = |_: usize| Unknown;
+        assert_eq!(power_compatible(Unknown, Unknown, 3, 2, 4, &bot, &top), (false, false));
+    }
+}

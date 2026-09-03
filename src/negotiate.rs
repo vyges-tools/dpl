@@ -1698,15 +1698,15 @@ use vyges_opendb::Db;
 pub const NOT_DONE: &[&str] = &[
     "groups_and_regions (respectsFence / initFenceRegions)",
     "master_symmetry (checkMasterSym)",
-    "row_power_compatibility (checkRowPowerCompatible)",
     "drc_history_costs (updateDrcHistoryCosts)",
     "diamondRecovery on stall",
 ];
 
 /// `NegotiationLegalizer::legalize` — the DEFAULT detailed-placement path.
 ///
-/// ⚠️ **Default, not the fallback.** `diamondDPL` is the opt-in one (`-disallow_one_site_gaps`
-/// and three other switches select it; 4 of 67 upstream cases take it).
+/// ⚠️ **Default, not the fallback.** `use_diamond_legalizer_` defaults to false and
+/// `isUseNegotiationLegalizer()` is its negation, so `diamondDPL` runs only when
+/// `-use_diamond_legalizer` is passed — **4 of 67 upstream cases**.
 ///
 /// **The call sequence, upstream's, in order:**
 ///
@@ -1735,8 +1735,18 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     let mut ngrid = NegGrid::build(gw.max(0) as usize, gh.max(0) as usize, &valid);
 
     // 1. + 3. The cells.
+    // Routing levels, shared with the power model (which reads pin geometry on ROUTING layers).
+    let levels = {
+        let layers = db.layers_with_direction().unwrap_or_default();
+        let types: Vec<(String, String)> = layers
+            .iter()
+            .map(|(n, _)| (n.clone(), db.layer_get_type(n).unwrap_or_default()))
+            .collect();
+        crate::drc::routing_levels(&types)
+    };
     let mut cells: Vec<SweepCell> = Vec::new();
     let mut sites: Vec<String> = Vec::new();
+    let mut masters: Vec<String> = Vec::new();
     for i in 0..db.num_insts() {
         let name = db.nth_inst_name(i);
         let master = db.inst_master(&name);
@@ -1774,6 +1784,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             width: cw, height: ch, fixed: false,
         });
         sites.push(db.master_get_site(&master));
+        masters.push(master.clone());
     }
 
     // The three closures the sweep needs, bound to this database.
@@ -1781,14 +1792,23 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     // ⚠️ Geometry is copied out so the closures below do not borrow `cells` — the sweep needs it
     // mutably. The dimensions never change during a run, so the copy cannot go stale.
     let dims: Vec<(i32, i32)> = cells.iter().map(|c| (c.width, c.height)).collect();
+    // `isValidRow`'s power guard. ⛔ **Multi-row cells only** — upstream tests
+    // `node->getMaster()->isMultiRow()` before calling `checkRowPowerCompatible`, and
+    // `powerCompatible`'s single-height branch returns `true` unconditionally anyway.
+    let power = PowerModel::build(db, &grid, &levels);
     let site_ok = |i: usize, x: i32, y: i32| -> bool {
         let (cw, ch) = dims[i];
         if x < 0 || y < 0 || y >= gh || x + cw > gw {
             return false;
         }
-        (0..ch).all(|dy| {
+        if !(0..ch).all(|dy| {
             (0..cw).all(|dx| grid.site_valid_at((x + dx) as i64, (y + dy) as i64, &sites[i]))
-        })
+        }) {
+            return false;
+        }
+        // ⚠️ Last, because the cheap geometric tests reject most candidates first — the ordering
+        // `isValidRow` uses.
+        ch <= 1 || power.compatible(&masters[i], y, ch)
     };
 
     // 4. Who starts illegal.
@@ -1948,4 +1968,107 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         out.not_done.push(format!("did not converge: {:?}", outcome));
     }
     Ok(out)
+}
+
+// ── power-rail alignment, bound to a database ────────────────────────────────────────────────
+
+/// The design's power model: each master's `(top, bottom)` rails, and each row's `(bottom, top)`.
+pub struct PowerModel {
+    master: std::collections::HashMap<String, (crate::drc::Power, crate::drc::Power)>,
+    /// Per grid row, `(bottom, top)`.
+    rows: Vec<(crate::drc::Power, crate::drc::Power)>,
+    /// Whether anything was actually determined. ⚠️ When false every check passes — say so.
+    pub known: bool,
+}
+
+impl PowerModel {
+    /// Build it the way `importDb` does: read every master's rails, infer the R0 convention from
+    /// the first single-height CORE master that shows one, then assign each row by its orientation.
+    ///
+    /// ⛔ **Instance order decides the convention**, because `inferR0RowPower` takes the FIRST
+    /// master that settles it — so the block's instances are walked in their own order, not the
+    /// master table's.
+    pub fn build(db: &Db, grid: &Grid, levels: &std::collections::HashMap<String, i32>)
+        -> PowerModel
+    {
+        use crate::drc::Power;
+        let mut master: std::collections::HashMap<String, (Power, Power)> =
+            std::collections::HashMap::new();
+        let mut rails_of = |db: &Db, m: &str| -> (Power, Power) {
+            if let Some(&v) = master.get(m) {
+                return v;
+            }
+            let (mut pwr, mut gnd) = (Vec::new(), Vec::new());
+            for (term, sig) in db.master_mterms(m).unwrap_or_default() {
+                let is_pwr = sig.eq_ignore_ascii_case("POWER");
+                let is_gnd = sig.eq_ignore_ascii_case("GROUND");
+                if !is_pwr && !is_gnd {
+                    continue;
+                }
+                for (ln, _, y0, _, y1) in db.mterm_pin_boxes(m, &term).unwrap_or_default() {
+                    // ⚠️ ROUTING layers only — wells, implants and cuts are skipped, and a well
+                    // rectangle spans the whole cell height so counting one would decide every
+                    // master's rails wrongly.
+                    if !levels.contains_key(&db.layer_name_by_number(ln)) {
+                        continue;
+                    }
+                    let y_centre = (y0 + y1) / 2;
+                    if is_pwr { pwr.push(y_centre) } else { gnd.push(y_centre) }
+                }
+            }
+            let v = crate::drc::master_power(&pwr, &gnd);
+            master.insert(m.to_string(), v);
+            v
+        };
+
+        // `inferR0RowPower` — the first single-height CORE master, in INSTANCE order.
+        let mut candidates = Vec::new();
+        for i in 0..db.num_insts() {
+            let m = db.inst_master(&db.nth_inst_name(i));
+            let ty = db.master_get_type(&m).unwrap_or_default();
+            if !ty.eq_ignore_ascii_case("CORE") {
+                continue;
+            }
+            let h = db.master_get_height(&m) as i32;
+            if grid.rows_spanned(0, h) > 1 {
+                continue; // multi-height masters are skipped
+            }
+            candidates.push(rails_of(db, &m));
+        }
+        let (r0_top, r0_bot) = crate::drc::infer_r0_row_power(candidates.into_iter());
+
+        let rows: Vec<(Power, Power)> = if r0_bot == Power::Unknown {
+            // ⛔ Nothing settled it, so EVERY row stays unknown and the check is a no-op.
+            vec![(Power::Unknown, Power::Unknown); grid.row_count]
+        } else {
+            (0..grid.row_count)
+                .map(|r| crate::drc::row_power(r0_top, r0_bot,
+                                               grid.row_orient.get(r).map_or("R0", |s| s)))
+                .collect()
+        };
+        let known = r0_bot != Power::Unknown;
+        // Make sure every master a caller may ask about is cached, not just the candidates.
+        for i in 0..db.num_insts() {
+            let m = db.inst_master(&db.nth_inst_name(i));
+            rails_of(db, &m);
+        }
+        PowerModel { master, rows, known }
+    }
+
+    /// `Opendp::checkRowPowerCompatible` — may this master start in this grid row?
+    ///
+    /// ⚠️ Returns `true` when the model is unknown, which is what upstream does: `powerCompatible`
+    /// treats `Power_UNK` as matching anything.
+    pub fn compatible(&self, master: &str, row: i32, rows_spanned: i32) -> bool {
+        if !self.known || row < 0 {
+            return true;
+        }
+        let (top, bot) = *self.master.get(master)
+            .unwrap_or(&(crate::drc::Power::Unknown, crate::drc::Power::Unknown));
+        crate::drc::power_compatible(
+            bot, top, row as usize, rows_spanned.max(0) as usize, self.rows.len(),
+            &|r| self.rows.get(r).map_or(crate::drc::Power::Unknown, |p| p.0),
+            &|r| self.rows.get(r).map_or(crate::drc::Power::Unknown, |p| p.1),
+        ).0
+    }
 }
