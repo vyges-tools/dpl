@@ -2378,15 +2378,22 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         if !(0..ch).all(|dy| row_has(y + dy)) {
             return false;
         }
-        // The bottom row must OFFER this cell's site, at this x.
-        // ⛔ Upstream tests `getSiteOrientation(...)` for a value here and refuses the row when
-        // it has none — the site being absent and the site being present are the same question.
-        let Some(orient) = grid.site_orient_at(x as i64, y as i64, &sites[i]) else {
-            return false;
-        };
-        // `checkMasterSym` — the master must be ALLOWED to take the orientation this row imposes.
-        if !check_master_sym(sym[i].0, sym[i].1, sym[i].2, &orient) {
-            return false;
+        // ⛔ **The whole site test is under `if (site != nullptr)`.** A master with no LEF
+        // `SITE` — a macro, typically — is asked NEITHER which site the row offers NOR which
+        // orientation it may take; upstream skips straight past both. Demanding a site match of
+        // a siteless master refuses it everywhere on the die, which reads as a legalizer that
+        // cannot place macros rather than as a missing guard.
+        if !sites[i].is_empty() {
+            // The bottom row must OFFER this cell's site, at this x. Upstream tests
+            // `getSiteOrientation(...)` for a value and refuses the row when it has none —
+            // the site being absent and the row being wrong are one question here.
+            let Some(orient) = grid.site_orient_at(x as i64, y as i64, &sites[i]) else {
+                return false;
+            };
+            // `checkMasterSym` — the master must be ALLOWED to take this row's orientation.
+            if !check_master_sym(sym[i].0, sym[i].1, sym[i].2, &orient) {
+                return false;
+            }
         }
         // ⚠️ The power test is last: it is the expensive one, and upstream reaches it only for a
         // multi-row master.
