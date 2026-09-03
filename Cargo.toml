@@ -1,6 +1,6 @@
 [package]
 name = "vyges-dpl"
-version = "0.1.35"
+version = "0.1.36"
 edition = "2021"
 description = "Detailed placement over the OpenDB database: legality checking and legalization."
 license = "Apache-2.0"
