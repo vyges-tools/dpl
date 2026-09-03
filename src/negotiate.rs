@@ -33,8 +33,18 @@ pub fn enters_model(placement_status: &str, core_auto_placeable: bool) -> bool {
     placement_status != "NONE" && core_auto_placeable
 }
 
-/// `initFromDb`'s snap — a cell whose rounded start lands on invalid sites moves to the nearest
-/// valid one, by a four-direction linear scan (upstream's shape is `Opendp::moveHopeless`).
+/// `initialSnap` — a cell whose rounded start lands on invalid sites moves to the nearest valid
+/// one, by an **expanding-budget diamond search**.
+///
+/// ⛔ **This REPLACED a four-direction linear scan.** Upstream `69c819fa16` (*"use dedicated
+/// diamond search for initial snapping. should provide better QoR (instances snapped to closer
+/// position), with controlled runtime"*), in the `945a9f4` → `7d490b8` window, and
+/// `fd9fad253e` promoted it out of `initFromDb` into its own `initialSnap()`.
+///
+/// ⚠️ **Four straight scans and a diamond do not agree**, which is the whole point of the change:
+/// the old shape only ever looked along the four axes, so a site one row up AND one column over
+/// was invisible to it however near it was. It could walk five sites left and take that over a
+/// diagonal neighbour two away.
 ///
 /// ⛔ **This runs BEFORE anything else looks at the cell, and it moves `init_x`/`init_y` as well
 /// as `x`/`y`.** The start position is what `targetCost` measures displacement from for the whole
@@ -46,20 +56,24 @@ pub fn enters_model(placement_status: &str, core_auto_placeable: bool) -> bool {
 /// and then reports *"0 illegal cells"*. Treating it as illegal instead hands it to the sweep,
 /// which legalizes it into a different row entirely.
 ///
-/// ⛔ **Four separate scans, each stopping at its OWN first valid position**, then the shortest
-/// of the four wins. Not one expanding diamond: the left scan may walk five sites and still lose
-/// to a right scan that walked two.
+/// 🔑 **The budget DOUBLES from one site width**, and within a pass `reach` is tightened by the
+/// incumbent — so the search widens geometrically but never scans past a hit it cannot beat.
+/// That is the *"controlled runtime"* the commit message claims.
 ///
 /// ⚠️ **The distances are in DBU, and the vertical one is NOT a row count.** Rows may differ in
 /// height, so a row one step away can be further in DBU than a site five steps away. Comparing
 /// rows against sites would pick a different winner on exactly the hybrid designs this matters on.
 ///
-/// ⚠️ **The comparison is strict `<`, so an exact tie keeps the EARLIER direction** — left, then
-/// right, then below, then above.
+/// ⚠️ **`total < best_dist` is strict, and left is tested before right**, so an exact tie keeps
+/// the first-seen candidate: the nearer ring, then the left column.
 ///
-/// ℹ️ Region containment (`isInRegionOk`) is part of upstream's test and is not evaluated here:
-/// designs declaring REGIONS/GROUPS are out of this engine's scope and are skipped whole.
-/// `valid_site` must answer for the cell's FULL footprint, which is why it takes the origin only.
+/// ℹ️ Upstream's `placeable` is in-die + every square having capacity + `respectsFence`. Region
+/// containment is not evaluated here: designs declaring REGIONS/GROUPS are out of this engine's
+/// scope and are skipped whole. `valid_site` must answer for the cell's FULL footprint, which is
+/// why it takes the origin only.
+///
+/// ℹ️ Distances are `i64` where upstream's are `int`; the widening is ours. It cannot bite at any
+/// realistic die size — `grid_w * site_width` is the die width in DBU.
 pub fn snap_to_valid_site(
     init_x: i32,
     init_y: i32,
@@ -78,37 +92,76 @@ pub fn snap_to_valid_site(
         row_y.get(usize::try_from(r).unwrap_or(usize::MAX)).copied().unwrap_or(0) as i64
     };
     let init_y_dbu = row_dbu(init_y);
-    let mut best: Option<(i64, i32, i32)> = None;
-    let mut offer = |dist: i64, x: i32, y: i32| {
-        if best.is_none_or(|(d, _, _)| dist < d) {
-            best = Some((dist, x, y));
+
+    // Farthest an in-grid site can sit from the initial position; once the budget reaches it the
+    // whole grid has been covered.
+    let max_budget = grid_w as i64 * site_width
+        + (init_y_dbu - row_dbu(0)).max(row_dbu(grid_h - height) - init_y_dbu);
+
+    let mut best_x = init_x;
+    let mut best_y = init_y;
+    let mut best_dist = i64::MAX;
+    let mut found = false;
+
+    let mut budget = site_width;
+    while !found {
+        // Rows in RINGS of increasing distance from `init_y`.
+        let mut r = 0i32;
+        loop {
+            // ⛔ **`reach` is tightened by the incumbent**, not just the budget. Once a hit is
+            // seen, rows further away than it cannot beat it and are skipped wholesale — this is
+            // what keeps the doubling search's runtime controlled.
+            let reach = budget.min(best_dist);
+            let ring_rows = [init_y - r, init_y + r];
+            let mut ring_in_reach = false;
+            // r == 0 is ONE row, not the same row twice.
+            for s in 0..if r == 0 { 1 } else { 2 } {
+                let py = ring_rows[s];
+                if py < 0 || py + height > grid_h {
+                    continue;
+                }
+                let vdist = (row_dbu(py) - init_y_dbu).abs();
+                if vdist >= reach {
+                    continue; // this row is beyond the current reach
+                }
+                ring_in_reach = true;
+                // Nearest placeable column on this row within what the budget has left after
+                // paying the vertical distance. `dx == 0` first, then outward.
+                let max_dx = ((reach - vdist) / site_width) as i32;
+                for dx in 0..=max_dx {
+                    let mut hit_x = -1;
+                    // ⚠️ **LEFT WINS A TIE**: `init_x - dx` is tested first and `init_x + dx`
+                    // only in the `else`, so at equal `dx` the left column takes it.
+                    if init_x - dx >= 0 && valid_site(init_x - dx, py) {
+                        hit_x = init_x - dx;
+                    } else if dx > 0 && init_x + dx + width <= grid_w && valid_site(init_x + dx, py)
+                    {
+                        hit_x = init_x + dx;
+                    }
+                    if hit_x >= 0 {
+                        let total = vdist + dx as i64 * site_width;
+                        if total < best_dist {
+                            best_dist = total;
+                            best_x = hit_x;
+                            best_y = py;
+                            found = true;
+                        }
+                        break; // nearest column on this row — stop scanning outward
+                    }
+                }
+            }
+            if !ring_in_reach {
+                break;
+            }
+            r += 1;
         }
-    };
-    for x in (0..init_x).rev() {
-        if valid_site(x, init_y) {
-            offer((init_x - x) as i64 * site_width, x, init_y);
-            break;
+        if budget >= max_budget {
+            break; // whole grid covered, nothing placeable
         }
+        budget = (budget * 2).min(max_budget);
     }
-    for x in (init_x + 1)..=(grid_w - width) {
-        if valid_site(x, init_y) {
-            offer((x - init_x) as i64 * site_width, x, init_y);
-            break;
-        }
-    }
-    for y in (0..init_y).rev() {
-        if valid_site(init_x, y) {
-            offer(init_y_dbu - row_dbu(y), init_x, y);
-            break;
-        }
-    }
-    for y in (init_y + 1)..=(grid_h - height) {
-        if valid_site(init_x, y) {
-            offer(row_dbu(y) - init_y_dbu, init_x, y);
-            break;
-        }
-    }
-    best.map(|(_, x, y)| (x, y))
+
+    if found { Some((best_x, best_y)) } else { None }
 }
 
 /// `dbMaster::isCoreAutoPlaceable` — may the placer touch an instance of this master at all?
@@ -1279,11 +1332,48 @@ mod tests {
         SortKey { overuse, height, width, idx }
     }
 
+    /// ⛔ **The DIAMOND finds a diagonal that four straight scans cannot see.**
+    ///
+    /// This is the case that distinguishes `initialSnap` (upstream `69c819fa16`) from the
+    /// `moveHopeless`-shaped four-direction scan it replaced: the only valid sites are one row up
+    /// and one column over. Every axis is blocked for the whole grid, so all four scans return
+    /// nothing and the old implementation answered `None` — leaving the cell on an invalid site
+    /// for negotiation to sort out.
+    ///
+    /// ⚠️ **Confirmed to FAIL against the four-scan version**, which is the only reason it is
+    /// worth having: a snap test that both algorithms pass proves nothing about the change.
     #[test]
-    fn the_snap_takes_the_shortest_of_four_independent_scans() {
-        // ⛔ Four separate scans, each stopping at its OWN first valid position, then the
-        // shortest wins — not one expanding diamond. Row 0 is a fragmented row: sites 0..=13 and
-        // 17.. are valid, 14/15/16 are the gap, and a 4-site cell rounds to x = 15.
+    fn the_diamond_finds_a_diagonal_no_straight_scan_would() {
+        // Rows 380 dbu apart, so one row up costs the same as one site across.
+        let row_y = [0, 380, 760];
+        // Valid ONLY at (init_x - 1, init_y + 1) and (init_x + 1, init_y + 1): both diagonals,
+        // nothing on init_y at all and nothing directly above.
+        let valid = |x: i32, y: i32| -> bool { y == 1 && (x == 4 || x == 6) };
+        assert_eq!(
+            snap_to_valid_site(5, 0, 1, 1, 31, 3, 380, &row_y, &valid),
+            Some((4, 1)),
+            "the diagonal one row up and one site LEFT — left wins the tie against x = 6",
+        );
+    }
+
+    /// 🔑 The budget doubles from ONE SITE WIDTH, so a site far outside the first budget is still
+    /// reached — the search widens geometrically rather than giving up.
+    #[test]
+    fn the_budget_doubles_until_a_distant_site_is_reached() {
+        let row_y = [0, 380];
+        // Nothing valid until 40 sites away — well past the initial one-site budget.
+        let valid = |x: i32, y: i32| -> bool { y == 0 && x == 45 };
+        assert_eq!(
+            snap_to_valid_site(5, 0, 1, 1, 100, 2, 380, &row_y, &valid),
+            Some((45, 0)),
+            "40 sites out, found by doubling the budget rather than by one linear walk",
+        );
+    }
+
+    #[test]
+    fn the_snap_takes_the_nearest_valid_site_in_dbu() {
+        // ⛔ Row 0 is a fragmented row: sites 0..=13 and 17.. are valid, 14/15/16 are the gap,
+        // and a 4-site cell rounds to x = 15.
         //
         // ⚠️ Measured against upstream on `fragmented_row02`: it logs "rounds to an invalid
         // initial position ... will search for the nearest valid site" and lands at dbu 34460,
@@ -3098,7 +3188,7 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
         // onto invalid pixels. Upstream moves it to the nearest valid site and moves `init_x` /
         // `init_y` with it — see [`snap_to_valid_site`]. Seeding first and snapping after would
         // leave usage at the unreachable square.
-        let (gx, gy) = snap_to_valid_site(
+        let gx_gy_snap = snap_to_valid_site(
             gx, gy, cw, ch, gw, gh, sw as i64, &grid.row_y,
             &|x, y| {
                 if x < 0 || y < 0 || x + cw > gw || y + ch > gh {
@@ -3108,8 +3198,19 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
                     grid.pixel((x + dx) as i64, (y + dy) as i64).is_some_and(|p| p.is_valid)
                 }))
             },
-        )
-        .unwrap_or((gx, gy));
+        );
+        // ⛔ **`DPL_TRACE_SNAP=1` reports every cell the snap MOVED**, and it exists because the
+        // gate could not tell a correct snap from one that never ran. Measured 2026-09-03 at pin
+        // `7d490b8`: the snap fires on exactly ONE design in the 28-case corpus —
+        // `fragmented_row02`, once — and never on `aes`, `gcd`, `ibex`, `simple05` or `simple07`.
+        // ⟹ Any change to the search is invisible to every failing case, so "the gate did not
+        // move" says nothing about it either way. Report the decision, not just the outcome.
+        if std::env::var_os("DPL_TRACE_SNAP").is_some() {
+            if let Some((nx, ny)) = gx_gy_snap {
+                eprintln!("snap {name}: ({gx}, {gy}) -> ({nx}, {ny})");
+            }
+        }
+        let (gx, gy) = gx_gy_snap.unwrap_or((gx, gy));
         // ⛔ Seeded where the cell IS — but NOT yet: see the usage pass below. `init_x/init_y`
         // are this point and never move again; `targetCost` measures displacement from them for
         // the whole run.
