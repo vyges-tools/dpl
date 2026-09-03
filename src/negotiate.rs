@@ -2331,13 +2331,13 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     // `!odb::hasOneSiteMaster(db_)`. Where a one-site-wide master exists the gap is fillable and
     // upstream does not apply the rule at all.
     //
-    // 🔑 `checkOneSiteGap` asks only whether a square holds A cell, never WHICH — so
-    // `NegGrid.usage > 0` answers it exactly. `ripUp`/`place` keep usage in step through the
-    // sweep, and `blockade` gives a fixed cell `usage = 1`, so fixed neighbours count too.
+    // 🔑 `checkOneSiteGap` asks only whether a square holds A cell, never WHICH — but it asks
+    // that of `pixel->cell`, not of usage, and the two disagree on a shared square. See
+    // [`NegPixel::cell`].
     //
-    // ⬜ The other three `PlacementDRC` rules are NOT wired here: padding and edge spacing need
-    // the OCCUPANT'S IDENTITY (a class-pair table and a master edge list), which this grid does
-    // not carry. They stay in `NOT_DONE`.
+    // ⬜ Two of `PlacementDRC`'s four rules are wired: this one and `checkPadding`. Edge spacing
+    // and blocked layers need the occupant's master edge list and layer set, which this grid
+    // does not carry. They stay in `NOT_DONE`.
     let one_site_gaps_disallowed = !db.has_one_site_master();
     let gap_ok = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
         let (cw, ch) = dims[i];
