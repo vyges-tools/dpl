@@ -196,14 +196,31 @@ pub fn init_position(
     row_y: &[i32], width: i32, height: i32, grid_w: i32, grid_h: i32,
 ) -> (i32, i32) {
     let gx = ((x_dbu - core_x) as f64 / site_width as f64).floor() as i32;
-    let rel_y = (y_dbu - core_y) as i32;
-    // `gridRoundY` — the NEAREST row boundary.
-    let gy = row_y
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, ry)| (**ry - rel_y).abs())
-        .map(|(i, _)| i as i32)
-        .unwrap_or(0);
+    let rel_y = (y_dbu - core_y) as i64;
+    // `gridRoundY` — snap DOWN, then take the row above when it is AT LEAST AS CLOSE.
+    //
+    // ⛔ **`>=`, so a cell exactly halfway between two rows rounds UP.** A "nearest row" search
+    // that keeps the first minimum rounds it DOWN, and the two answers differ by a whole row.
+    // ⚠️ Measured on `row_boundary_filter`: the cell sits at y = 7000 with rows at 5600 and
+    // 8400 — 1400 either way. Upstream reports it rounding to 8400 in its own log, snaps it
+    // sideways within that row, and never negotiates it; we started it a row lower and finished
+    // a row lower.
+    //
+    // 🔑 **Only `g` and `g + 1` are ever considered**, and `g + 1` must be a real row — upstream
+    // guards `grid_y < size() - 1` over a table of `row_count` entries. `row_y` here carries
+    // `row_count + 1` (its last entry is the top of the core, not a row), so the guard is two
+    // from the end.
+    let gy = {
+        let g = row_y.iter().rposition(|&ry| ry as i64 <= rel_y).unwrap_or(0);
+        let above_exists = g + 1 <= row_y.len().saturating_sub(2);
+        if above_exists
+            && (row_y[g] as i64 - rel_y).abs() >= (row_y[g + 1] as i64 - rel_y).abs()
+        {
+            g + 1
+        } else {
+            g
+        }
+    } as i32;
     (gx.clamp(0, (grid_w - width).max(0)), gy.clamp(0, (grid_h - height).max(0)))
 }
 
@@ -2067,6 +2084,23 @@ mod tests {
         negotiation_iter(&mut cells, &mut vec![0], consts::ISOLATION_PT, &mut ctx);
         assert_eq!(cells[0].x, 3, "untouched, and its usage was never ripped up");
         assert_eq!(grid.at(3, 0).usage, 1, "usage is intact — the skip happened before rip-up");
+    }
+
+    #[test]
+    fn a_cell_exactly_between_two_rows_rounds_up() {
+        // ⛔ `gridRoundY`'s comparison is `>=`, so a tie goes to the row ABOVE. A "nearest row"
+        // search that keeps the first minimum sends it DOWN, and the answers differ by a row.
+        //
+        // ⚠️ Measured on `row_boundary_filter`: the cell is at y = 7000 with rows at 5600 and
+        // 8400 — 1400 either way — and upstream's own log reports it rounding to 8400.
+        let row_y = [0, 2800, 5600, 8400, 11200, 14000, 16800];
+        let at = |y: i64| init_position(0, y, 0, 0, 380, &row_y, 3, 1, 23, 6).1;
+        assert_eq!(at(7000), 3, "the exact tie takes the row above");
+        assert_eq!(at(6999), 2, "one dbu below the midpoint still rounds down");
+        assert_eq!(at(7001), 3);
+        // 🔑 The last entry of `row_y` is the top of the core, not a row: rounding must never
+        // return it.
+        assert_eq!(at(16800), 5, "clamped to the last real row, not to the core's top edge");
     }
 
     #[test]
