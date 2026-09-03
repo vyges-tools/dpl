@@ -1926,7 +1926,7 @@ mod tests {
     fn sweep_ctx(grid: &mut NegGrid) -> SweepCtx<'_> {
         SweepCtx {
             grid,
-            window: &|_c, x, y| (-4, 4, vec![y; 1].into_iter().map(|_| y).collect()),
+            window: &|_c, _x, y, _g| (-4, 4, vec![y; 1].into_iter().map(|_| y).collect()),
             placeable: &|c, x, _y| x >= 0 && x + c.width <= 8,
             drc_violations: &|_, _, _, _| 0,
             fixed_paint: &[],
@@ -1946,7 +1946,7 @@ mod tests {
         grid.add_usage(0, 0, 1, 1, 1);
         let mut ctx = SweepCtx {
             grid: &mut grid,
-            window: &|_c, x, y| (-x, 0, vec![y]),   // pinned in place: no candidate but its own
+            window: &|_c, x, y, _g| (-x, 0, vec![y]), // pinned in place: no candidate but its own
             placeable: &|_, x, _| (0..6).contains(&x),
             // Always dirty, wherever it sits.
             drc_violations: &|_, _, _, _| 1,
@@ -1971,7 +1971,7 @@ mod tests {
         }
         let mut ctx = SweepCtx {
             grid: &mut grid,
-            window: &|_c, x, y| (-x, 0, vec![y]),
+            window: &|_c, x, y, _g| (-x, 0, vec![y]),
             placeable: &|_, x, _| (0..6).contains(&x),
             // Only the bystander is dirty — the active cell is fine.
             drc_violations: &|c, _, _, _| i32::from(c.name == "bystander"),
@@ -1996,7 +1996,7 @@ mod tests {
         let before = grid.at(1, 0).hist_cost;
         let mut ctx = SweepCtx {
             grid: &mut grid,
-            window: &|_c, x, y| (-x, 3 - x, vec![y]),
+            window: &|_c, x, y, _g| (-x, 3 - x, vec![y]),
             placeable: &|_, x, _| (0..4).contains(&x),
             drc_violations: &|_, _, _, _| 0,
             fixed_paint: &[],
@@ -2022,7 +2022,7 @@ mod tests {
         // ⚠️ And the sweep moves it out, rather than leaving it where it started.
         let mut ctx = SweepCtx {
             grid: &mut grid,
-            window: &|_c, x, y| (-x, 3 - x, vec![y]),
+            window: &|_c, x, y, _g| (-x, 3 - x, vec![y]),
             placeable: &|c, x, _| x >= 0 && x + c.width <= 4,
             drc_violations: &|_, _, _, _| 0,
             fixed_paint: &[],
@@ -2152,7 +2152,12 @@ pub struct SweepCell {
 pub struct SweepCtx<'a> {
     pub grid: &'a mut NegGrid,
     /// `(dx_lo, dx_hi, rows)` for a cell anchored at `(x, y)`.
-    pub window: &'a dyn Fn(&SweepCell, i32, i32) -> (i32, i32, Vec<i32>),
+    ///
+    /// ⚠️ **Takes the grid**, because both halves of `buildSearchWindow` read CAPACITY:
+    /// `horizontalWindowBounds`' `openAt` tests the footprint for `capacity == 0`, and
+    /// `verticalWindowRows`' `rowUsable` tests it per square. A window built from die bounds
+    /// alone cannot see a macro, and so never walks past one.
+    pub window: &'a dyn Fn(&SweepCell, i32, i32, &NegGrid) -> (i32, i32, Vec<i32>),
     /// Can this cell's footprint legally sit here, ignoring congestion?
     pub placeable: &'a dyn Fn(&SweepCell, i32, i32) -> bool,
     /// How many of `PlacementDRC`'s four checks a position fails.
@@ -2279,9 +2284,9 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
         ctx.grid.add_usage(c.x, c.y, c.width, c.height, -1);
 
         // 4. Enumerate and score.
-        let (ilo, ihi, irows) = (ctx.window)(&c, c.init_x, c.init_y);
+        let (ilo, ihi, irows) = (ctx.window)(&c, c.init_x, c.init_y, ctx.grid);
         let (clo, chi, crows) = if (c.x, c.y) != (c.init_x, c.init_y) {
-            (ctx.window)(&c, c.x, c.y)
+            (ctx.window)(&c, c.x, c.y, ctx.grid)
         } else {
             (0, 0, Vec::new())
         };
@@ -2838,18 +2843,46 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         let names: Vec<String> = cells.iter().map(|c| c.name.clone()).collect();
         let by_name: std::collections::HashMap<&str, usize> =
             index.iter().map(|&i| (names[i].as_str(), i)).collect();
-        let window = |c: &SweepCell, x: i32, y: i32| -> (i32, i32, Vec<i32>) {
+        let window = |c: &SweepCell, x: i32, y: i32, g: &NegGrid| -> (i32, i32, Vec<i32>) {
             let i = by_name[c.name.as_str()];
+            let (cw, ch) = (c.width, c.height);
+            let cap_at = |px: i32, py: i32| -> i32 {
+                if px < 0 || py < 0 || px as usize >= g.width || py as usize >= g.height {
+                    return 0;
+                }
+                g.at(px as usize, py as usize).capacity
+            };
+            // `offDie` — upstream's `inDie(target_x, target_y, width, height)`, negated: the
+            // whole FOOTPRINT must fit, not just the origin.
+            let off_die = |px: i32| !(px >= 0 && y >= 0 && px + cw <= gw && y + ch <= gh);
+            // ⛔ **`openAt` tests CAPACITY over the footprint, not die bounds.** Upstream's own
+            // comment: "fixed cells, macros and row-less gaps all have capacity == 0". A walk
+            // that calls every on-die square open spends its whole budget inside a macro and
+            // stops there, so the window never reaches the free sites on the far side.
+            //
+            // ⚠️ Measured on `cell_on_block1`: a 264-site macro with four cells sitting on it.
+            // Upstream walks 80 blocked steps — blocked steps cost no budget — and finds the
+            // first open site past the macro's right edge; ours reached 20 sites and gave up,
+            // leaving the cell where it was, on the blockage.
+            let open_at = |px: i32| (0..ch).all(|dy| (0..cw).all(|dx| cap_at(px + dx, y + dy) > 0));
             let w = build_search_window(
                 x, y,
                 consts::SITE_SEARCH_WINDOW, consts::ROW_SEARCH_WINDOW,
                 effective_row_cap(consts::ROW_SEARCH_WINDOW, c.height, 100, true),
                 500, 100, true,
-                &|px| px < 0 || px >= gw,
-                &|px| px >= 0 && px < gw,
+                &off_die,
+                &open_at,
                 c.height, gh,
                 &row_has,
-                &|r, lo, hi| (lo.max(0)..=hi.min(gw - 1)).any(|px| site_ok(i, px, r)),
+                // `rowUsable` — SOME square in the horizontal span has capacity AND offers the
+                // cell's row. ⛔ Both terms: capacity alone would call a macro's rows usable,
+                // and `isValidRow` alone would call a blockaded row usable.
+                // ⚠️ The probe's right edge is `grid_w - cell.width`, not `grid_w - 1`: it is an
+                // ORIGIN that has to fit the footprint.
+                &|r, lo, hi| {
+                    (lo.max(0)..=hi.min(gw - cw))
+                        .any(|px| cap_at(px, r) > 0 && site_ok(i, px, r))
+                },
             );
             (w.dx_lo, w.dx_hi, w.rows)
         };
