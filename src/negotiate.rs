@@ -757,6 +757,84 @@ pub fn run_negotiation(
     Outcome::Exhausted { violations: -1 }
 }
 
+/// A candidate location and the rank that breaks cost ties.
+///
+/// ⛔ **`ScanRank = (window, row_pos, dx)`, compared lexicographically**, and the FIRST element is
+/// the window index: **0 = the init window, 1 = the current-position window**. So on an exact cost
+/// tie a candidate found around the cell's original position beats one found around where it
+/// currently sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScanRank {
+    pub window: u8,
+    pub row_pos: usize,
+    pub dx: i32,
+}
+
+/// One candidate the search offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Candidate {
+    pub x: i32,
+    pub y: i32,
+    pub rank: ScanRank,
+}
+
+/// `findBestLocation`'s enumeration — candidates in the order upstream visits them.
+///
+/// **Pass 1 — wavefronts of increasing displacement around the INIT position.**
+/// `d` runs 0..=`max_dy + max(-dx_lo, dx_hi)`; each row spends `|ty - init_y|` of the budget and
+/// the remainder `rem` is the horizontal reach. ⚠️ At `rem == 0` only the LEFT branch fires (the
+/// right needs `rem > 0`), so the centre column is offered **once**, not twice.
+///
+/// ⛔ **`prune(d)` breaks the whole loop, it does not skip.** `targetCostFromDisp` is monotone in
+/// `d`, so once a wavefront's floor exceeds the incumbent no later wavefront can win — that is the
+/// entire reason the search is cheap in an uncontended region.
+///
+/// **Pass 2 — a FULL scan around the CURRENT position, only when the cell has been displaced.**
+/// ⚠️ Not wavefronts: upstream's comment is explicit that `targetCost` is anchored at init, so
+/// ordering around the current position "gives no usable bound here". Every candidate is offered
+/// and the per-candidate prune does the work.
+pub fn enumerate_candidates(
+    init_x: i32, init_y: i32, cur_x: i32, cur_y: i32,
+    init_rows: &[i32], init_dx_lo: i32, init_dx_hi: i32,
+    curr_rows: &[i32], curr_dx_lo: i32, curr_dx_hi: i32,
+    prune: &dyn Fn(i64) -> bool,
+    out: &mut Vec<Candidate>,
+) {
+    let max_dy = init_rows.iter().map(|ty| (ty - init_y).abs()).max().unwrap_or(0);
+    let max_d = max_dy + (-init_dx_lo).max(init_dx_hi);
+
+    'waves: for d in 0..=max_d {
+        if prune(d as i64) {
+            break 'waves; // ⛔ break, not continue — the floor only rises
+        }
+        for (row_pos, &ty) in init_rows.iter().enumerate() {
+            let rem = d - (ty - init_y).abs();
+            if rem < 0 {
+                continue;
+            }
+            if -rem >= init_dx_lo {
+                out.push(Candidate { x: init_x - rem, y: ty,
+                                     rank: ScanRank { window: 0, row_pos, dx: -rem } });
+            }
+            if rem > 0 && rem <= init_dx_hi {
+                out.push(Candidate { x: init_x + rem, y: ty,
+                                     rank: ScanRank { window: 0, row_pos, dx: rem } });
+            }
+        }
+    }
+
+    // Only when displaced — an undisplaced cell's two windows are the same one.
+    if cur_x == init_x && cur_y == init_y {
+        return;
+    }
+    for (row_pos, &ty) in curr_rows.iter().enumerate() {
+        for dx in curr_dx_lo..=curr_dx_hi {
+            out.push(Candidate { x: cur_x + dx, y: ty,
+                                 rank: ScanRank { window: 1, row_pos, dx } });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1241,6 +1319,64 @@ mod tests {
         let out = run_negotiation(2, 2, |_| { n += 1; n }, || {});
         assert!(matches!(out, Outcome::Exhausted { .. }));
         assert_eq!(n, 4, "both phases ran to their limits");
+    }
+
+    fn enumerate(init_rows: &[i32], lo: i32, hi: i32) -> Vec<Candidate> {
+        let mut v = Vec::new();
+        enumerate_candidates(10, 5, 10, 5, init_rows, lo, hi, &[], 0, 0, &|_| false, &mut v);
+        v
+    }
+
+    #[test]
+    fn the_centre_is_offered_once_not_twice() {
+        // ⚠️ At rem == 0 only the left branch fires, so (init_x, init_y) appears a single time.
+        let v = enumerate(&[5], -2, 2);
+        let centre = v.iter().filter(|c| (c.x, c.y) == (10, 5)).count();
+        assert_eq!(centre, 1, "got {centre} copies of the centre");
+    }
+
+    #[test]
+    fn candidates_arrive_in_wavefronts_of_increasing_displacement() {
+        let v = enumerate(&[5], -3, 3);
+        let disp: Vec<i32> = v.iter().map(|c| (c.x - 10).abs() + (c.y - 5).abs()).collect();
+        assert!(disp.windows(2).all(|w| w[0] <= w[1]), "not monotone: {disp:?}");
+        assert_eq!(disp[0], 0, "the cell's own position comes first");
+    }
+
+    #[test]
+    fn the_prune_breaks_the_search_rather_than_skipping_a_wavefront() {
+        // ⛔ **A MONOTONE prune cannot tell `break` from `continue`** — both drop everything past
+        // the threshold. Written that way first, and a `break`→`continue` mutation survived.
+        //
+        // A NON-monotone prune separates them: reject only d == 2. `break` stops there and never
+        // offers d >= 3; `continue` skips 2 and resumes at 3.
+        //
+        // ⚠️ Upstream is only *entitled* to `break` because `targetCostFromDisp` is monotone — but
+        // the test for which spelling was written needs the case that distinguishes them.
+        let mut v = Vec::new();
+        enumerate_candidates(10, 5, 10, 5, &[5], -5, 5, &[], 0, 0, &|d| d == 2, &mut v);
+        let reach = v.iter().map(|c| (c.x - 10).abs()).max().unwrap_or(0);
+        assert_eq!(reach, 1, "must BREAK at d == 2, so d >= 3 is never offered; got reach {reach}");
+        assert!(!v.is_empty(), "wavefronts 0 and 1 were still offered");
+    }
+
+    #[test]
+    fn the_second_window_runs_only_when_the_cell_is_displaced() {
+        let mut same = Vec::new();
+        enumerate_candidates(10, 5, 10, 5, &[5], 0, 0, &[9], -1, 1, &|_| false, &mut same);
+        assert!(same.iter().all(|c| c.rank.window == 0), "undisplaced: no second window");
+
+        let mut moved = Vec::new();
+        enumerate_candidates(10, 5, 30, 9, &[5], 0, 0, &[9], -1, 1, &|_| false, &mut moved);
+        assert!(moved.iter().any(|c| c.rank.window == 1), "displaced: the second window runs");
+    }
+
+    #[test]
+    fn the_init_window_outranks_the_current_window_on_a_tie() {
+        // ⛔ ScanRank compares the window index first.
+        let a = ScanRank { window: 0, row_pos: 99, dx: 99 };
+        let b = ScanRank { window: 1, row_pos: 0, dx: 0 };
+        assert!(a < b, "an init-window candidate wins however deep in its own scan it was");
     }
 
     #[test]
