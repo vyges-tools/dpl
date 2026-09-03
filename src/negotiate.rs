@@ -439,6 +439,18 @@ impl NegGrid {
     }
 
     /// Blockade a fixed cell's footprint: `capacity = 0`, `usage = 1`.
+    /// `gridAt(x, y).capacity` — 1 for a usable square, 0 for **no site OR a fixed blockage**.
+    ///
+    /// 🔑 Out-of-grid reads 0, which is what `initialSnap`'s `placeable` wants: upstream tests
+    /// `inDie` first and then every square's capacity, and a square off the grid is not one a
+    /// cell may occupy either way.
+    pub fn capacity_at(&self, x: i32, y: i32) -> i32 {
+        if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height {
+            return 0;
+        }
+        self.pixels[y as usize * self.width + x as usize].capacity
+    }
+
     pub fn blockade(&mut self, x: i32, y: i32, w: i32, h: i32) {
         for dy in 0..h {
             for dx in 0..w {
@@ -3188,29 +3200,9 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
         // onto invalid pixels. Upstream moves it to the nearest valid site and moves `init_x` /
         // `init_y` with it — see [`snap_to_valid_site`]. Seeding first and snapping after would
         // leave usage at the unreachable square.
-        let gx_gy_snap = snap_to_valid_site(
-            gx, gy, cw, ch, gw, gh, sw as i64, &grid.row_y,
-            &|x, y| {
-                if x < 0 || y < 0 || x + cw > gw || y + ch > gh {
-                    return false;
-                }
-                (0..ch).all(|dy| (0..cw).all(|dx| {
-                    grid.pixel((x + dx) as i64, (y + dy) as i64).is_some_and(|p| p.is_valid)
-                }))
-            },
-        );
-        // ⛔ **`DPL_TRACE_SNAP=1` reports every cell the snap MOVED**, and it exists because the
-        // gate could not tell a correct snap from one that never ran. Measured 2026-09-03 at pin
-        // `7d490b8`: the snap fires on exactly ONE design in the 28-case corpus —
-        // `fragmented_row02`, once — and never on `aes`, `gcd`, `ibex`, `simple05` or `simple07`.
-        // ⟹ Any change to the search is invisible to every failing case, so "the gate did not
-        // move" says nothing about it either way. Report the decision, not just the outcome.
-        if std::env::var_os("DPL_TRACE_SNAP").is_some() {
-            if let Some((nx, ny)) = gx_gy_snap {
-                eprintln!("snap {name}: ({gx}, {gy}) -> ({nx}, {ny})");
-            }
-        }
-        let (gx, gy) = gx_gy_snap.unwrap_or((gx, gy));
+        // ⛔ **The snap does NOT happen here — see the `initialSnap` pass after this loop.** It
+        // needs every fixed cell blockaded first, and inside this loop only the fixed cells seen
+        // so far are.
         // ⛔ Seeded where the cell IS — but NOT yet: see the usage pass below. `init_x/init_y`
         // are this point and never move again; `targetCost` measures displacement from them for
         // the whole run.
@@ -3244,6 +3236,55 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
     // `_388_` scored an overuse of 17 where upstream scores at least 19, which put it ninth in
     // the sweep instead of seventh. Usage feeds the sort key, the cost, the violation count and
     // the history — the wrong seed is wrong for all four.
+    // ⛔ **`initialSnap` — its OWN pass, after every fixed cell is blockaded and before usage is
+    // seeded.** Upstream `fd9fad253e` promoted it out of `initFromDb` into `initialSnap()` and
+    // says why at the call site:
+    //
+    // > Must run after buildGrid()/initFenceRegions() so it can see fixed-cell blockages and
+    // > fence regions.
+    //
+    // ⛔ **We ran it INSIDE the instance loop, so it saw only the blockages of fixed cells that
+    // happened to come earlier in DEF order** — a correct function called on the wrong inputs,
+    // which is the call-sequence half of the transcription and the half a pure unit test cannot
+    // see. Measured on `simple05`: upstream logs *"Instance '_283_' has an invalid initial
+    // position at dbu (31040, 28000)"* and snaps it; ours snapped NOTHING on that design.
+    //
+    // ⛔ **And the predicate is CAPACITY, not "a site exists".** Upstream's `placeable` fails on
+    // `gridAt(gx, gy).capacity == 0`, which is *"no site OR a fixed blockage"* — that is the
+    // *"available space"* of `fd9fad253e`'s title. Testing `Grid::is_valid` alone asks only
+    // whether the site exists, so a cell sitting squarely on a macro read as legal and was never
+    // snapped.
+    //
+    // ℹ️ It deliberately ignores row legality, movable overlap and padding: negotiation handles
+    // all three. And it does not read usage — which is why the seeding below comes after.
+    let trace_snap = std::env::var_os("DPL_TRACE_SNAP").is_some();
+    for c in cells.iter_mut() {
+        let (cw, ch) = (c.width, c.height);
+        let snapped = snap_to_valid_site(
+            c.init_x, c.init_y, cw, ch, gw, gh, sw as i64, &grid.row_y,
+            &|x, y| {
+                if x < 0 || y < 0 || x + cw > gw || y + ch > gh {
+                    return false;
+                }
+                (0..ch).all(|dy| (0..cw).all(|dx| {
+                    ngrid.capacity_at(x + dx, y + dy) != 0
+                }))
+            },
+        );
+        if let Some((nx, ny)) = snapped {
+            if trace_snap {
+                eprintln!("snap {}: ({}, {}) -> ({nx}, {ny})", c.name, c.init_x, c.init_y);
+            }
+            // ⛔ `init_x`/`init_y` move WITH the cell: they are what `targetCost` measures
+            // displacement from for the whole run, so a snapped cell is negotiated from its new
+            // home rather than pulled back toward a position it could never have occupied.
+            c.init_x = nx;
+            c.init_y = ny;
+            c.x = nx;
+            c.y = ny;
+        }
+    }
+
     for c in &cells {
         ngrid.add_usage(c.x, c.y, c.width, c.height, 1);
     }
