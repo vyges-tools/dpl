@@ -66,25 +66,30 @@ order to be useful — and upstream's own suite leans on it harder: **77 of 92 `
 
 ## Status
 
-⚠️ **REGRESSED at the current pin — 18 of 28 comparable cases** at
-`7d490b8ecd357199c0c0e9f3e32becd5eb507c34`, down from **28 of 28** at the previous pin
-`945a9f48dc6e5cc91d865daa92c45a1094cb682c`. **A score is only true of one commit**, and this is
-what that rule looks like when it bites.
+✅ **Legalization matches the reference on every comparable case in its own regression suite** —
+**28 of 28**, at pin `7d490b8ecd357199c0c0e9f3e32becd5eb507c34`.
 
-⛔ **The regression is upstream moving, not a defect introduced here.** OpenROAD reworked the
-negotiation legalizer's INITIAL SNAPPING across seven commits and refreshed 24 of its own goldens.
-🔑 **All ten failing cases are exactly the comparable cases whose golden upstream changed, and no
-other case moved** — so nothing here broke; three named mechanisms are simply not transcribed yet:
+🔑 **The agreement is SWEEP-LEVEL, not final-placement only.** Upstream's own per-iteration debug
+trace and this engine's match line for line — same cell, same order, same chosen position, every
+iteration — on `simple05`, `simple07`, `gcd` (574 lines) and `hybrid_cells`.
 
-| not yet transcribed | what it changes |
+ℹ️ **It read 18 of 28 when the pin first moved** from `945a9f48dc6e5cc91d865daa92c45a1094cb682c`,
+because upstream reworked the negotiation legalizer's initial snapping across seven commits and
+refreshed 24 of its own goldens. Four mechanisms recovered it:
+
+| mechanism | what it changed |
 | --- | --- |
-| `Grid::gridRoundX` | the initial x now **rounds** to the nearest site where it truncated |
-| `displacementInSites` / `rowDispInSites` | displacement is measured in **site widths on both axes**, so a row jump is no longer priced as one step |
-| `initialSnap()` | a dedicated diamond search for the initial snap |
+| `Grid::gridRoundX` | the initial x **rounds** to the nearest site rather than truncating |
+| `displacementInSites` / `rowDispInSites` | displacement is **site widths on both axes**, so a row jump is no longer priced as one step — and the search wavefront reorders with it |
+| `initialSnap()`'s diamond search | replaces a four-direction scan that could not see a diagonal |
+| **the snap runs as its own pass** | after every fixed cell is blockaded, testing grid **capacity** rather than merely whether a site exists |
 
-At the previous pin the agreement covered the three large designs:
+⚠️ **The last one is a CALL SEQUENCE fix, not a logic one** — the function was right and was being
+called on inputs that were not ready. It took the gate from 23/28 to 28/28 on its own.
 
-| design | components | result at `945a9f4` |
+The three large designs, at the current pin:
+
+| design | components | result at `7d490b8` |
 | --- | ---: | --- |
 | `aes` | 21,340 | identical |
 | `ibex` | 34,184 | identical |
