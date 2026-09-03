@@ -205,11 +205,27 @@ pub fn grid_width_in_sites(master_width: i64, site_width: i64) -> i32 {
     (master_width as f64 / site_width as f64).ceil() as i32
 }
 
-/// The starting grid position — `gridX` for x, **`gridRoundY`** for y, then clamped.
+/// The starting grid position — **`gridRoundX`** for x, **`gridRoundY`** for y, then clamped.
 ///
-/// ⚠️ **`x` FLOORS and `y` ROUNDS.** `diamondDPL`'s `legalGridPt` snaps y DOWN instead; this
-/// legalizer takes the nearest row. A cell sitting just below a row boundary therefore starts one
-/// row higher here than it would there.
+/// ⛔ **BOTH AXES ROUND, and x did not always.** Upstream `e83b52b4cc` (*"negotiation initial
+/// snapping, round on x direction instead of truncating"*, in the `945a9f4` → `7d490b8` window)
+/// replaced `gridX` with the new `gridRoundX` here, giving the reason at the call site:
+///
+/// > Round to the nearest site/row in both directions (as `Opendp::legalPt` does) so an
+/// > already-legal instance keeps its position instead of drifting left/down by up to one site.
+///
+/// ⚠️ **This is the same defect class as the `gridRoundY` tie, one axis over** — and the comment
+/// that used to sit here, *"`x` FLOORS and `y` ROUNDS"*, was a faithful transcription of code
+/// upstream has since decided was wrong. A correct transcription of the old rule is still wrong at
+/// the new pin.
+///
+/// 🔑 `gridRoundX(x) = divRound(x, site_width)` and `divRound(a, b) = round(double(a) / b)`, so a
+/// tie goes **AWAY FROM ZERO — up, i.e. right** for the positive coordinates this sees. Rust's
+/// `f64::round()` has the same tie rule, so the transcription is direct.
+///
+/// ℹ️ Upstream's `divRound` takes `int`; the DBU values here are `i64` and so nominally WIDER.
+/// It cannot bite in practice — a die coordinate is ~1e7 DBU against `i32`'s 2.1e9 — but the
+/// widening is ours, not the reference's.
 ///
 /// 🔑 The clamp uses `grid_w - width` and `grid_h - height`, not `grid_w`/`grid_h`, so the whole
 /// footprint stays on the grid rather than just the origin.
@@ -217,7 +233,8 @@ pub fn init_position(
     x_dbu: i64, y_dbu: i64, core_x: i64, core_y: i64, site_width: i64,
     row_y: &[i32], width: i32, height: i32, grid_w: i32, grid_h: i32,
 ) -> (i32, i32) {
-    let gx = ((x_dbu - core_x) as f64 / site_width as f64).floor() as i32;
+    // `gridRoundX` — nearest site column, NOT the floor. See the note above.
+    let gx = ((x_dbu - core_x) as f64 / site_width as f64).round() as i32;
     let rel_y = (y_dbu - core_y) as i64;
     // `gridRoundY` — snap DOWN, then take the row above when it is AT LEAST AS CLOSE.
     //
@@ -1901,13 +1918,47 @@ mod tests {
         assert_eq!(cell_width_in_sites(10, 100), 1, "never below one site");
     }
 
+    /// ⛔ **BOTH axes round.** Upstream `e83b52b4cc` replaced `gridX` with `gridRoundX` here —
+    /// *"Round to the nearest site/row in both directions (as `Opendp::legalPt` does) so an
+    /// already-legal instance keeps its position instead of drifting left/down by up to one
+    /// site."*
+    ///
+    /// ⚠️ **This test previously asserted the opposite** (`the_start_position_floors_x_and_rounds_y`,
+    /// *"x floors: 2.55 sites -> 2"*). It was a faithful transcription of upstream code that
+    /// upstream has since decided was wrong, and it aged with it — the same shape as a descriptor
+    /// that pins what we CANNOT do. Pin what upstream does NOW, and name the commit.
     #[test]
-    fn the_start_position_floors_x_and_rounds_y() {
+    fn the_start_position_rounds_on_both_axes() {
         // Rows every 10 units; the cell sits at y=17, nearer row 2 (y=20) than row 1 (y=10).
         let rows = [0, 10, 20, 30];
         let (gx, gy) = init_position(255, 17, 0, 0, 100, &rows, 1, 1, 100, 4);
-        assert_eq!(gx, 2, "x floors: 2.55 sites -> 2");
+        assert_eq!(gx, 3, "x ROUNDS: 2.55 sites -> 3, where the old gridX floored it to 2");
         assert_eq!(gy, 2, "y takes the NEAREST row, not the one below");
+    }
+
+    /// 🔑 `divRound(a, b)` is `round(double(a) / b)`, and C's `round()` breaks a tie **away from
+    /// zero** — so exactly half a site goes RIGHT. Rust's `f64::round()` has the same rule, which
+    /// is why the transcription is a one-word change rather than a hand-rolled comparison.
+    ///
+    /// ⚠️ Checking the direction of every rounding tie is a standing rule here: `gridRoundY`'s
+    /// `>=` sends a tie UP, and getting it backwards was worth one whole row.
+    #[test]
+    fn an_x_tie_goes_right_because_divround_rounds_away_from_zero() {
+        let rows = [0, 10];
+        // 250 DBU on a 100 DBU site is exactly 2.5 sites.
+        let (gx, _) = init_position(250, 0, 0, 0, 100, &rows, 1, 1, 100, 2);
+        assert_eq!(gx, 3, "a tie rounds AWAY FROM ZERO, so 2.5 -> 3, not 2");
+    }
+
+    /// The reason upstream gives for the change: an instance already sitting exactly on a site
+    /// must keep its column, which floor and round agree on — the drift was for everything else.
+    #[test]
+    fn an_already_legal_x_keeps_its_column() {
+        let rows = [0, 10];
+        for sites in 0..6i64 {
+            let (gx, _) = init_position(sites * 100, 0, 0, 0, 100, &rows, 1, 1, 100, 2);
+            assert_eq!(gx, sites as i32, "an exact multiple of the site width must not move");
+        }
     }
 
     #[test]
