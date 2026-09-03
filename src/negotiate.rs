@@ -129,13 +129,18 @@ pub fn snap_to_valid_site(
 /// Matching strings cannot earn that warning, so an unrecognised type falls through to `false`,
 /// which is the answer upstream's own trailing `return false` gives.
 pub fn is_core_auto_placeable(master_type: &str) -> bool {
-    match master_type {
+    match crate::drc::canonical_master_type(master_type).as_str() {
         "CORE" | "CORE_FEEDTHRU" | "CORE_TIEHIGH" | "CORE_TIELOW" | "CORE_SPACER"
         | "CORE_WELLTAP" | "CORE_ANTENNACELL" => true,
         "BLOCK" | "BLOCK_BLACKBOX" | "BLOCK_SOFT" => true,
-        "ENDCAP" | "ENDCAP_PRE" | "ENDCAP_POST" => true,
+        // ⛔ The four CORNER endcaps are the ones the placer ignores. Every other `ENDCAP *` —
+        // `PRE`, `POST`, and all the LEF58 edges and corners — is placeable.
+        //
+        // ⚠️ **`ENDCAP TOPLEFT` and `ENDCAP LEFTTOPEDGE` are different types with opposite
+        // answers**, so this cannot be a prefix or substring test on "TOPLEFT": the four corners
+        // are matched exactly and everything else beginning `ENDCAP` falls through to true.
         "ENDCAP_TOPLEFT" | "ENDCAP_TOPRIGHT" | "ENDCAP_BOTTOMLEFT" | "ENDCAP_BOTTOMRIGHT" => false,
-        t if t.starts_with("ENDCAP_LEF58_") => true,
+        t if t == "ENDCAP" || t.starts_with("ENDCAP_") => true,
         _ => false,
     }
 }
@@ -164,7 +169,8 @@ pub fn status_is_fixed(placement_status: &str) -> bool {
 /// NETWORK node fixed. The macro is negotiated and its answer is then discarded. ⟹ A cell being
 /// in the sweep and a cell being written back are two different questions.
 pub fn is_std_cell(master_type: &str) -> bool {
-    master_type.starts_with("CORE") || master_type.starts_with("ENDCAP")
+    let t = crate::drc::canonical_master_type(master_type);
+    t.starts_with("CORE") || t.starts_with("ENDCAP")
 }
 
 /// A cell's width in SITES — `initFromDb`'s sizing.
@@ -460,14 +466,28 @@ pub struct NegPixel {
 }
 
 impl NegPixel {
-    /// Sites claimed beyond the one the square can serve.
+    /// Sites claimed beyond what the square can serve — `max(usage - CAPACITY, 0)`.
     ///
-    /// ⚠️ **One cell per square is not overuse** — `max(0, usage - 1)`, not `usage > 0`. A fixed
-    /// cell's square carries `usage = 1` (and `capacity = 0`), and a legally placed movable cell
-    /// carries 1 too; treating any usage as overuse would report a legal design as fully
-    /// congested and the negotiation would never terminate.
+    /// ⚠️ **One cell per square is not overuse**, because an ordinary site has `capacity = 1`.
+    /// Treating any usage as overuse would report a legal design as fully congested and the
+    /// negotiation would never terminate.
+    ///
+    /// ⛔ **`capacity`, not the constant 1, and the two differ on every capacity-0 square.** A
+    /// fixed cell's footprint carries `capacity = 0` with `usage = 1`, so it reads as overused by
+    /// ONE all on its own, and a movable cell landing on it reads TWO rather than one. That is
+    /// upstream's arithmetic and it changes the SWEEP ORDER: `sortByNegotiationOrder` ranks by
+    /// overuse first, so a cell overlapping a fixed cell is negotiated earlier than one merely
+    /// overlapping a movable one.
+    ///
+    /// ⚠️ Measured on `gcd`, which has 255 FIXED components: `_388_` sorted seventh upstream and
+    /// ninth here, and every other cell in the first twelve agreed. A design with no fixed cells
+    /// cannot show the difference at all.
+    ///
+    /// 🔑 It stays invisible in the violation counts because nothing ever scans a FIXED cell's
+    /// footprint — the counting loop, the history update and the sort all walk ACTIVE cells — so
+    /// a capacity-0 square is only ever read through a movable cell sitting on one.
     pub fn overuse(&self) -> i32 {
-        (self.usage - 1).max(0)
+        (self.usage - self.capacity).max(0)
     }
 }
 
@@ -1196,6 +1216,37 @@ mod tests {
     }
 
     #[test]
+    fn the_filter_matches_the_strings_odb_actually_returns() {
+        // ⛔ **`dbMasterType::getString` is the LEF spelling, with SPACES.** The C++ `switch`
+        // reads `CORE_WELLTAP`; the binding hands us `"CORE WELLTAP"`. A matcher written from the
+        // enum compiles, reads as a faithful transcription, and matches nothing.
+        //
+        // ⚠️ Measured on `gcd`: 255 `CORE WELLTAP` tap cells fell out of the model entirely —
+        // no cell, no blockade, no capacity — and fixing the spelling took aes from 319
+        // differing components to 53, gcd from 52 to 15 and ibex from 681 to 53.
+        assert!(is_core_auto_placeable("CORE WELLTAP"), "the spelling odb actually returns");
+        assert!(is_core_auto_placeable("CORE_WELLTAP"), "and the enum's, which costs nothing");
+        assert_eq!(crate::drc::classify("CORE WELLTAP"), crate::drc::Class::Wt);
+        assert_eq!(crate::drc::classify("BLOCK BLACKBOX"), crate::drc::Class::Bl);
+        assert_eq!(crate::drc::classify("CORE SPACER"), crate::drc::Class::Sp);
+        assert!(is_std_cell("CORE WELLTAP") && !is_std_cell("BLOCK SOFT"));
+
+        // 🔑 The LEF58 endcaps LOSE their prefix on the way out: `ENDCAP_LEF58_TOPEDGE` arrives
+        // as `"ENDCAP TOPEDGE"`, so any test for `LEF58` in the name is dead code.
+        assert!(is_core_auto_placeable("ENDCAP TOPEDGE"));
+        assert!(is_core_auto_placeable("ENDCAP LEFTBOTTOMCORNER"));
+
+        // ⛔ **The trap this test exists for**: two near-anagrams with OPPOSITE answers. A corner
+        // endcap is ignored by the placer; a LEF58 left-top EDGE is placed. So the rule cannot be
+        // a substring test — the four corners are matched exactly, the rest fall through.
+        assert!(!is_core_auto_placeable("ENDCAP TOPLEFT"), "a corner endcap is ignored");
+        assert!(is_core_auto_placeable("ENDCAP LEFTTOPEDGE"), "a LEF58 edge is not");
+        for t in ["COVER BUMP", "PAD INPUT", "PAD AREAIO", "RING"] {
+            assert!(!is_core_auto_placeable(t), "{t} is outside the model");
+        }
+    }
+
+    #[test]
     fn the_model_filter_is_the_master_class_and_never_the_fixed_flag() {
         // ⛔ `dbMaster::isCoreAutoPlaceable`, arm for arm. BLOCK is PLACEABLE — a macro is
         // excluded by being FIXED, never by its class — and this is the trap the corpus punishes:
@@ -1274,11 +1325,32 @@ mod tests {
 
     #[test]
     fn a_fixed_site_is_used_but_not_overused() {
-        // ⛔ The distinction the whole cost function rests on.
-        assert_eq!(NegPixel { usage: 0, ..Default::default() }.overuse(), 0);
-        assert_eq!(NegPixel { usage: 1, ..Default::default() }.overuse(), 0);
-        assert_eq!(NegPixel { usage: 2, ..Default::default() }.overuse(), 1);
-        assert_eq!(NegPixel { usage: 5, ..Default::default() }.overuse(), 4);
+        // ⛔ The distinction the whole cost function rests on: an ordinary site serves ONE cell.
+        let px = |usage| NegPixel { usage, capacity: 1, ..Default::default() };
+        assert_eq!(px(0).overuse(), 0);
+        assert_eq!(px(1).overuse(), 0);
+        assert_eq!(px(2).overuse(), 1);
+        assert_eq!(px(5).overuse(), 4);
+    }
+
+    #[test]
+    fn a_capacity_zero_square_is_overused_by_whatever_sits_on_it() {
+        // ⛔ `max(usage - CAPACITY, 0)`, not `max(usage - 1, 0)`. A fixed cell's footprint is
+        // `capacity = 0, usage = 1`, so it reads as overused by one on its own, and a movable
+        // cell landing there reads TWO — one more than the same overlap on an ordinary site.
+        //
+        // ⚠️ That extra one is a SORT KEY, and it reorders the sweep: measured on `gcd`, whose
+        // 255 fixed components put `_388_` seventh upstream and ninth here.
+        let blocked = |usage| NegPixel { usage, capacity: 0, ..Default::default() };
+        assert_eq!(blocked(0).overuse(), 0, "an empty blockage is not overused");
+        assert_eq!(blocked(1).overuse(), 1, "a fixed cell overuses its own square");
+        assert_eq!(blocked(2).overuse(), 2, "and a movable cell on top makes it two, not one");
+        // 🔑 The two definitions agree everywhere capacity is 1, which is why an ordinary design
+        // cannot tell them apart.
+        for u in 0..6 {
+            assert_eq!(NegPixel { usage: u, capacity: 1, ..Default::default() }.overuse(),
+                       (u - 1).max(0));
+        }
     }
 
     #[test]
@@ -2610,7 +2682,11 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         let mtype = db.master_get_type(&master).unwrap_or_default();
         let status = db.inst_get_placement_status(&name);
         // ⛔ `initFromDb`'s two-test filter, in its order: status NONE, then the master class.
+        //
+        // ⛔ **Every exclusion is COUNTED and reported.** A filter that drops instances silently
+        // is indistinguishable from a design that has none of them — see [`Legalized::filtered_out`].
         if !enters_model(&status, is_core_auto_placeable(&mtype)) {
+            *out.filtered_out.entry(format!("{mtype}/{status}")).or_default() += 1;
             continue;
         }
         // ⛔ From the STATUS alone. Reading it off the master type made every macro an obstacle,
@@ -2631,7 +2707,30 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             // blockade that is one row too tall does not look like an off-by-one in the output;
             // it looks like a legalizer that will not move cells vertically.
             let (x0, y0, x1, y1) = grid.covering(x - core.0, y - core.1, w, h);
-            ngrid.blockade(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32);
+            // ⛔ **A fixed cell has the SAME two footprints a movable one does, and the blockade
+            // takes the NEGOTIATION one.** `buildGrid` walks `cells_` and blockades
+            // `cell.x, cell.y, cell.width, cell.height` — the very fields `initFromDb` set for
+            // every cell alike: `gridX` and **`gridRoundY`** for the origin, `round(w/site)` for
+            // the width, `gridHeight(master)` for the height. `covering` answers a different
+            // question — snap-DOWN row, `divCeil` width — and that one belongs to the occupancy
+            // stamp below, which upstream reaches through `paintPixel(node)`.
+            //
+            // ⚠️ The rows differ whenever a fixed cell is not row-aligned, which in `gcd` is most
+            // of the 255 of them: `gridRoundY` puts a cell past its row's midpoint one row HIGHER
+            // than `gridSnapDownY` does, so the whole blockade lands on the wrong row.
+            let (fw, fh) = (
+                cell_width_in_sites(w as i64, sw as i64),
+                grid.grid_height(h, db.row_pattern(&db.master_get_site(&master))
+                                        .map_or(0, |p| p.len())),
+            );
+            let (fx, fy) = init_position(
+                x as i64, y as i64, core.0 as i64, core.1 as i64, sw as i64,
+                &grid.row_y, fw, fh, gw, gh,
+            );
+            ngrid.blockade(fx, fy, fw, fh);
+            // ⚠️ The occupancy stamp keeps `covering`'s footprint: `paintPixel(node)` is
+            // `gridX(cell)`, `gridSnapDownY(cell)` and `gridWidth`, read off the node's own DBU
+            // position, which for a fixed cell is where the DEF put it.
             fixed_boxes.push((x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32));
             fixed_types.push(mtype.clone());
             continue;
@@ -2667,9 +2766,9 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             },
         )
         .unwrap_or((gx, gy));
-        // ⛔ Seeded where the cell IS. `init_x/init_y` are the same point and never move again —
-        // `targetCost` measures displacement from them for the whole run.
-        ngrid.add_usage(gx, gy, cw, ch, 1);
+        // ⛔ Seeded where the cell IS — but NOT yet: see the usage pass below. `init_x/init_y`
+        // are this point and never move again; `targetCost` measures displacement from them for
+        // the whole run.
         cells.push(SweepCell {
             name: name.clone(), x: gx, y: gy, init_x: gx, init_y: gy,
             width: cw, height: ch,
@@ -2684,6 +2783,24 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             db.master_get_symmetry_y(&master),
             db.master_get_symmetry_r90(&master),
         ));
+    }
+
+    // ⛔ **Seed movable usage only after EVERY fixed cell has been blockaded**, because
+    // `buildGrid` ASSIGNS `usage = 1` over a fixed footprint rather than incrementing it. A
+    // single loop that interleaves the two in DEF order wipes the usage of any movable cell that
+    // happened to be read before a fixed cell overlapping it.
+    //
+    // 🔑 **This is upstream's call sequence, and the sequence is the behaviour.** `legalize` runs
+    // `buildGrid()` — which blockades every fixed cell — to completion, and only then loops
+    // `addUsage(i, 1)` over the movable ones. Reading the two functions and not their order gives
+    // exactly this bug: both halves correct, applied in the wrong sequence.
+    //
+    // ⚠️ Measured on `gcd`, whose DEF interleaves 255 FIXED components with the movable ones:
+    // `_388_` scored an overuse of 17 where upstream scores at least 19, which put it ninth in
+    // the sweep instead of seventh. Usage feeds the sort key, the cost, the violation count and
+    // the history — the wrong seed is wrong for all four.
+    for c in &cells {
+        ngrid.add_usage(c.x, c.y, c.width, c.height, 1);
     }
 
     // Indices past the movable cells, so `pixel->cell` names exactly one occupant either way.

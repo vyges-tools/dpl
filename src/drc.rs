@@ -35,17 +35,33 @@ pub enum Class {
     Ignored,
 }
 
+/// A master type in one spelling, whatever spelling it arrived in.
+///
+/// ⛔ **`dbMasterType::getString` returns the LEF spelling, with SPACES** — `"CORE WELLTAP"`,
+/// `"BLOCK BLACKBOX"`, `"ENDCAP TOPEDGE"` — not the C++ enum name. A matcher written from the
+/// enum (`CORE_WELLTAP`) reads the source correctly and then matches nothing at all.
+///
+/// ⚠️ **Measured on `gcd`, which is 255 `CORE WELLTAP` tap cells**: they matched no arm of the
+/// model filter, so every one was dropped from the model — no cell, no blockade, no occupancy.
+/// The design simply had no fixed cells as far as this engine was concerned, and nothing said so.
+///
+/// 🔑 **And the LEF58 endcaps lose their prefix**: `ENDCAP_LEF58_TOPEDGE` stringifies as
+/// `"ENDCAP TOPEDGE"`, so a test for `LEF58` in the name never fires on real data either.
+pub fn canonical_master_type(master_type: &str) -> String {
+    master_type.trim().replace(' ', "_").to_ascii_uppercase()
+}
+
 /// Classify a master type string as the placer does.
 ///
 /// ⚠️ Upstream uses a `switch` over the enum *"so if new types are added we get a compiler
 /// warning"*. Matching on strings here cannot get that warning, so an unknown type maps to
 /// [`Class::Ignored`] — the same answer upstream's fall-through gives.
 pub fn classify(master_type: &str) -> Class {
-    match master_type {
+    match canonical_master_type(master_type).as_str() {
         "CORE" | "CORE_FEEDTHRU" | "CORE_TIEHIGH" | "CORE_TIELOW" | "CORE_ANTENNACELL" => Class::Cr,
         "CORE_WELLTAP" => Class::Wt,
         "BLOCK" | "BLOCK_BLACKBOX" | "BLOCK_SOFT" => Class::Bl,
-        t if t == "CORE_SPACER" || t.starts_with("ENDCAP") => Class::Sp,
+        t if t == "CORE_SPACER" || t == "ENDCAP" || t.starts_with("ENDCAP_") => Class::Sp,
         _ => Class::Ignored,
     }
 }

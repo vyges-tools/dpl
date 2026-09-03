@@ -171,12 +171,21 @@ fn legalize(args: &[String]) -> ExitCode {
         "legalizer": if diamond { "diamond" } else { "negotiation" },
         "cells": res.placed.len(), "moved": moved,
         "failures": res.failures, "not_done": res.not_done,
+        // ⛔ **What the MODEL FILTER dropped, named and counted.** An instance excluded here has
+        // no cell, no blockade and no capacity, so every number above is computed as though the
+        // design did not contain it. Measured on `gcd`: 255 tap cells silently left the model
+        // because their master type arrives spelled `CORE WELLTAP`, not `CORE_WELLTAP`.
+        "filtered_out": res.filtered_out,
         // ⚠️ The DECISION, not just the count. A placer whose output cannot be inspected cannot
         // be debugged — the first bug here was invisible in a summary that said "1 moved".
         "placed": res.placed,
     })).expect("valid JSON"));
     eprintln!("detailed-placement: {} cell(s), {moved} moved, {} failed, status {status}",
               res.placed.len(), res.failures.len());
+    if !res.filtered_out.is_empty() {
+        let n: usize = res.filtered_out.values().sum();
+        eprintln!("detailed-placement: {n} instance(s) outside the model: {:?}", res.filtered_out);
+    }
     match status { "legalized" => ExitCode::SUCCESS, "vacuous" => ExitCode::from(3),
                    _ => ExitCode::from(1) }
 }

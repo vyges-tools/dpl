@@ -257,6 +257,23 @@ pub struct Legalized {
     pub placed: Vec<Placed>,
     pub failures: Vec<String>,
     pub not_done: Vec<String>,
+    /// Instances the MODEL FILTER excluded, counted by `"<master type>/<placement status>"`.
+    ///
+    /// ⛔ **Reported on every run, because a filter that drops instances silently is
+    /// indistinguishable from a design that has none.** `dbMaster::isCoreAutoPlaceable` and the
+    /// placement status decide what enters the model at all; anything they reject has no cell, no
+    /// blockade, no occupancy and no capacity, and every number the engine goes on to report is
+    /// computed as though it were not there.
+    ///
+    /// ⚠️ **Measured on `gcd`**: its 255 `CORE WELLTAP` tap cells matched no arm of the filter —
+    /// the master types arrive from odb in LEF spelling, `"CORE WELLTAP"`, where the C++ enum
+    /// reads `CORE_WELLTAP` — so the engine saw a design with no fixed cells whatsoever. Three
+    /// correct fixes in a row failed to move the case before this line was printed; it named the
+    /// cause immediately.
+    ///
+    /// 🔑 This is the [`vacuous`] guard for the model itself: a pass must never come from a run
+    /// that quietly legalized a smaller design than it was given.
+    pub filtered_out: std::collections::BTreeMap<String, usize>,
 }
 
 /// Families of behaviour this legalizer does NOT implement.
