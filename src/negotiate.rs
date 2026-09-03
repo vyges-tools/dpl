@@ -1771,7 +1771,9 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         // bottom-left corner. Measured on `fragmented_row04`: the cell reported `init_grid
         // [0, 0]` for an instance the DEF places at (8360, 5600), and landed at site 0.
         let cw = cell_width_in_sites(w as i64, sw as i64);
-        let ch = grid.rows_spanned(y - core.1, h).max(1) as i32;
+        // ⛔ From the MASTER, not from where the cell sits. See `Grid::grid_height`.
+        let ch = grid.grid_height(h, db.row_pattern(&db.master_get_site(&master))
+                                          .map_or(0, |p| p.len()));
         let (gx, gy) = init_position(
             x as i64, y as i64, core.0 as i64, core.1 as i64, sw as i64,
             &grid.row_y, cw, ch, gw, gh,
@@ -1947,7 +1949,22 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     // 6. Sync back.
     for (i, c) in cells.iter().enumerate() {
         if !site_ok(i, c.x, c.y) {
-            out.failures.push(c.name.clone());
+            // ⛔ **Say WHICH test refused it.** A failure list of bare names cannot be debugged:
+            // geometry, the site name and the power rails are three different bugs and they all
+            // read as "failed" without this.
+            let (cw, ch) = (c.width, c.height);
+            let why = if c.x < 0 || c.y < 0 || c.y >= gh || c.x + cw > gw {
+                format!("off the grid at ({}, {}), grid is {gw}x{gh}", c.x, c.y)
+            } else if !(0..ch).any(|dy| (0..cw).any(|dx| {
+                grid.site_valid_at((c.x + dx) as i64, (c.y + dy) as i64, &sites[i])
+            })) {
+                format!("no square at ({}, {}) offers site `{}`", c.x, c.y, sites[i])
+            } else if ch > 1 && !power.compatible(&masters[i], c.y, ch) {
+                format!("power rails do not match row {} for a {ch}-row cell", c.y)
+            } else {
+                format!("part of the {cw}x{ch} footprint at ({}, {}) is off-site", c.x, c.y)
+            };
+            out.failures.push(format!("{}: {why}", c.name));
             continue;
         }
         let nx = c.x * sw;
@@ -2030,7 +2047,9 @@ impl PowerModel {
                 continue;
             }
             let h = db.master_get_height(&m) as i32;
-            if grid.rows_spanned(0, h) > 1 {
+            if grid.grid_height(h, db.row_pattern(&db.master_get_site(&m)).map_or(0, |p| p.len()))
+                > 1
+            {
                 continue; // multi-height masters are skipped
             }
             candidates.push(rails_of(db, &m));

@@ -441,6 +441,43 @@ impl Grid {
         true
     }
 
+    /// `Grid::gridHeight(master)` — a cell's height in ROWS, from the MASTER alone.
+    ///
+    /// ⛔ **Not a function of where the cell currently sits**, and that distinction is the whole
+    /// point. `rows_spanned` measures the band a cell actually covers, so a cell resting 10 DBU
+    /// above its row straddles two of them; this asks how tall the master IS.
+    ///
+    /// ⚠️ Measured on `simple02`, whose single cell is deliberately placed at y = 2810 in a
+    /// design with a 2800 row pitch: `rows_spanned` called it a 2-row cell, and every rule that
+    /// treats multi-row cells specially — power-rail alignment first — then refused it.
+    ///
+    /// Upstream's three cases, transcribed:
+    ///
+    /// | | |
+    /// | --- | --- |
+    /// | uniform row height | `max(1, ceil(master_height / row_height))` |
+    /// | non-uniform, site has no ROWPATTERN | **1** |
+    /// | non-uniform, site has a ROWPATTERN | the pattern's LENGTH — not a division |
+    pub fn grid_height(&self, master_height: i32, row_pattern_len: usize) -> i32 {
+        match self.uniform_row_height() {
+            Some(rh) if rh > 0 => 1.max((master_height + rh - 1) / rh),
+            // ⚠️ Hybrid rows: the pattern length IS the answer. Dividing by some row height would
+            // give a different number whenever the pattern mixes row heights, which is the only
+            // situation a pattern exists for.
+            _ if row_pattern_len > 0 => row_pattern_len as i32,
+            _ => 1,
+        }
+    }
+
+    /// The row height, if every row in the grid has the same one.
+    ///
+    /// ⚠️ `None` for a hybrid-row design, which is what selects the ROWPATTERN branch above.
+    pub fn uniform_row_height(&self) -> Option<i32> {
+        let mut heights = self.row_y.windows(2).map(|w| w[1] - w[0]);
+        let first = heights.next()?;
+        if heights.all(|h| h == first) { Some(first) } else { None }
+    }
+
     /// How many grid rows a cell of height `h` starting at core-relative `y` spans.
     ///
     /// 🔑 Not `h / row_height`: grid rows are the distinct Y boundaries, so a hybrid design has
@@ -532,5 +569,57 @@ mod padding_paint_tests {
         g.paint_cell_padding(0, 0, 1, 10, 3, 5, 9);
         assert_eq!(g.pixel(0, 0).unwrap().padding_reserved_by, None, "the body");
         assert!((1..4).all(|x| g.pixel(x, 0).unwrap().padding_reserved_by == Some(9)));
+    }
+}
+
+#[cfg(test)]
+mod grid_height_tests {
+    fn uniform(pitch: i32, rows: usize) -> super::Grid {
+        super::Grid {
+            core: (0, 0, 100, pitch * rows as i32),
+            site_width: 10, row_count: rows, row_site_count: 10,
+            pixels: vec![vec![super::Pixel::default(); 10]; rows],
+            row_sites: vec![vec![(0, 10, "S".to_string())]; rows],
+            row_y: (0..=rows).map(|i| i as i32 * pitch).collect(),
+            row_orient: vec!["R0".to_string(); rows],
+            blocked_layers_populated: false,
+        }
+    }
+
+    #[test]
+    fn a_single_height_master_is_one_row_however_the_cell_sits() {
+        // ⛔ The `simple02` regression: the cell is at y = 10 in a 2800-pitch design, so
+        // `rows_spanned` says 2 and `grid_height` says 1. The master is what decides.
+        let g = uniform(2800, 4);
+        assert_eq!(g.grid_height(2800, 0), 1);
+        assert_eq!(g.rows_spanned(10, 2800), 2, "the OTHER question, and its answer differs");
+    }
+
+    #[test]
+    fn a_taller_master_rounds_up() {
+        let g = uniform(2800, 6);
+        assert_eq!(g.grid_height(5600, 0), 2);
+        assert_eq!(g.grid_height(8400, 0), 3);
+        // ⚠️ CEIL, not round: a master a hair over two rows needs three.
+        assert_eq!(g.grid_height(5601, 0), 3);
+        assert_eq!(g.grid_height(1, 0), 1, "and never zero");
+    }
+
+    #[test]
+    fn hybrid_rows_use_the_pattern_length_not_a_division() {
+        // Rows of 2800 then 1400, alternating — no uniform height.
+        let mut g = uniform(2800, 4);
+        g.row_y = vec![0, 2800, 4200, 7000, 8400];
+        assert_eq!(g.uniform_row_height(), None);
+        // ⛔ The pattern's length IS the answer; the master height is not consulted at all.
+        assert_eq!(g.grid_height(999999, 3), 3);
+        assert_eq!(g.grid_height(2800, 0), 1, "no pattern on a hybrid design means one row");
+    }
+
+    #[test]
+    fn a_uniform_design_ignores_the_row_pattern() {
+        // ⚠️ Order matters: uniform is tested FIRST, so a pattern on a uniform design is unused.
+        let g = uniform(2800, 4);
+        assert_eq!(g.grid_height(2800, 3), 1);
     }
 }
