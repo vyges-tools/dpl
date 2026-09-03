@@ -374,19 +374,27 @@ impl Grid {
 
     /// `Grid::paintCellPadding` — reserve the sites a cell's padding claims either side of it.
     ///
-    /// ⛔ **The padded span only; the cell's own body is painted by [`Grid::paint_cell`].**
-    /// Upstream keeps them in different fields because `checkPadding` consults both and a cell
-    /// must not be blocked by its own reservation.
+    /// ⛔ **The TWO PAD SPANS ONLY — `[x - left_pad, x)` and `[x_end, x_end + right_pad)`. The
+    /// cell's own body is NOT painted here**; that is [`Grid::paint_cell`]'s `cell` field.
+    /// Upstream keeps them apart because `checkPadding` consults both and a cell must not be
+    /// blocked by its own reservation.
+    ///
+    /// ⚠️ Painting the body too is invisible while padding is zero — the body square already
+    /// carries the same cell in `pixel.cell`, so the class-pair verdict is unchanged — and wrong
+    /// the moment a design sets padding. Transcribed from `Grid.cpp`'s two separate loops.
+    ///
+    /// ⚠️ **LAST writer wins**, unlike `paint_cell`: upstream assigns unconditionally here, so a
+    /// square claimed by two cells' padding names the later one.
     pub fn paint_cell_padding(&mut self, x: i64, y: i64, cells_wide: i64, h: i32,
                               left_pad: i64, right_pad: i64, occupant: u32) {
-        let y_end = self.grid_end_y(y, h);
-        for gy in y.max(0)..y_end.min(self.row_count as i64) {
-            for gx in (x - left_pad).max(0)..(x + cells_wide + right_pad)
-                                            .min(self.row_site_count as i64)
-            {
-                let p = &mut self.pixels[gy as usize][gx as usize];
-                if p.padding_reserved_by.is_none() {
-                    p.padding_reserved_by = Some(occupant);
+        let y_end = self.grid_end_y(y, h).min(self.row_count as i64);
+        let x_end = x + cells_wide;
+        let spans = [((x - left_pad).max(0), x.min(self.row_site_count as i64)),
+                     (x_end.max(0), (x_end + right_pad).min(self.row_site_count as i64))];
+        for (lo, hi) in spans {
+            for gy in y.max(0)..y_end {
+                for gx in lo..hi {
+                    self.pixels[gy as usize][gx as usize].padding_reserved_by = Some(occupant);
                 }
             }
         }
@@ -457,5 +465,72 @@ impl Grid {
     /// How many squares are usable — the number a legal placement has to fit into.
     pub fn valid_sites(&self) -> usize {
         self.pixels.iter().flatten().filter(|p| p.is_valid).count()
+    }
+}
+
+#[cfg(test)]
+mod padding_paint_tests {
+    /// A bare grid with `w` sites in one row, every square valid.
+    fn grid(w: usize) -> super::Grid {
+        super::Grid {
+            core: (0, 0, w as i32 * 10, 10),
+            site_width: 10,
+            row_count: 1,
+            row_site_count: w,
+            pixels: vec![vec![super::Pixel { is_valid: true, ..Default::default() }; w]],
+            row_sites: vec![vec![(0, w, "S".to_string())]],
+            row_y: vec![0, 10],
+            row_orient: vec!["R0".to_string()],
+            blocked_layers_populated: false,
+        }
+    }
+
+    #[test]
+    fn the_body_is_not_reserved_by_its_own_padding() {
+        // ⛔ `paintCellPadding` paints the two PAD spans, never the body. A cell blocked by its
+        // own reservation is the failure this separation exists to prevent.
+        let mut g = grid(10);
+        g.paint_cell_padding(4, 0, 2, 10, 1, 1, 7);
+        assert_eq!(g.pixel(3, 0).unwrap().padding_reserved_by, Some(7), "left pad");
+        assert_eq!(g.pixel(4, 0).unwrap().padding_reserved_by, None, "the body is NOT reserved");
+        assert_eq!(g.pixel(5, 0).unwrap().padding_reserved_by, None, "the body is NOT reserved");
+        assert_eq!(g.pixel(6, 0).unwrap().padding_reserved_by, Some(7), "right pad");
+        assert_eq!(g.pixel(7, 0).unwrap().padding_reserved_by, None, "past the pad");
+    }
+
+    #[test]
+    fn zero_padding_reserves_nothing_at_all() {
+        // ⚠️ The case that hid the bug: at zero padding the body square already carries the cell
+        // in `pixel.cell`, so painting it here changed no verdict and no test noticed.
+        let mut g = grid(6);
+        g.paint_cell_padding(2, 0, 2, 10, 0, 0, 1);
+        assert!((0..6).all(|x| g.pixel(x, 0).unwrap().padding_reserved_by.is_none()),
+                "zero padding claims no square");
+    }
+
+    #[test]
+    fn the_later_cells_padding_wins_the_square() {
+        // ⚠️ Upstream assigns unconditionally — LAST writer, unlike `paint_cell`'s first.
+        let mut g = grid(8);
+        g.paint_cell_padding(4, 0, 1, 10, 1, 0, 1);
+        g.paint_cell_padding(2, 0, 1, 10, 0, 1, 2);
+        assert_eq!(g.pixel(3, 0).unwrap().padding_reserved_by, Some(2));
+    }
+
+    #[test]
+    fn the_first_cell_keeps_the_square_it_occupies() {
+        // ⛔ The opposite rule for the BODY, and the contrast is the point.
+        let mut g = grid(8);
+        g.paint_cell(20, 0, 20, 10, Some(1));
+        g.paint_cell(20, 0, 20, 10, Some(2));
+        assert_eq!(g.pixel(2, 0).unwrap().cell, Some(1), "first writer keeps `cell`");
+    }
+
+    #[test]
+    fn a_pad_reaching_past_the_core_edge_is_clipped_not_wrapped() {
+        let mut g = grid(4);
+        g.paint_cell_padding(0, 0, 1, 10, 3, 5, 9);
+        assert_eq!(g.pixel(0, 0).unwrap().padding_reserved_by, None, "the body");
+        assert!((1..4).all(|x| g.pixel(x, 0).unwrap().padding_reserved_by == Some(9)));
     }
 }
