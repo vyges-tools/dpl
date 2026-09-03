@@ -1379,6 +1379,76 @@ mod tests {
         assert!(a < b, "an init-window candidate wins however deep in its own scan it was");
     }
 
+    fn sweep_cell(name: &str, x: i32, w: i32) -> SweepCell {
+        SweepCell { name: name.into(), x, y: 0, init_x: x, init_y: 0,
+                    width: w, height: 1, fixed: false }
+    }
+
+    /// A one-row grid of `width` sites, all valid.
+    fn sweep_ctx(grid: &mut NegGrid) -> SweepCtx<'_> {
+        SweepCtx {
+            grid,
+            window: &|_c, x, y| (-4, 4, vec![y; 1].into_iter().map(|_| y).collect()),
+            placeable: &|c, x, _y| x >= 0 && x + c.width <= 8,
+            drc_violations: &|_, _, _| 0,
+            max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
+            max_disp_threshold: consts::MAX_DISP_THRESHOLD,
+            drc_penalty: consts::DRC_PENALTY,
+        }
+    }
+
+    #[test]
+    fn a_sweep_separates_two_overlapping_cells() {
+        // 🔑 The end-to-end property the whole engine exists for: two cells on the same site,
+        // one sweep, no overlap left.
+        let mut grid = NegGrid::build(8, 1, &|_, _| true);
+        let mut cells = vec![sweep_cell("a", 2, 2), sweep_cell("b", 2, 2)];
+        for c in &cells {
+            grid.add_usage(c.x, c.y, c.width, c.height, 1);
+        }
+        assert!(grid.total_overuse() > 0, "the fixture must start overlapping");
+
+        let mut ctx = sweep_ctx(&mut grid);
+        let overuse = negotiation_iter(&mut cells, &[0, 1], 0, &mut ctx);
+        assert_eq!(overuse, 0, "one sweep resolved it: {:?}",
+                   cells.iter().map(|c| (c.name.clone(), c.x)).collect::<Vec<_>>());
+        assert_ne!(cells[0].x, cells[1].x, "the two cells no longer share a site");
+    }
+
+    #[test]
+    fn a_cell_can_stay_where_it_is() {
+        // ⛔ Ripping up before searching must not stop a cell choosing its own square back.
+        let mut grid = NegGrid::build(8, 1, &|_, _| true);
+        let mut cells = vec![sweep_cell("solo", 3, 2)];
+        grid.add_usage(3, 0, 2, 1, 1);
+        let mut ctx = sweep_ctx(&mut grid);
+        negotiation_iter(&mut cells, &[0], 0, &mut ctx);
+        assert_eq!(cells[0].x, 3, "an uncontested cell stays at its init position");
+        assert_eq!(grid.total_overuse(), 0);
+    }
+
+    #[test]
+    fn a_fixed_cell_is_never_moved() {
+        let mut grid = NegGrid::build(8, 1, &|_, _| true);
+        let mut cells = vec![SweepCell { fixed: true, ..sweep_cell("fix", 2, 2) }];
+        grid.blockade(2, 0, 2, 1);
+        let mut ctx = sweep_ctx(&mut grid);
+        negotiation_iter(&mut cells, &[0], 0, &mut ctx);
+        assert_eq!(cells[0].x, 2);
+    }
+
+    #[test]
+    fn from_the_isolation_point_a_legal_cell_is_left_alone() {
+        // ⚠️ iter 0 sweeps everything; iter >= 1 skips cells that are already legal.
+        let mut grid = NegGrid::build(8, 1, &|_, _| true);
+        let mut cells = vec![sweep_cell("a", 3, 2)];
+        grid.add_usage(3, 0, 2, 1, 1);
+        let mut ctx = sweep_ctx(&mut grid);
+        negotiation_iter(&mut cells, &[0], consts::ISOLATION_PT, &mut ctx);
+        assert_eq!(cells[0].x, 3, "untouched, and its usage was never ripped up");
+        assert_eq!(grid.at(3, 0).usage, 1, "usage is intact — the skip happened before rip-up");
+    }
+
     #[test]
     fn the_order_does_not_depend_on_the_input_order() {
         let mk = || vec![k(0, 2, 2, 3), k(4, 1, 1, 1), k(4, 2, 1, 7), k(0, 2, 2, 0)];
@@ -1388,4 +1458,154 @@ mod tests {
         sort_by_negotiation_order(&mut b);
         assert_eq!(a, b, "the sweep order must not depend on how the active set was built");
     }
+}
+
+// ── the assembled sweep ──────────────────────────────────────────────────────────────────────
+
+/// A cell as the sweep sees it. Grid units throughout.
+#[derive(Debug, Clone)]
+pub struct SweepCell {
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub init_x: i32,
+    pub init_y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub fixed: bool,
+}
+
+/// What one `negotiationIter` sweep needs from its surroundings.
+pub struct SweepCtx<'a> {
+    pub grid: &'a mut NegGrid,
+    /// `(dx_lo, dx_hi, rows)` for a cell anchored at `(x, y)`.
+    pub window: &'a dyn Fn(&SweepCell, i32, i32) -> (i32, i32, Vec<i32>),
+    /// Can this cell's footprint legally sit here, ignoring congestion?
+    pub placeable: &'a dyn Fn(&SweepCell, i32, i32) -> bool,
+    /// How many of `PlacementDRC`'s four checks a position fails.
+    pub drc_violations: &'a dyn Fn(&SweepCell, i32, i32) -> i32,
+    pub max_disp_multiplier: f64,
+    pub max_disp_threshold: i64,
+    pub drc_penalty: f64,
+}
+
+/// `negotiationIter` — one rip-up / re-place sweep over the active cells.
+///
+/// ⛔ **The order is upstream's and each step matters:**
+///
+/// 1. `sortByNegotiationOrder` — most-overused first;
+/// 2. skip fixed cells; **from `ISOLATION_PT` on, skip cells that are already legal**;
+/// 3. `ripUp` — remove the cell's usage BEFORE searching, or it blocks itself;
+/// 4. `findBestLocation` — wavefronts, cost, `ScanRank` tie-break;
+/// 5. `place` — restore usage at the chosen position.
+///
+/// Returns the grid's total overuse afterwards.
+pub fn negotiation_iter(cells: &mut [SweepCell], active: &[usize], iter: i32, ctx: &mut SweepCtx)
+    -> i32
+{
+    // 1. Order the sweep.
+    let mut keys: Vec<SortKey> = active
+        .iter()
+        .map(|&i| {
+            let c = &cells[i];
+            let mut ov = 0;
+            for dy in 0..c.height {
+                for dx in 0..c.width {
+                    if let (Ok(gx), Ok(gy)) = (usize::try_from(c.x + dx), usize::try_from(c.y + dy))
+                    {
+                        if gx < ctx.grid.width && gy < ctx.grid.height {
+                            ov += ctx.grid.at(gx, gy).overuse();
+                        }
+                    }
+                }
+            }
+            SortKey { overuse: ov, height: c.height, width: c.width, idx: i }
+        })
+        .collect();
+    sort_by_negotiation_order(&mut keys);
+
+    let drc_penalty = ctx.drc_penalty * (1.0 + iter as f64);
+
+    for key in &keys {
+        let i = key.idx;
+        if cells[i].fixed {
+            continue;
+        }
+        // 2. ⚠️ The isolation point — from the SECOND iteration a legal cell is left alone.
+        if iter >= consts::ISOLATION_PT && cell_is_legal(&cells[i], ctx) {
+            continue;
+        }
+        // 3. ⛔ Rip up FIRST. A cell still counted in `usage` competes with itself for its own
+        //    square and the search will refuse to stay put.
+        let c = cells[i].clone();
+        ctx.grid.add_usage(c.x, c.y, c.width, c.height, -1);
+
+        // 4. Enumerate and score.
+        let (ilo, ihi, irows) = (ctx.window)(&c, c.init_x, c.init_y);
+        let (clo, chi, crows) = if (c.x, c.y) != (c.init_x, c.init_y) {
+            (ctx.window)(&c, c.x, c.y)
+        } else {
+            (0, 0, Vec::new())
+        };
+        let congestion_floor = c.width as f64 * c.height as f64;
+        let mut best = (INF_COST, ScanRank { window: 0, row_pos: usize::MAX, dx: i32::MAX },
+                        c.x, c.y);
+        let mut cands = Vec::new();
+        enumerate_candidates(
+            c.init_x, c.init_y, c.x, c.y, &irows, ilo, ihi, &crows, clo, chi,
+            &|d| {
+                target_cost_from_disp(d, ctx.max_disp_multiplier, ctx.max_disp_threshold)
+                    + congestion_floor
+                    > best.0
+            },
+            &mut cands,
+        );
+        for cand in cands {
+            if !(ctx.placeable)(&c, cand.x, cand.y) {
+                continue;
+            }
+            let target = target_cost(cand.x, cand.y, c.init_x, c.init_y,
+                                     ctx.max_disp_multiplier, ctx.max_disp_threshold);
+            let fp = footprint_of(&c, cand.x, cand.y, ctx.grid);
+            let mut cost = negotiation_cost(fp.into_iter(), target, best.0);
+            if cost > best.0 || (cost == best.0 && cand.rank >= best.1) {
+                continue; // loses, or ties with a losing rank — skip the costly DRC term
+            }
+            cost += drc_penalty * (ctx.drc_violations)(&c, cand.x, cand.y) as f64;
+            if cost < best.0 || (cost == best.0 && cand.rank < best.1) {
+                best = (cost, cand.rank, cand.x, cand.y);
+            }
+        }
+
+        // 5. Place — even if nothing better was found, which restores the cell where it was.
+        cells[i].x = best.2;
+        cells[i].y = best.3;
+        ctx.grid.add_usage(best.2, best.3, c.width, c.height, 1);
+    }
+    ctx.grid.total_overuse()
+}
+
+fn footprint_of(c: &SweepCell, x: i32, y: i32, grid: &NegGrid) -> Vec<Option<(i32, i32, f64)>> {
+    let mut out = Vec::with_capacity((c.width * c.height) as usize);
+    for dy in 0..c.height {
+        for dx in 0..c.width {
+            let (gx, gy) = (x + dx, y + dy);
+            if gx < 0 || gy < 0 || gx as usize >= grid.width || gy as usize >= grid.height {
+                out.push(None);
+            } else {
+                let p = grid.at(gx as usize, gy as usize);
+                out.push(Some((p.usage, p.capacity, p.hist_cost)));
+            }
+        }
+    }
+    out
+}
+
+fn cell_is_legal(c: &SweepCell, ctx: &SweepCtx) -> bool {
+    if !(ctx.placeable)(c, c.x, c.y) || (ctx.drc_violations)(c, c.x, c.y) > 0 {
+        return false;
+    }
+    footprint_of(c, c.x, c.y, ctx.grid)
+        .into_iter()
+        .all(|sq| matches!(sq, Some((u, cap, _)) if cap > 0 && (u - 1).max(0) == 0))
 }
