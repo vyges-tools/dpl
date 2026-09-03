@@ -65,11 +65,26 @@ pub struct Grid {
     pub row_count: usize,
     pub row_site_count: usize,
     pixels: Vec<Vec<Pixel>>,
-    /// Grid row -> the site names valid there, by x interval `[lo, hi)`.
-    row_sites: Vec<Vec<(usize, usize, String)>>,
+    /// Grid row -> the sites valid there, as `(lo, hi, site, orientation)` over x interval
+    /// `[lo, hi)`.
+    ///
+    /// ⛔ **The orientation belongs to the (interval, SITE) entry, not to the row.** Upstream's
+    /// `row_sites_` is an interval map to a `site -> orientation` table for exactly this reason:
+    /// several `dbRow`s with DIFFERENT sites and DIFFERENT orientations can start at the same Y,
+    /// and a multi-row master's site may be registered there with the opposite orientation to
+    /// the single-height one beside it.
+    ///
+    /// ⚠️ Collapsing this to one orientation per row is silent on a uniform design — every row
+    /// there has a single site — and wrong on a hybrid one, where the last row parsed decides
+    /// the orientation of every cell in that row regardless of its master.
+    row_sites: Vec<Vec<(usize, usize, String, String)>>,
     /// Core-relative Y of each grid row boundary.
     pub row_y: Vec<i32>,
-    /// The orientation each grid row imposes on a cell placed in it.
+    /// The orientation of the LAST row parsed at each grid row.
+    ///
+    /// ⚠️ **Only meaningful where a grid row has one site.** Ask
+    /// [`Grid::site_orient_at`] for the orientation a particular master would take — that is
+    /// keyed by site, as upstream's is.
     pub row_orient: Vec<String>,
     /// Whether `mark_blocked_layers` found any special wire to record.
     blocked_layers_populated: bool,
@@ -133,7 +148,7 @@ impl Grid {
         let row_site_count = ((core.2 - core.0) / site_width).max(0) as usize;
 
         let mut pixels = vec![vec![Pixel::default(); row_site_count]; row_count];
-        let mut row_sites: Vec<Vec<(usize, usize, String)>> = vec![Vec::new(); row_count];
+        let mut row_sites: Vec<Vec<(usize, usize, String, String)>> = vec![Vec::new(); row_count];
         let mut row_orient: Vec<String> = vec!["R0".into(); row_count];
 
         for (x, y, count, site, _orient, _h) in &rows {
@@ -146,7 +161,7 @@ impl Grid {
             for gx in x_start..x_end {
                 pixels[gy][gx].is_valid = true;
             }
-            row_sites[gy].push((x_start, x_end, site.clone()));
+            row_sites[gy].push((x_start, x_end, site.clone(), _orient.clone()));
             row_orient[gy] = _orient.clone();
         }
 
@@ -253,7 +268,7 @@ impl Grid {
         }
         self.row_sites[y as usize]
             .iter()
-            .any(|(lo, hi, s)| (x as usize) >= *lo && (x as usize) < *hi && s == site)
+            .any(|(lo, hi, s, _)| (x as usize) >= *lo && (x as usize) < *hi && s == site)
     }
 
     /// `Opendp::legalPt(cell, pt)` — clamp a wanted position into the core, then ROUND it to the
@@ -495,10 +510,13 @@ impl Grid {
         if y < 0 || y as usize >= self.row_count {
             return None;
         }
+        // ⛔ The orientation of the matching (interval, SITE) entry — NOT the row's. See
+        // `row_sites`: on a hybrid design the two differ, and the row's value is whichever row
+        // happened to be parsed last.
         self.row_sites[y as usize]
             .iter()
-            .find(|(lo, hi, s)| (x as usize) >= *lo && (x as usize) < *hi && s == site)
-            .map(|(_, _, _)| self.row_orient[y as usize].clone())
+            .find(|(lo, hi, s, _)| (x as usize) >= *lo && (x as usize) < *hi && s == site)
+            .map(|(_, _, _, orient)| orient.clone())
     }
 
     /// How many squares are usable — the number a legal placement has to fit into.
@@ -517,7 +535,7 @@ mod padding_paint_tests {
             row_count: 1,
             row_site_count: w,
             pixels: vec![vec![super::Pixel { is_valid: true, ..Default::default() }; w]],
-            row_sites: vec![vec![(0, w, "S".to_string())]],
+            row_sites: vec![vec![(0, w, "S".to_string(), "R0".to_string())]],
             row_y: vec![0, 10],
             row_orient: vec!["R0".to_string()],
             blocked_layers_populated: false,
@@ -581,7 +599,7 @@ mod grid_height_tests {
             core: (0, 0, 100, pitch * rows as i32),
             site_width: 10, row_count: rows, row_site_count: 10,
             pixels: vec![vec![super::Pixel::default(); 10]; rows],
-            row_sites: vec![vec![(0, 10, "S".to_string())]; rows],
+            row_sites: vec![vec![(0, 10, "S".to_string(), "R0".to_string())]; rows],
             row_y: (0..=rows).map(|i| i as i32 * pitch).collect(),
             row_orient: vec!["R0".to_string(); rows],
             blocked_layers_populated: false,
@@ -623,5 +641,51 @@ mod grid_height_tests {
         // ⚠️ Order matters: uniform is tested FIRST, so a pattern on a uniform design is unused.
         let g = uniform(2800, 4);
         assert_eq!(g.grid_height(2800, 3), 1);
+    }
+}
+
+#[cfg(test)]
+mod site_orientation_tests {
+    /// One grid row carrying TWO sites with OPPOSITE orientations — the hybrid case.
+    fn two_sites_one_row() -> super::Grid {
+        super::Grid {
+            core: (0, 0, 100, 10),
+            site_width: 10, row_count: 1, row_site_count: 10,
+            pixels: vec![vec![super::Pixel { is_valid: true, ..Default::default() }; 10]],
+            row_sites: vec![vec![
+                (0, 10, "SINGLE".to_string(), "FS".to_string()),
+                (0, 10, "DOUBLE".to_string(), "N".to_string()),
+            ]],
+            row_y: vec![0, 10],
+            // ⚠️ The row-level value is the LAST one parsed — which is what the old lookup
+            // returned for every master in the row.
+            row_orient: vec!["N".to_string()],
+            blocked_layers_populated: false,
+        }
+    }
+
+    #[test]
+    fn orientation_follows_the_site_not_the_row() {
+        // ⛔ The bug this pins: both masters used to get the row's single orientation, so a
+        // multi-row master in a row shared with single-height ones came out flipped.
+        let g = two_sites_one_row();
+        assert_eq!(g.site_orient_at(0, 0, "SINGLE").as_deref(), Some("FS"));
+        assert_eq!(g.site_orient_at(0, 0, "DOUBLE").as_deref(), Some("N"));
+    }
+
+    #[test]
+    fn a_site_the_row_does_not_offer_has_no_orientation() {
+        let g = two_sites_one_row();
+        assert_eq!(g.site_orient_at(0, 0, "ABSENT"), None);
+        assert_eq!(g.site_orient_at(0, 1, "SINGLE"), None, "off the grid vertically");
+    }
+
+    #[test]
+    fn the_interval_bounds_the_lookup() {
+        let mut g = two_sites_one_row();
+        g.row_sites[0] = vec![(2, 5, "S".to_string(), "FS".to_string())];
+        assert_eq!(g.site_orient_at(1, 0, "S"), None, "below the interval");
+        assert_eq!(g.site_orient_at(2, 0, "S").as_deref(), Some("FS"), "lo is inclusive");
+        assert_eq!(g.site_orient_at(5, 0, "S"), None, "hi is EXCLUSIVE");
     }
 }
