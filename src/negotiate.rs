@@ -378,7 +378,10 @@ pub enum Legality {
     RowRejectsSite,
     Blockage,
     Overused,
-    /// ⬜ Declared, never returned by this engine — see [`is_cell_legal`].
+    /// The cell fails one of `PlacementDRC`'s four checks.
+    DrcViolation,
+    /// ⛔ No DRC checker was supplied. Upstream fails the cell in this case rather than passing
+    /// it — a missing checker is "cannot vouch for this", not "nothing wrong".
     DrcUnavailable,
 }
 
@@ -414,17 +417,22 @@ pub fn is_valid_row(
 
 /// `isCellLegal` — is the cell legally placed where it is?
 ///
-/// ⛔ **Upstream's version returns FALSE when the DRC engine is unavailable**, logging
-/// *"DRC objects not available!"*. Transcribed literally without `PlacementDRC`, every cell would
-/// be illegal and the negotiation would never converge.
+/// ⛔ **Upstream returns FALSE when the DRC engine is unavailable**, logging *"DRC objects not
+/// available!"*. It treats a missing checker as "cannot vouch for this cell", not as "no news is
+/// good news" — so `drc_ok` here is `Option<bool>` rather than `bool`, and `None` fails the cell
+/// exactly as upstream does.
 ///
-/// ⚠️ **So this omits the DRC clause, and that is a DIVERGENCE, not a simplification.** A cell that
-/// upstream rejects for edge spacing, blocked layers, padding or a one-site gap is legal here — so
-/// this engine will consider fewer cells illegal, negotiate fewer of them, and settle somewhere
-/// upstream would not. It must stay declared until `PlacementDRC` exists.
+/// ✅ **The DRC clause is WIRED as of 2026-09-02** (`crate::drc::check_drc`), so the divergence
+/// declared when this was first written is closed. It read: *a cell upstream rejects for edge
+/// spacing, blocked layers, padding or a one-site gap is legal here, so this engine considers
+/// fewer cells illegal and settles somewhere upstream would not.*
+///
+/// ⚠️ **Order is upstream's fast path**: `inDie → isValidRow → fence → DRC → footprint`, cheapest
+/// first, bailing on the first failure.
 pub fn is_cell_legal(
     in_die: bool,
     row_ok: Legality,
+    drc_ok: Option<bool>,
     footprint: impl Iterator<Item = (i32, i32)>,
 ) -> Legality {
     if !in_die {
@@ -433,7 +441,12 @@ pub fn is_cell_legal(
     if row_ok != Legality::Legal {
         return row_ok;
     }
-    // ⬜ upstream: `drc_engine_->checkDRC(node, x, y, orient)` here.
+    // ⛔ `None` = no checker. Upstream fails the cell rather than passing it.
+    match drc_ok {
+        None => return Legality::DrcUnavailable,
+        Some(false) => return Legality::DrcViolation,
+        Some(true) => {}
+    }
     for (usage, capacity) in footprint {
         if capacity == 0 {
             return Legality::Blockage;
@@ -851,18 +864,39 @@ mod tests {
 
     #[test]
     fn an_overused_or_blocked_square_makes_a_cell_illegal() {
-        let ok = |v: Vec<(i32, i32)>| is_cell_legal(true, Legality::Legal, v.into_iter());
+        let ok = |v: Vec<(i32, i32)>| is_cell_legal(true, Legality::Legal, Some(true), v.into_iter());
         assert_eq!(ok(vec![(1, 1), (1, 1)]), Legality::Legal, "one cell per square is legal");
         assert_eq!(ok(vec![(1, 1), (2, 1)]), Legality::Overused);
         assert_eq!(ok(vec![(1, 0)]), Legality::Blockage);
     }
 
     #[test]
+    fn a_missing_drc_checker_fails_the_cell_rather_than_passing_it() {
+        // ⛔ Upstream logs "DRC objects not available!" and returns false. A missing checker is
+        // "cannot vouch for this cell", not "nothing wrong with it" — passing it would let the
+        // negotiation declare a design legal that was never checked.
+        assert_eq!(is_cell_legal(true, Legality::Legal, None, [].into_iter()),
+                   Legality::DrcUnavailable);
+        assert_eq!(is_cell_legal(true, Legality::Legal, Some(false), [].into_iter()),
+                   Legality::DrcViolation);
+        assert_eq!(is_cell_legal(true, Legality::Legal, Some(true), [].into_iter()),
+                   Legality::Legal);
+    }
+
+    #[test]
+    fn drc_is_consulted_before_the_footprint_scan() {
+        // ⚠️ Upstream's fast path: a DRC failure short-circuits, so an overused footprint behind
+        // a DRC violation reports the DRC one.
+        assert_eq!(is_cell_legal(true, Legality::Legal, Some(false), [(9, 1)].into_iter()),
+                   Legality::DrcViolation, "not Overused");
+    }
+
+    #[test]
     fn the_row_verdict_is_reported_rather_than_collapsed_to_a_bool() {
         // 🔑 A caller that only sees false cannot tell a blockage from a missing row, and the two
         // want different fixes.
-        assert_eq!(is_cell_legal(false, Legality::Legal, [].into_iter()), Legality::OffDie);
-        assert_eq!(is_cell_legal(true, Legality::RowRejectsSite, [].into_iter()),
+        assert_eq!(is_cell_legal(false, Legality::Legal, Some(true), [].into_iter()), Legality::OffDie);
+        assert_eq!(is_cell_legal(true, Legality::RowRejectsSite, Some(true), [].into_iter()),
                    Legality::RowRejectsSite);
     }
 

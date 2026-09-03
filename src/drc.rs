@@ -542,3 +542,62 @@ mod tests {
         assert!(!check_padding(0, 1, 0, 1, 0, 0, Class::Cr, &block));
     }
 }
+
+/// `PlacementDRC::checkDRC` — all four checks, in upstream's fast-path order.
+///
+/// ⛔ **Cheapest first, bailing on the first failure**: blocked layers → one-site gap → padding →
+/// edge spacing. ⚠️ Upstream's *debug* path runs all four in a different order so a report can
+/// show each; the two orders are only interchangeable because the checks are independent, and this
+/// takes the fast one.
+pub struct DrcVerdict {
+    pub blocked_layers: bool,
+    pub one_site_gap: bool,
+    pub padding: bool,
+    pub edge_spacing: bool,
+}
+
+impl DrcVerdict {
+    pub fn ok(&self) -> bool {
+        self.blocked_layers && self.one_site_gap && self.padding && self.edge_spacing
+    }
+
+    /// `countDRCViolations` — how many of the four fail.
+    ///
+    /// ⚠️ **A COUNT, not a boolean.** `findBestLocation` multiplies it by the escalating penalty,
+    /// so a position failing two rules must cost more than one failing a single rule — collapsing
+    /// it to 0/1 would make those positions indistinguishable.
+    pub fn count(&self) -> i32 {
+        [self.blocked_layers, self.one_site_gap, self.padding, self.edge_spacing]
+            .iter()
+            .filter(|ok| !**ok)
+            .count() as i32
+    }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+
+    fn v(bl: bool, gap: bool, pad: bool, edge: bool) -> DrcVerdict {
+        DrcVerdict { blocked_layers: bl, one_site_gap: gap, padding: pad, edge_spacing: edge }
+    }
+
+    #[test]
+    fn all_four_must_pass() {
+        assert!(v(true, true, true, true).ok());
+        for i in 0..4 {
+            let mut f = [true; 4];
+            f[i] = false;
+            assert!(!v(f[0], f[1], f[2], f[3]).ok(), "check {i} alone must fail the verdict");
+        }
+    }
+
+    #[test]
+    fn the_count_distinguishes_one_violation_from_several() {
+        // ⚠️ findBestLocation multiplies this by the escalating penalty, so 2 must outrank 1.
+        assert_eq!(v(true, true, true, true).count(), 0);
+        assert_eq!(v(false, true, true, true).count(), 1);
+        assert_eq!(v(false, false, true, true).count(), 2);
+        assert_eq!(v(false, false, false, false).count(), 4);
+    }
+}

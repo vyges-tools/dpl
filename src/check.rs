@@ -57,10 +57,22 @@ impl Report {
     }
 }
 
-/// The families this engine cannot yet evaluate. Named so `not_checked` is never empty by
+/// The families `check-placement` does not evaluate. Named so `not_checked` is never empty by
 /// accident: a checker that quietly stops checking is the `vacuous` class.
+///
+/// ⚠️ **The REASON changed on 2026-09-02 and the list did not.** Four of these are now implemented
+/// in [`crate::drc`] — padding with its class matrix, edge spacing, blocked layers, one-site gaps
+/// — and are wired into the NEGOTIATION legalizer's `is_cell_legal`. They are still listed here
+/// because `check-placement` does not yet CALL them: it would need the pixel occupancy and each
+/// master's edge list, which this command does not build.
+///
+/// ⛔ **"Implemented but not wired" is not "checked".** Moving a family off this list before the
+/// call site exists would be exactly the stale claim this suite keeps catching in descriptors.
 pub const NOT_CHECKED: &[&str] = &[
-    "region_placement", "padding", "edge_spacing", "blocked_layers", "one_site_gap",
+    // Needs regions, which nothing in this crate models yet.
+    "region_placement",
+    // Implemented in `crate::drc`; awaiting a call site here.
+    "padding", "edge_spacing", "blocked_layers", "one_site_gap",
 ];
 
 /// The rectangle a cell occupies, in DBU: `(x, y, w, h)`.
