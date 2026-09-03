@@ -1573,6 +1573,40 @@ mod tests {
         assert!(a < b, "an init-window candidate wins however deep in its own scan it was");
     }
 
+    #[test]
+    fn the_overlap_penalty_is_what_breaks_the_displacement_tie() {
+        // ⛔ **`checkPadding` is upstream's OVERLAP check, and without it the tie goes the wrong
+        // way.** With no padding set it still walks the footprint and fails on
+        // `hasPaddingConflict(cell, pixel->cell)` — two CORE cells are `P` in the class matrix —
+        // and `findBestLocation` adds `drc_penalty` for the failure.
+        //
+        // 🔑 The congestion term ALONE cannot separate the two candidates here. An occupied
+        // square under the cell costs `0 + h*(1+1)/1 = 2`; the free square one site over costs
+        // `1 + h*(0+1)/1 = 2`. At `h = 1` that is an exact tie, and `ScanRank` then breaks it
+        // toward the NEARER square — the occupied one.
+        //
+        // ⚠️ Measured against upstream at pin 945a9f4 on cut-down `hybrid_cells` variants: with
+        // the square free the reference takes it, and with a cell on it the reference steps one
+        // site over. Ours did not until the padding term was counted.
+        let run = |count_padding: bool| -> i32 {
+            let mut grid = NegGrid::build(8, 1, &|_, _| true);
+            let mut cells = vec![sweep_cell("mover", 0, 1), sweep_cell("blocker", 0, 1)];
+            for (i, c) in cells.iter().enumerate() {
+                grid.add_usage(c.x, c.y, c.width, c.height, 1);
+                grid.paint_cell(i, c.x, c.y, c.width, c.height);
+            }
+            // The blocker painted last, so it owns the slot and the mover's rip-up leaves it.
+            let drc = move |_c: &SweepCell, x: i32, y: i32, g: &NegGrid| -> i32 {
+                i32::from(count_padding && g.occupant(x, y).is_some())
+            };
+            let mut ctx = SweepCtx { drc_violations: &drc, ..sweep_ctx(&mut grid) };
+            negotiation_iter(&mut cells, &mut vec![0], 0, &mut ctx);
+            cells[0].x
+        };
+        assert_eq!(run(false), 0, "without the term the tie goes to the nearer, OCCUPIED square");
+        assert_eq!(run(true), 1, "with it the cell steps one site over, as upstream does");
+    }
+
     fn sweep_cell(name: &str, x: i32, w: i32) -> SweepCell {
         SweepCell { name: name.into(), x, y: 0, init_x: x, init_y: 0,
                     width: w, height: 1, fixed: false }
@@ -2113,10 +2147,14 @@ use vyges_opendb::Db;
 pub const NOT_DONE: &[&str] = &[
     "groups_and_regions (respectsFence / initFenceRegions)",
     "master_symmetry (checkMasterSym)",
-    // ⚠️ ONE of `countDRCViolations`' four terms is evaluated (one-site gaps). The other three
-    // need the occupant's identity or its master's edge list, so the DRC penalty is an
-    // UNDER-count — it never over-reports, but it will prefer a location upstream would not.
-    "drc: padding, edge_spacing and blocked_layers are not evaluated by the legalizer",
+    // ⚠️ TWO of `countDRCViolations`' four terms are evaluated (padding/overlap and one-site
+    // gaps). The other two need the master's edge list or its blocked layers, so the DRC penalty
+    // is still an UNDER-count — it never over-reports, but it will prefer a location upstream
+    // would not.
+    "drc: edge_spacing and blocked_layers are not evaluated by the legalizer",
+    // ⚠️ `checkPadding` runs, but with a padding of zero: `set_placement_padding` is unbuilt, so
+    // the scan is never widened and nothing ever reserves a square it does not occupy.
+    "padding values (set_placement_padding, padding_reserved_by)",
     "drc_history_costs (updateDrcHistoryCosts)",
     "diamondRecovery on stall",
 ];
@@ -2170,6 +2208,10 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     // moves them — but `PlacementDRC` reads every occupant through `pixel->cell`, so leaving
     // them out makes each check blind to exactly the obstacles that matter most.
     let mut fixed_boxes: Vec<(i32, i32, i32, i32)> = Vec::new();
+    let mut fixed_types: Vec<String> = Vec::new();
+    // Master class per occupant, for the CR/WT/BL/SP pair rules `checkPadding` applies. Movable
+    // cells first and the fixed ones after, so an index into this is an index in the map.
+    let mut cell_types: Vec<String> = Vec::new();
     for i in 0..db.num_insts() {
         let name = db.nth_inst_name(i);
         let master = db.inst_master(&name);
@@ -2183,6 +2225,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             let (x0, y0, x1, y1) = grid.covering(x - core.0, y - core.1, w, h);
             ngrid.blockade(x0 as i32, y0 as i32, (x1 - x0 + 1) as i32, (y1 - y0 + 1) as i32);
             fixed_boxes.push((x0 as i32, y0 as i32, (x1 - x0 + 1) as i32, (y1 - y0 + 1) as i32));
+            fixed_types.push(mtype.clone());
             continue;
         }
         if !mtype.contains("CORE") || !enters_model(&status, true) {
@@ -2211,6 +2254,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         });
         sites.push(db.master_get_site(&master));
         masters.push(master.clone());
+        cell_types.push(mtype.clone());
     }
 
     // Indices past the movable cells, so `pixel->cell` names exactly one occupant either way.
@@ -2218,6 +2262,11 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         .iter()
         .enumerate()
         .map(|(k, &(x, y, w, h))| (cells.len() + k, x, y, w, h))
+        .collect();
+    let classes: Vec<crate::drc::Class> = cell_types
+        .iter()
+        .chain(fixed_types.iter())
+        .map(|t| crate::drc::classify(t))
         .collect();
     // `syncAllCellsToDplGrid` — the seeding call `legalize` makes right after `addUsage`, before
     // the first legality scan. ⛔ Without it the map is empty and every DRC check passes
@@ -2308,6 +2357,34 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             })
     };
 
+    // `checkPadding` — and ⛔ **it is upstream's OVERLAP check, not merely a spacing one.** With
+    // no padding set it still walks the footprint and fails on `hasPaddingConflict(cell,
+    // pixel->cell)`: two CORE cells are `P` in the class matrix, so one sitting on another is a
+    // violation worth `drc_penalty` in `findBestLocation`.
+    //
+    // 🔑 **That penalty is what separates a contested square from a free one**, because the
+    // congestion term alone cannot. On `hybrid_cells` a cell one site away from an occupied
+    // square costs `1 + h*(1+1)/1 = 3` there and `2 + h*(0+1)/1 = 3` on the free square — an
+    // exact tie at `h = 1`, which the scan rank then breaks toward the NEARER, occupied one.
+    // Upstream adds `5 * 1` to the occupied candidate and takes the free one.
+    // ⚠️ Measured against upstream on three cut-down variants of that design: with the square
+    // free the reference picks it, and with either a single- or a double-height cell on it the
+    // reference steps one site over.
+    //
+    // ℹ️ Padding VALUES are still not implemented — `set_placement_padding` cases are skipped —
+    // so the scan is never widened and `padding_reserved_by` is always empty. See `NOT_DONE`.
+    let pad_ok = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
+        let (cw, ch) = dims[i];
+        crate::drc::check_padding(
+            x, x + cw, y, y + ch, 0, 0, classes[i],
+            &|px, py| {
+                if px < 0 || py < 0 || px as usize >= g.width || py as usize >= g.height {
+                    return None; // off the grid — the core edge, skipped rather than failed
+                }
+                Some((g.occupant(px, py).map(|o| (classes[o], o == i)), None))
+            })
+    };
+
     // 4. Who starts illegal.
     //
     // ⛔ Upstream's seeding scan is `isCellLegal`, which CALLS `checkDRC`. Leaving the DRC out
@@ -2320,6 +2397,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         // Testing overuse alone here let a cell inside a hard blockage seed as legal.
         if !footprint_is_legal(c, c.x, c.y, &ngrid)
             || !site_ok(i, c.x, c.y)
+            || !pad_ok(i, c.x, c.y, &ngrid)
             || !gap_ok(i, c.x, c.y, &ngrid)
         {
             illegal.push(i);
@@ -2407,7 +2485,15 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         let idx_of: std::collections::HashMap<&str, usize> =
             index.iter().map(|&i| (names[i].as_str(), i)).collect();
         let drc = |c: &SweepCell, x: i32, y: i32, g: &NegGrid| -> i32 {
-            if gap_ok(idx_of[c.name.as_str()], x, y, g) { 0 } else { 1 }
+            let i = idx_of[c.name.as_str()];
+            let mut count = 0;
+            if !pad_ok(i, x, y, g) {
+                count += 1;
+            }
+            if !gap_ok(i, x, y, g) {
+                count += 1;
+            }
+            count
         };
 
         let mut ctx_cells = cells;
