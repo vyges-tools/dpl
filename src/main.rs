@@ -47,10 +47,12 @@ vyges physical dpl — detailed placement: legality checking over the design dat
 USAGE:
   vyges physical dpl check-placement    <design.odb> [--json] [-o FILE]
   vyges physical dpl detailed-placement <design.odb> [--out-odb FILE] [--dry-run]
+                                        [--use-diamond-legalizer]
   vyges physical dpl --describe | --help | --version
 
-⛔ SCOPE: legalization is the DIAMOND SEARCH path only. Rip-up-and-replace, groups/regions,
-   padding and one-site gaps are NOT implemented and are named in `not_done` on every run.
+⛔ SCOPE: legalization runs the NEGOTIATION legalizer, which is upstream's default path;
+   `--use-diamond-legalizer` selects the diamond one, as upstream's own flag does. Whichever
+   runs, what it does NOT implement is named in `not_done` on every run rather than omitted.
 
 ⚠️ Four of upstream's nine check families are evaluated (site alignment, placed, overlap,
    in rows). The other five are reported in `not_checked` rather than passed over in silence.
@@ -93,12 +95,16 @@ fn main() -> ExitCode {
 }
 
 fn legalize(args: &[String]) -> ExitCode {
-    let (mut odb, mut out_odb, mut dry) = (None, None, false);
+    // ⚠️ `use_diamond_legalizer_` DEFAULTS TO FALSE upstream and
+    // `isUseNegotiationLegalizer()` is `!use_diamond_legalizer_` — so NEGOTIATION is the default
+    // path and the diamond one is opt-in (4 of 67 upstream cases pass `-use_diamond_legalizer`).
+    let (mut odb, mut out_odb, mut dry, mut diamond) = (None, None, false, false);
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--out-odb" => { i += 1; out_odb = args.get(i).cloned(); }
             "--dry-run" => dry = true,
+            "--use-diamond-legalizer" => diamond = true,
             a if a.starts_with('-') => {
                 eprintln!("vyges-dpl: unknown option `{a}`");
                 return ExitCode::from(2);
@@ -115,7 +121,8 @@ fn legalize(args: &[String]) -> ExitCode {
         Ok(d) => d,
         Err(e) => { eprintln!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
     };
-    let res = match vyges_dpl::place::legalize(&db) {
+    let res = match if diamond { vyges_dpl::place::legalize(&db) }
+                    else { vyges_dpl::negotiate::legalize(&db) } {
         Ok(r) => r,
         Err(e) => { eprintln!("vyges-dpl: {e}"); return ExitCode::from(2); }
     };
@@ -158,6 +165,9 @@ fn legalize(args: &[String]) -> ExitCode {
                  else if res.placed.is_empty() { "vacuous" } else { "legalized" };
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
         "tool": "vyges-dpl", "command": "detailed-placement", "status": status,
+        // 🔑 Which legalizer ran is part of the result — the two produce different placements
+        // and a report that does not say which one it was cannot be compared to anything.
+        "legalizer": if diamond { "diamond" } else { "negotiation" },
         "cells": res.placed.len(), "moved": moved,
         "failures": res.failures, "not_done": res.not_done,
         // ⚠️ The DECISION, not just the count. A placer whose output cannot be inspected cannot

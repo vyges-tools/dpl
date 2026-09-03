@@ -1609,3 +1609,213 @@ fn cell_is_legal(c: &SweepCell, ctx: &SweepCtx) -> bool {
         .into_iter()
         .all(|sq| matches!(sq, Some((u, cap, _)) if cap > 0 && (u - 1).max(0) == 0))
 }
+
+// ── the driver ───────────────────────────────────────────────────────────────────────────────
+
+use crate::grid::Grid;
+use crate::place::{Legalized, Placed};
+use vyges_opendb::Db;
+
+/// Families of behaviour the NEGOTIATION legalizer does not implement.
+///
+/// ⛔ Reported on every run for the same reason `place::NOT_DONE` is: a legalizer that quietly
+/// omits a check reports fewer violations than it earned.
+pub const NOT_DONE: &[&str] = &[
+    "groups_and_regions (respectsFence / initFenceRegions)",
+    "master_symmetry (checkMasterSym)",
+    "row_power_compatibility (checkRowPowerCompatible)",
+    "drc_history_costs (updateDrcHistoryCosts)",
+    "diamondRecovery on stall",
+];
+
+/// `NegotiationLegalizer::legalize` — the DEFAULT detailed-placement path.
+///
+/// ⚠️ **Default, not the fallback.** `diamondDPL` is the opt-in one (`-disallow_one_site_gaps`
+/// and three other switches select it; 4 of 67 upstream cases take it).
+///
+/// **The call sequence, upstream's, in order:**
+///
+/// 1. `initFromDb` — cells enter the model by [`enters_model`]; each gets an
+///    [`init_position`] in grid units that never changes afterwards;
+/// 2. `buildGrid` — capacity 1 per valid site, `blockade` for fixed cells;
+/// 3. seed `addUsage(+1)` for every movable cell where it currently sits;
+/// 4. scan for illegal cells; the active set is those plus nothing else — ⚠️ a legal cell is
+///    only ever revisited because a neighbour's search moved into it, which shows up as overuse;
+/// 5. [`run_negotiation`] — two phases, [`negotiation_iter`] per iteration, history updated
+///    after each, diamond recovery on a 3-iteration stall;
+/// 6. sync back: grid units → absolute DBU, ⚠️ **orientation from the row landed in**.
+pub fn legalize(db: &Db) -> Result<Legalized, String> {
+    let grid = Grid::build(db)?;
+    let core = grid.core;
+    let (gw, gh) = (grid.row_site_count as i32, grid.row_count as i32);
+    let sw = grid.site_width;
+
+    let mut out = Legalized {
+        not_done: NOT_DONE.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+
+    // 2. The grid. A site is valid where the row model says a cell may sit.
+    let valid = |x: usize, y: usize| grid.pixel(x as i64, y as i64).is_some_and(|p| p.is_valid);
+    let mut ngrid = NegGrid::build(gw.max(0) as usize, gh.max(0) as usize, &valid);
+
+    // 1. + 3. The cells.
+    let mut cells: Vec<SweepCell> = Vec::new();
+    let mut sites: Vec<String> = Vec::new();
+    for i in 0..db.num_insts() {
+        let name = db.nth_inst_name(i);
+        let master = db.inst_master(&name);
+        let (x, y) = db.inst_location(&name);
+        let (w, h) = (db.master_get_width(&master) as i32, db.master_get_height(&master) as i32);
+        let mtype = db.master_get_type(&master).unwrap_or_default();
+        let status = db.inst_get_placement_status(&name);
+        let fixed = status == "FIRM" || status == "LOCKED" || mtype.contains("BLOCK");
+
+        if fixed {
+            let (x0, y0, x1, y1) = grid.covering(x - core.0, y - core.1, w, h);
+            ngrid.blockade(x0 as i32, y0 as i32, (x1 - x0 + 1) as i32, (y1 - y0 + 1) as i32);
+            continue;
+        }
+        if !mtype.contains("CORE") || !enters_model(&status, true) {
+            continue;
+        }
+        let (gx, gy) = init_position(
+            x as i64, y as i64, core.0 as i64, core.1 as i64, sw as i64,
+            &grid.row_y, w, h, gw, gh,
+        );
+        let cw = cell_width_in_sites(w as i64, sw as i64);
+        let ch = grid.rows_spanned(y - core.1, h).max(1) as i32;
+        // ⛔ Seeded where the cell IS. `init_x/init_y` are the same point and never move again —
+        // `targetCost` measures displacement from them for the whole run.
+        ngrid.add_usage(gx, gy, cw, ch, 1);
+        cells.push(SweepCell {
+            name: name.clone(), x: gx, y: gy, init_x: gx, init_y: gy,
+            width: cw, height: ch, fixed: false,
+        });
+        sites.push(db.master_get_site(&master));
+    }
+
+    // The three closures the sweep needs, bound to this database.
+    let row_has = |r: i32| r >= 0 && r < gh && grid.pixel(0, r as i64).is_some();
+    // ⚠️ Geometry is copied out so the closures below do not borrow `cells` — the sweep needs it
+    // mutably. The dimensions never change during a run, so the copy cannot go stale.
+    let dims: Vec<(i32, i32)> = cells.iter().map(|c| (c.width, c.height)).collect();
+    let site_ok = |i: usize, x: i32, y: i32| -> bool {
+        let (cw, ch) = dims[i];
+        if x < 0 || y < 0 || y >= gh || x + cw > gw {
+            return false;
+        }
+        (0..ch).all(|dy| {
+            (0..cw).all(|dx| grid.site_valid_at((x + dx) as i64, (y + dy) as i64, &sites[i]))
+        })
+    };
+
+    // 4. Who starts illegal.
+    let mut active: Vec<usize> = Vec::new();
+    for i in 0..cells.len() {
+        let c = &cells[i];
+        let overused = (0..c.height).any(|dy| {
+            (0..c.width).any(|dx| {
+                let (gx, gy) = (c.x + dx, c.y + dy);
+                gx >= 0 && gy >= 0 && (gx as usize) < ngrid.width && (gy as usize) < ngrid.height
+                    && ngrid.at(gx as usize, gy as usize).overuse() > 0
+            })
+        });
+        if overused || !site_ok(i, c.x, c.y) {
+            active.push(i);
+        }
+    }
+
+    // 5. Run it. ⚠️ The window is rebuilt per candidate anchor, as upstream does — hoisting it
+    //    out of the loop would freeze the reach at the cell's start position.
+    let index: Vec<usize> = (0..cells.len()).collect();
+    let outcome = if active.is_empty() {
+        Outcome::Converged { phase: 1, iter: 0 }
+    } else {
+        let names: Vec<String> = cells.iter().map(|c| c.name.clone()).collect();
+        let by_name: std::collections::HashMap<&str, usize> =
+            index.iter().map(|&i| (names[i].as_str(), i)).collect();
+        let window = |c: &SweepCell, x: i32, y: i32| -> (i32, i32, Vec<i32>) {
+            let i = by_name[c.name.as_str()];
+            let w = build_search_window(
+                x, y,
+                consts::SITE_SEARCH_WINDOW, consts::ROW_SEARCH_WINDOW,
+                effective_row_cap(consts::ROW_SEARCH_WINDOW, c.height, 100, true),
+                500, 100, true,
+                &|px| px < 0 || px >= gw,
+                &|px| px >= 0 && px < gw,
+                c.height, gh,
+                &row_has,
+                &|r, lo, hi| (lo.max(0)..=hi.min(gw - 1)).any(|px| site_ok(i, px, r)),
+            );
+            (w.dx_lo, w.dx_hi, w.rows)
+        };
+        let placeable = |c: &SweepCell, x: i32, y: i32| site_ok(by_name[c.name.as_str()], x, y);
+        // ⚠️ `updateDrcHistoryCosts` is NOT built — reported in `not_done`, and 0 here means the
+        // DRC term never fires, so the sweep is congestion-only. It is not silently treated as
+        // clean anywhere the caller cannot see.
+        let drc = |_: &SweepCell, _: i32, _: i32| 0;
+
+        let mut ctx_cells = cells;
+        let mut violations = 0;
+        let outcome = {
+            let mut iterate = |iter: i32| -> i32 {
+                let mut ctx = SweepCtx {
+                    grid: &mut ngrid, window: &window, placeable: &placeable,
+                    drc_violations: &drc,
+                    max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
+                    max_disp_threshold: consts::MAX_DISP_THRESHOLD,
+                    drc_penalty: consts::DRC_PENALTY,
+                };
+                violations = negotiation_iter(&mut ctx_cells, &active, iter, &mut ctx);
+                let footprints: Vec<Vec<usize>> = ctx_cells
+                    .iter()
+                    .map(|c| {
+                        let mut f = Vec::new();
+                        for dy in 0..c.height {
+                            for dx in 0..c.width {
+                                let (gx, gy) = (c.x + dx, c.y + dy);
+                                if gx >= 0 && gy >= 0
+                                    && (gx as usize) < ngrid.width && (gy as usize) < ngrid.height
+                                {
+                                    f.push(gy as usize * ngrid.width + gx as usize);
+                                }
+                            }
+                        }
+                        f
+                    })
+                    .collect();
+                update_history_costs(&mut ngrid.pixels, &footprints);
+                violations
+            };
+            run_negotiation(consts::MAX_ITER_NEG, consts::MAX_ITER_NEG2, &mut iterate, || {})
+        };
+        cells = ctx_cells;
+        let _ = violations;
+        outcome
+    };
+
+    // 6. Sync back.
+    for (i, c) in cells.iter().enumerate() {
+        if !site_ok(i, c.x, c.y) {
+            out.failures.push(c.name.clone());
+            continue;
+        }
+        let nx = c.x * sw;
+        let ny = grid.row_y[c.y as usize];
+        let orient = grid
+            .site_orient_at(c.x as i64, c.y as i64, &sites[i])
+            .unwrap_or_else(|| "R0".into());
+        out.placed.push(Placed {
+            name: c.name.clone(),
+            x: nx + core.0,
+            y: ny + core.1,
+            orient,
+            moved: c.x != c.init_x || c.y != c.init_y,
+        });
+    }
+    if !matches!(outcome, Outcome::Converged { .. }) {
+        out.not_done.push(format!("did not converge: {:?}", outcome));
+    }
+    Ok(out)
+}
