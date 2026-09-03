@@ -719,19 +719,33 @@ pub enum Outcome {
 /// 🔑 **The stall escape is `diamondRecovery`** — the diamond search legalizer, run over the cells
 /// still illegal, then the phase BREAKS. So `diamondDPL`'s search is not an alternative to
 /// negotiation; it is a component of it.
+///
+/// ⛔ **A phase-1 stall BREAKS INTO PHASE 2; it does not end the run.** Upstream's `break` leaves
+/// the phase-1 loop and falls through to phase 2, which runs its full `kMaxIterNeg2` iterations
+/// on the cells `diamondRecovery` could not seat. Only a phase-2 stall ends it. Returning after
+/// the first stall — which this function did until 2026-09-02 — throws away the 1000 iterations
+/// that are meant to clean up after recovery.
+///
+/// ⚠️ **`kIsolationPt` is 1, so the isolation applies from phase-1 iteration 1** — not from
+/// phase 2. Upstream's own comments say otherwise ("Phase 1 – all active cells rip-up every
+/// iteration (isolation point = 0)" and "Phase 2 – isolation point active"), and the code at
+/// `NegotiationLegalizerPass.cpp:314` — `if (iter >= kIsolationPt && isCellLegal(idx))` — is what
+/// runs. Transcribed from the code.
 pub fn run_negotiation(
     max_iter_neg: i32,
     max_iter_neg2: i32,
     mut iterate: impl FnMut(i32) -> i32,
     mut diamond_recovery: impl FnMut(),
 ) -> Outcome {
+    let mut stalled_phase_1 = None;
+    let mut final_violations = -1;
     for (phase, (start, count)) in [(0, max_iter_neg), (max_iter_neg, max_iter_neg2)]
         .into_iter()
         .enumerate()
     {
         let mut prev = -1;
         let mut stall = 0;
-        let mut last = 0;
+        let mut last = -1;
         for i in 0..count {
             let actual = start + i;
             let violations = iterate(actual);
@@ -743,18 +757,29 @@ pub fn run_negotiation(
                 stall += 1;
                 if stall == 3 {
                     diamond_recovery();
-                    return Outcome::StalledIntoRecovery {
-                        phase: phase as u8 + 1, iter: i, violations,
-                    };
+                    // ⛔ BREAK, not return. Phase 1 falls through into phase 2; only a phase-2
+                    // stall ends the run.
+                    if phase == 1 {
+                        return Outcome::StalledIntoRecovery {
+                            phase: 2, iter: i, violations,
+                        };
+                    }
+                    stalled_phase_1 = Some((i, violations));
+                    break;
                 }
             } else {
                 stall = 0;
             }
             prev = violations;
         }
-        let _ = last;
+        final_violations = last;
     }
-    Outcome::Exhausted { violations: -1 }
+    match stalled_phase_1 {
+        // Phase 1 stalled, recovery ran, and phase 2 then used up its iterations without
+        // converging. Both facts are reported — the stall is why, the exhaustion is what.
+        Some((iter, violations)) => Outcome::StalledIntoRecovery { phase: 1, iter, violations },
+        None => Outcome::Exhausted { violations: final_violations },
+    }
 }
 
 /// A candidate location and the rank that breaks cost ties.
@@ -1288,8 +1313,28 @@ mod tests {
     fn three_identical_counts_are_a_stall_and_call_recovery() {
         let mut recovered = 0;
         let out = run_negotiation(400, 1000, |_| 7, || recovered += 1);
-        assert_eq!(out, Outcome::StalledIntoRecovery { phase: 1, iter: 3, violations: 7 });
-        assert_eq!(recovered, 1, "recovery runs exactly once, then the phase breaks");
+        // ⛔ A count that never moves stalls TWICE: once in phase 1, which breaks into phase 2,
+        // and once in phase 2, which ends the run. Recovery therefore runs once per phase.
+        assert_eq!(out, Outcome::StalledIntoRecovery { phase: 2, iter: 3, violations: 7 });
+        assert_eq!(recovered, 2, "recovery ran in both phases, not once");
+    }
+
+    #[test]
+    fn a_phase_one_stall_falls_through_into_phase_two() {
+        // 🔑 The property the `break` exists for: after recovery, phase 2 gets its full run.
+        // ⚠️ This fails if phase 1 RETURNS on a stall — `iters` would stop at 3.
+        let mut iters = Vec::new();
+        let out = run_negotiation(400, 5, |i| {
+            iters.push(i);
+            // Constant through the phase-1 stall, then a sequence that never repeats so phase 2
+            // exhausts rather than stalling too.
+            if iters.len() <= 4 { 7 } else { 100 - iters.len() as i32 }
+        }, || {});
+        assert_eq!(&iters[..4], &[0, 1, 2, 3], "phase 1 stalled at its 4th iteration");
+        assert_eq!(&iters[4..], &[400, 401, 402, 403, 404],
+                   "phase 2 ran all 5 of its iterations, counter continuing from 400");
+        assert_eq!(out, Outcome::StalledIntoRecovery { phase: 1, iter: 3, violations: 7 },
+                   "the phase-1 stall is still reported — it is why phase 2 had work left");
     }
 
     #[test]
@@ -1299,8 +1344,9 @@ mod tests {
         let mut n = 0;
         let out = run_negotiation(400, 1000, |_| { let v = seq[n.min(seq.len() - 1)]; n += 1; v },
                                   || {});
-        // 4,4 -> stall 1; 5 resets; 5,5 -> stall 2; 5 -> stall 3 at index 5.
-        assert_eq!(out, Outcome::StalledIntoRecovery { phase: 1, iter: 5, violations: 5 });
+        // 4,4 -> stall 1; 5 resets; 5,5 -> stall 2; 5 -> stall 3 at index 5. Phase 1 then breaks
+        // into phase 2, where the count is still a constant 5 and it stalls again.
+        assert_eq!(out, Outcome::StalledIntoRecovery { phase: 2, iter: 3, violations: 5 });
     }
 
     #[test]
@@ -1711,7 +1757,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     };
 
     // 4. Who starts illegal.
-    let mut active: Vec<usize> = Vec::new();
+    let mut illegal: Vec<usize> = Vec::new();
     for i in 0..cells.len() {
         let c = &cells[i];
         let overused = (0..c.height).any(|dy| {
@@ -1722,9 +1768,57 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             })
         });
         if overused || !site_ok(i, c.x, c.y) {
-            active.push(i);
+            illegal.push(i);
         }
     }
+
+    // ⛔ **The active set is the illegal cells PLUS every movable cell inside their search
+    // windows** — upstream's comment: "so the loop can create space organically". A run that
+    // negotiates only the illegal cells has nowhere to push their neighbours to, and a cell
+    // wedged between two legal ones simply never finds a site.
+    //
+    // 🔑 Seeded ONCE, before the phases; the set does not grow afterwards.
+    //
+    // ⚠️ Upstream buckets movable cells by row and binary-searches the x-range so the cost is
+    // proportional to what is actually inside the windows, not to the design size. Transcribed,
+    // because on a design where most cells are legal a linear scan per seed is the difference
+    // between seconds and minutes.
+    let active = {
+        let mut set: std::collections::BTreeSet<usize> = illegal.iter().copied().collect();
+        let mut buckets: Vec<Vec<(i32, usize)>> = vec![Vec::new(); gh.max(0) as usize];
+        for (i, c) in cells.iter().enumerate() {
+            if c.fixed || c.y < 0 || c.y >= gh || set.contains(&i) {
+                continue;
+            }
+            buckets[c.y as usize].push((c.x, i));
+        }
+        for b in &mut buckets {
+            b.sort_unstable();
+        }
+        for &idx in &illegal {
+            let seed = &cells[idx];
+            let site_window = effective_site_window(
+                consts::SITE_SEARCH_WINDOW, seed.width, 500, true);
+            let row_cap = effective_row_cap(consts::ROW_SEARCH_WINDOW, seed.height, 100, true);
+            let (xlo, xhi) = (seed.x - site_window, seed.x + seed.width + site_window);
+            let ylo = (seed.y - row_cap).max(0);
+            let yhi = (seed.y + seed.height + row_cap).min(gh - 1);
+            for yy in ylo..=yhi {
+                for &(bx, bi) in &buckets[yy as usize] {
+                    if bx > xhi {
+                        break; // sorted by x — nothing further can be in range
+                    }
+                    if bx >= xlo {
+                        set.insert(bi);
+                    }
+                }
+            }
+        }
+        // ⚠️ A `BTreeSet`, where upstream uses an `unordered_set`. The ORDER out of it does not
+        // matter — `sortByNegotiationOrder` re-sorts the vector every iteration with a trailing
+        // index tie-break — but a deterministic one costs nothing and makes a trace comparable.
+        set.into_iter().collect::<Vec<usize>>()
+    };
 
     // 5. Run it. ⚠️ The window is rebuilt per candidate anchor, as upstream does — hoisting it
     //    out of the loop would freeze the reach at the cell's start position.

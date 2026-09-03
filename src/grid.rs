@@ -40,8 +40,20 @@ use vyges_opendb::Db;
 pub struct Pixel {
     /// A row covers this square, and no hard blockage has taken it away.
     pub is_valid: bool,
-    /// A cell sits here — upstream's `pixel->cell`, reduced to the one bit this engine reads.
+    /// A cell sits here — upstream's `pixel->cell`, as the one bit most callers read.
     pub occupied: bool,
+    /// WHICH cell sits here, as an index into the caller's cell table.
+    ///
+    /// ⛔ **Identity, not just occupancy.** Every `PlacementDRC` rule needs it: `checkPadding`
+    /// asks whether the occupant's CLASS conflicts with this cell's, `checkEdgeSpacing` skips
+    /// `pixel->cell == cell` and de-duplicates neighbours it has already compared, and
+    /// `checkOneSiteGap` distinguishes "occupied" from "occupied by me". A boolean cannot answer
+    /// any of the three.
+    pub cell: Option<u32>,
+    /// `pixel->padding_reserved_by` — the cell whose PADDING claims this square without its
+    /// body covering it. ⚠️ A separate field upstream, and separately consulted by
+    /// `checkPadding`: a square can be reserved by one cell's padding and occupied by no one.
+    pub padding_reserved_by: Option<u32>,
     /// Bitmask of routing levels blocked here, `1 << level`.
     pub blocked_layers: u32,
 }
@@ -279,17 +291,61 @@ impl Grid {
 
     /// `Grid::paintPixel` — mark the squares a cell occupies.
     ///
-    /// ⚠️ Padding (`paintCellPadding`) is NOT applied; this engine does not implement padding, and
-    /// declares that rather than pretending the reservation exists.
+    /// ⚠️ Padding is painted separately, by [`Grid::paint_cell_padding`], because upstream calls
+    /// it separately — `checkPlacement` runs `checkPadding`, THEN paints the padding, THEN
+    /// checks edge spacing. Folding the two together would let a cell see its own reservation.
     pub fn paint(&mut self, x: i32, y: i32, w: i32, h: i32, _movable: bool) {
+        self.paint_cell(x, y, w, h, None)
+    }
+
+    /// `Grid::paintPixel` with the occupant recorded.
+    pub fn paint_cell(&mut self, x: i32, y: i32, w: i32, h: i32, occupant: Option<u32>) {
         let (xlo, ylo, xhi, yhi) = self.covering(x, y, w, h);
         if ylo < 0 {
             return;
         }
         for gy in ylo.max(0)..yhi.min(self.row_count as i64) {
             for gx in xlo.max(0)..xhi.min(self.row_site_count as i64) {
-                self.pixels[gy as usize][gx as usize].occupied = true;
+                let p = &mut self.pixels[gy as usize][gx as usize];
+                p.occupied = true;
+                // ⚠️ FIRST writer wins, matching `paintPixel`'s assignment order under the
+                // overlap check: a square already claimed keeps its claimant, so the second cell
+                // is the one reported as overlapping.
+                if p.cell.is_none() {
+                    p.cell = occupant;
+                }
             }
+        }
+    }
+
+    /// `Grid::paintCellPadding` — reserve the sites a cell's padding claims either side of it.
+    ///
+    /// ⛔ **The padded span only; the cell's own body is painted by [`Grid::paint_cell`].**
+    /// Upstream keeps them in different fields because `checkPadding` consults both and a cell
+    /// must not be blocked by its own reservation.
+    pub fn paint_cell_padding(&mut self, x: i64, y: i64, cells_wide: i64, h: i32,
+                              left_pad: i64, right_pad: i64, occupant: u32) {
+        let y_end = self.grid_end_y(y, h);
+        for gy in y.max(0)..y_end.min(self.row_count as i64) {
+            for gx in (x - left_pad).max(0)..(x + cells_wide + right_pad)
+                                            .min(self.row_site_count as i64)
+            {
+                let p = &mut self.pixels[gy as usize][gx as usize];
+                if p.padding_reserved_by.is_none() {
+                    p.padding_reserved_by = Some(occupant);
+                }
+            }
+        }
+    }
+
+    /// `Grid::gridEndY(gridYToDbu(y) + height)` — the row PAST the last one a cell of `h` DBU
+    /// starting at grid row `y` covers.
+    pub fn grid_end_y(&self, y: i64, h: i32) -> i64 {
+        let y0 = *self.row_y.get(y.max(0) as usize).unwrap_or(&0);
+        let top = y0 + h;
+        match self.row_y.iter().position(|&ry| ry >= top) {
+            Some(r) => r as i64,
+            None => self.row_count as i64,
         }
     }
 
