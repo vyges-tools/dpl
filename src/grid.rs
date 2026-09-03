@@ -641,6 +641,23 @@ mod grid_height_tests {
     }
 
     #[test]
+    fn covering_returns_half_open_bounds() {
+        // ⛔ **`xhi`/`yhi` are ONE PAST the last square**, which is why every caller iterates
+        // `ylo..yhi`. Reading them as inclusive and adding 1 over-paints a row and a column.
+        //
+        // ⚠️ Measured: the negotiation driver did exactly that, so every FIXED cell blockaded one
+        // row too many. On `simple07` the row above the one fixed cell went to capacity 0, the
+        // first swept cell found upstream's answer at INF and walked five sites sideways instead.
+        // 🔑 The symptom read as "the legalizer will not move cells vertically", not as an
+        // off-by-one — a whole-row artefact does not look like arithmetic.
+        let g = uniform(2800, 4);
+        // One row tall (2800) and three sites wide (30 dbu at a 10-dbu site), at row 0, site 2.
+        assert_eq!(g.covering(20, 0, 30, 2800), (2, 0, 5, 1),
+                   "sites 2..5 and row 0..1 — three squares on ONE row");
+        assert_eq!(g.covering(20, 2800, 30, 5600), (2, 1, 5, 3), "a two-row cell spans rows 1..3");
+    }
+
+    #[test]
     fn a_single_height_master_is_one_row_however_the_cell_sits() {
         // ⛔ The `simple02` regression: the cell is at y = 10 in a 2800-pitch design, so
         // `rows_spanned` says 2 and `grid_height` says 1. The master is what decides.

@@ -2522,9 +2522,21 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         let fixed = status_is_fixed(&status);
 
         if fixed {
+            // ⛔ **`covering` returns HALF-OPEN bounds** — `xhi`/`yhi` are one past the last
+            // square, which is why every other caller iterates `ylo..yhi`. Adding 1 here
+            // blockaded one row and one column too many for EVERY fixed cell.
+            //
+            // ⚠️ Measured on `simple07`: the single fixed cell is one row tall, and the extra row
+            // made the whole of row 1 above it capacity 0. `_276_` then found `(8, 1)` — the
+            // square upstream puts it on, one row up and no sites across — at INF_COST, and
+            // walked five sites sideways instead.
+            //
+            // 🔑 The symptom was a WRONG ROW, not a wrong column, on four cases at once. A
+            // blockade that is one row too tall does not look like an off-by-one in the output;
+            // it looks like a legalizer that will not move cells vertically.
             let (x0, y0, x1, y1) = grid.covering(x - core.0, y - core.1, w, h);
-            ngrid.blockade(x0 as i32, y0 as i32, (x1 - x0 + 1) as i32, (y1 - y0 + 1) as i32);
-            fixed_boxes.push((x0 as i32, y0 as i32, (x1 - x0 + 1) as i32, (y1 - y0 + 1) as i32));
+            ngrid.blockade(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32);
+            fixed_boxes.push((x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32));
             fixed_types.push(mtype.clone());
             continue;
         }
