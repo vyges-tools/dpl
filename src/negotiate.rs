@@ -3811,6 +3811,35 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
     }
     if !matches!(outcome, Outcome::Converged { .. }) {
         out.not_done.push(format!("did not converge: {:?}", outcome));
+        // ⛔ **A non-converged run is a FAILED legalization, and must not report `legalized`.**
+        //
+        // `Opendp::detailedPlacement` warns DPL-701 *"NegotiationLegalizer did not fully
+        // converge"* and then calls `saveFailures(..., getIllegalNodes(), ...)` — the illegal
+        // cells go into the FAILURE report, not just a count into a log line.
+        //
+        // ⚠️ **Without this the status was a LIE.** `status` is decided by `failures` being
+        // empty, so a run that seated every cell and left thousands ILLEGAL reported `legalized`
+        // and exited 0 — and this engine's own descriptor asserts
+        // `pass_when status == "legalized"`, so a flow gate or MCP client read it as success.
+        // Measured 2026-09-03 on a real sky130 block (`rv_plic_lite`, 19,757 instances): the run
+        // ended `Exhausted { violations: 2487 }`, `check-placement` on its output then found 930
+        // violations, and this engine had already called it legalized.
+        // ⟹ **A pass word must never come from a run that failed** — the `vacuous` convention,
+        // applied to convergence.
+        //
+        // ℹ️ Upstream WARNS rather than erroring, so this is not an `error`; it is a failed
+        // legalization, which is what `failed` means here.
+        //
+        // ⬜ **NOT yet reproduced: the per-cell identities.** Upstream names every illegal node;
+        // this records the count only, because the legality context does not outlive the sweep.
+        // The status is the defect; the identities are the refinement.
+        if let Outcome::Exhausted { violations } | Outcome::StalledIntoRecovery { violations, .. } =
+            outcome
+        {
+            out.failures.push(format!(
+                "negotiation did not converge: {violations} cell(s) remain illegal"
+            ));
+        }
     }
     Ok(out)
 }
