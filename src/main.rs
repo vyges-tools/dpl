@@ -27,9 +27,29 @@ use vyges_opendb::Db;
 /// legalization was matching the reference on every comparable case. ⟹ **A descriptor rots
 /// toward whatever was true when it was written**, understating as readily as overstating, and
 /// nothing fails when it does. It is read by `vyges mcp` and rendered verbatim into the docs.
+/// The pin, inherited from the crate every engine already depends on.
+const CRATE_PIN: &str = vyges_opendb::OPENROAD_PIN;
+
+/// The pin this binary was built against, injected into the descriptor at print time.
+///
+/// 🔑 **One definition for the whole programme, inherited rather than typed** — the SHA lives in
+/// `openroad-pin.yaml` in `vyges-opendb-lib` and reaches here through `vyges-opendb`.
+///
+/// ⛔ **`dpl` was the ONE engine of eight still spelling the pin out as a literal**, and the
+/// 2026-09-03 re-pin is how that surfaced: rebuilt against `7d490b8`, this binary went on
+/// reporting `945a9f4` because the string is what it prints, not what it links. The other seven
+/// had used this token since 2026-08-29. ⟹ **A self-reported pin that cannot disagree with the
+/// build reports nothing** — `--pins` compares this against the oracle a harness is about to
+/// launch, and a hand-typed constant makes that comparison vacuous.
+const PIN_TOKEN: &str = "@OPENROAD_PIN@";
+
+fn describe() -> String {
+    DESCRIBE.replace(PIN_TOKEN, CRATE_PIN)
+}
+
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
-  "openroad_pin": "945a9f48dc6e5cc91d865daa92c45a1094cb682c",
+  "openroad_pin": "@OPENROAD_PIN@",
   "name": "dpl",
   "summary": "detailed placement: legality checking and legalization over the design database",
   "maturity": "structured",
@@ -150,7 +170,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("--describe") => {
-            println!("{DESCRIBE}");
+            println!("{}", describe());
             ExitCode::SUCCESS
         }
         Some("--version") => {
@@ -431,6 +451,43 @@ mod descriptor_tests {
             assert!(d.get(k).is_some(), "descriptor is missing `{k}`");
         }
         assert_eq!(d["name"], "dpl");
+    }
+
+    /// ⛔ **This test is the one `dpl` did not have**, and the 2026-09-03 re-pin is what it cost:
+    /// rebuilt against `7d490b8`, the binary went on reporting `945a9f4` because the field was a
+    /// hand-typed literal. ⟹ **A self-reported pin that cannot disagree with the build reports
+    /// nothing**, and `--pins` compares exactly this field against the oracle a harness is about
+    /// to launch.
+    ///
+    /// ⚠️ It guards the FIELD, not the prose. A correlation claim names the commit it was
+    /// MEASURED at and must stay a literal — `945a9f4` in a limitation is correct and must not
+    /// become the token, or the claim silently re-asserts itself at every future pin.
+    #[test]
+    fn the_descriptor_reports_the_pin_this_binary_was_built_against() {
+        let d = super::describe();
+        assert!(
+            !d.contains(super::PIN_TOKEN),
+            "the pin placeholder survived into the output -- the substitution did not run"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&d).expect("the descriptor is still valid JSON once filled in");
+        assert_eq!(
+            v["openroad_pin"], super::CRATE_PIN,
+            "the descriptor must report the pin this binary was actually built against"
+        );
+        assert_eq!(super::CRATE_PIN.len(), 40, "a full commit SHA, not an abbreviation");
+    }
+
+    /// The `openroad_pin` FIELD specifically must never be a literal — that is the regression.
+    #[test]
+    fn the_openroad_pin_field_is_the_token_not_a_literal() {
+        let raw: serde_json::Value = serde_json::from_str(DESCRIBE)
+            .expect("the raw descriptor is valid JSON before substitution");
+        assert_eq!(
+            raw["openroad_pin"], super::PIN_TOKEN,
+            "openroad_pin must be {} in the source so it tracks the build",
+            super::PIN_TOKEN
+        );
     }
 
     #[test]
