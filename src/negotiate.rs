@@ -33,6 +33,48 @@ pub fn enters_model(placement_status: &str, core_auto_placeable: bool) -> bool {
     placement_status != "NONE" && core_auto_placeable
 }
 
+/// `dbMaster::isCoreAutoPlaceable` — may the placer touch an instance of this master at all?
+///
+/// ⛔ **This is the model filter, and it is about the master's CLASS, never about whether the
+/// instance is fixed.** `initFromDb` skips an instance on two tests only: placement status
+/// `NONE`, and this. Everything else enters the model, fixed or movable.
+///
+/// ⚠️ **BLOCK is placeable.** A macro is not excluded here — it is excluded, when it is, by
+/// being FIXED. Filtering macros out by master type instead is the trap: `macro_placed_not_fixed`
+/// leaves its macro at status `PLACED`, and upstream's negotiation sweeps it like any other cell.
+///
+/// 🔑 **The four CORNER endcaps are the exception among endcaps** — upstream's comment calls them
+/// *"completely ignored by the placer"* — while every `ENDCAP_LEF58_*` edge and corner IS
+/// placeable. Covers, rings and pads are out.
+///
+/// ℹ️ Upstream switches over the enum *"so if new types are added we get a compiler warning"*.
+/// Matching strings cannot earn that warning, so an unrecognised type falls through to `false`,
+/// which is the answer upstream's own trailing `return false` gives.
+pub fn is_core_auto_placeable(master_type: &str) -> bool {
+    match master_type {
+        "CORE" | "CORE_FEEDTHRU" | "CORE_TIEHIGH" | "CORE_TIELOW" | "CORE_SPACER"
+        | "CORE_WELLTAP" | "CORE_ANTENNACELL" => true,
+        "BLOCK" | "BLOCK_BLACKBOX" | "BLOCK_SOFT" => true,
+        "ENDCAP" | "ENDCAP_PRE" | "ENDCAP_POST" => true,
+        "ENDCAP_TOPLEFT" | "ENDCAP_TOPRIGHT" | "ENDCAP_BOTTOMLEFT" | "ENDCAP_BOTTOMRIGHT" => false,
+        t if t.starts_with("ENDCAP_LEF58_") => true,
+        _ => false,
+    }
+}
+
+/// `dbPlacementStatus::isFixed` — is this instance an obstacle rather than something to place?
+///
+/// ⛔ **Three statuses, and `COVER` is the one that is easy to miss.** `NONE`, `UNPLACED`,
+/// `SUGGESTED` and `PLACED` are all movable.
+///
+/// ⚠️ **`PLACED` is movable even for a macro.** `dbToOpendp` warns DPL-404 and calls
+/// `node->setFixed(true)` on its own network NODE, but it never writes the dbInst's status —
+/// and `initFromDb` reads the dbInst. So the negotiation legalizer sweeps a placed-but-not-fixed
+/// macro, whatever that warning says. ⟹ Transcribe the code, not the message it prints.
+pub fn status_is_fixed(placement_status: &str) -> bool {
+    matches!(placement_status, "LOCKED" | "FIRM" | "COVER")
+}
+
 /// A cell's width in SITES — `initFromDb`'s sizing.
 ///
 /// ⛔ **`round(width / site_width)`, floored at 1 — NOT `divCeil`.** `Grid::gridWidth` uses
@@ -973,6 +1015,43 @@ mod tests {
 
     fn k(overuse: i32, height: i32, width: i32, idx: usize) -> SortKey {
         SortKey { overuse, height, width, idx }
+    }
+
+    #[test]
+    fn the_model_filter_is_the_master_class_and_never_the_fixed_flag() {
+        // ⛔ `dbMaster::isCoreAutoPlaceable`, arm for arm. BLOCK is PLACEABLE — a macro is
+        // excluded by being FIXED, never by its class — and this is the trap the corpus punishes:
+        // `macro_placed_not_fixed` leaves its macro at PLACED and upstream sweeps it.
+        for t in ["CORE", "CORE_FEEDTHRU", "CORE_TIEHIGH", "CORE_TIELOW", "CORE_SPACER",
+                  "CORE_WELLTAP", "CORE_ANTENNACELL", "BLOCK", "BLOCK_BLACKBOX", "BLOCK_SOFT",
+                  "ENDCAP", "ENDCAP_PRE", "ENDCAP_POST", "ENDCAP_LEF58_TOPEDGE",
+                  "ENDCAP_LEF58_LEFTBOTTOMCORNER"] {
+            assert!(is_core_auto_placeable(t), "{t} is placeable upstream");
+        }
+        // 🔑 The four CORNER endcaps are the exception among endcaps; covers, rings and pads are
+        // "completely ignored by the placer".
+        for t in ["ENDCAP_TOPLEFT", "ENDCAP_TOPRIGHT", "ENDCAP_BOTTOMLEFT", "ENDCAP_BOTTOMRIGHT",
+                  "COVER", "COVER_BUMP", "RING", "PAD", "PAD_AREAIO", "PAD_INPUT", "PAD_OUTPUT",
+                  "PAD_INOUT", "PAD_POWER", "PAD_SPACER", "SOMETHING_NEW"] {
+            assert!(!is_core_auto_placeable(t), "{t} is not placeable upstream");
+        }
+    }
+
+    #[test]
+    fn only_three_statuses_are_fixed() {
+        // ⛔ `dbPlacementStatus::isFixed`. COVER is the one that is easy to miss, and PLACED is
+        // MOVABLE even for a macro: DPL-404 sets the network node fixed, not the dbInst status,
+        // and `initFromDb` reads the dbInst.
+        for s in ["LOCKED", "FIRM", "COVER"] {
+            assert!(status_is_fixed(s), "{s} is fixed");
+        }
+        for s in ["NONE", "UNPLACED", "SUGGESTED", "PLACED", ""] {
+            assert!(!status_is_fixed(s), "{s} is movable");
+        }
+        // ⚠️ And NONE is out of the model entirely, however placeable its master is.
+        assert!(!enters_model("NONE", true));
+        assert!(enters_model("PLACED", true));
+        assert!(!enters_model("PLACED", false));
     }
 
     #[test]
@@ -2277,16 +2356,19 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         let (w, h) = (db.master_get_width(&master) as i32, db.master_get_height(&master) as i32);
         let mtype = db.master_get_type(&master).unwrap_or_default();
         let status = db.inst_get_placement_status(&name);
-        let fixed = status == "FIRM" || status == "LOCKED" || mtype.contains("BLOCK");
+        // ⛔ `initFromDb`'s two-test filter, in its order: status NONE, then the master class.
+        if !enters_model(&status, is_core_auto_placeable(&mtype)) {
+            continue;
+        }
+        // ⛔ From the STATUS alone. Reading it off the master type made every macro an obstacle,
+        // including the ones upstream legalizes.
+        let fixed = status_is_fixed(&status);
 
         if fixed {
             let (x0, y0, x1, y1) = grid.covering(x - core.0, y - core.1, w, h);
             ngrid.blockade(x0 as i32, y0 as i32, (x1 - x0 + 1) as i32, (y1 - y0 + 1) as i32);
             fixed_boxes.push((x0 as i32, y0 as i32, (x1 - x0 + 1) as i32, (y1 - y0 + 1) as i32));
             fixed_types.push(mtype.clone());
-            continue;
-        }
-        if !mtype.contains("CORE") || !enters_model(&status, true) {
             continue;
         }
         // ⛔ **`init_position` wants the footprint in GRID UNITS, not DBU**, because its clamp is
