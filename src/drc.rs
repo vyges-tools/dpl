@@ -601,3 +601,146 @@ mod verdict_tests {
         assert_eq!(v(false, false, false, false).count(), 4);
     }
 }
+
+// ── binding the rules to a database ──────────────────────────────────────────────────────────
+
+/// Routing level per layer name, as `dbTechLayer::getRoutingLevel()` defines it.
+///
+/// ⛔ **The 1-based index among ROUTING layers in tech order** — cut layers are skipped but do not
+/// consume a number. That is OpenDB's own definition, not an approximation of it.
+///
+/// ⚠️ Derived rather than read, because the bindings expose no `getRoutingLevel`. It is correct
+/// only while `nth_layer_name` yields tech order; [`routing_level_sanity`] states what a caller
+/// must check on a real technology before trusting it.
+pub fn routing_levels(layers: &[(String, String)]) -> std::collections::HashMap<String, i32> {
+    let mut out = std::collections::HashMap::new();
+    let mut level = 0;
+    for (name, ty) in layers {
+        if ty.eq_ignore_ascii_case("ROUTING") {
+            level += 1;
+            out.insert(name.clone(), level);
+        }
+    }
+    out
+}
+
+/// Does a derived routing-level map look like a real technology's?
+///
+/// 🔑 **A derivation needs a witness.** Levels must start at 1 and be contiguous — a map that
+/// skips a number means `nth_layer_name` did not give tech order, and every `blocked_layers` bit
+/// computed from it would be off by that much, silently.
+pub fn routing_level_sanity(levels: &std::collections::HashMap<String, i32>) -> Result<(), String> {
+    if levels.is_empty() {
+        return Err("no ROUTING layers in the technology".into());
+    }
+    let mut seen: Vec<i32> = levels.values().copied().collect();
+    seen.sort_unstable();
+    for (i, &l) in seen.iter().enumerate() {
+        if l != i as i32 + 1 {
+            return Err(format!("routing levels are not contiguous from 1: got {seen:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// `Node::addUsedLayer` — the layer bitmask a master's pins occupy.
+///
+/// ⛔ **Transcribed, including both surprises:**
+///
+/// - ROUTING layers **only**, and only those with `routing_level <= 3`. A pin on M4 contributes
+///   nothing, so this is about the low layers a power strap could collide with.
+/// - each qualifying layer sets **TWO** bits, `level` and `level + 1` — upstream's comment says
+///   "for via access from above". So a master with an M1 pin reads as using M1 AND M2.
+///
+/// ⚠️ The `<= 3` test is on the layer's own level, applied BEFORE the `+1`, so an M3 pin sets
+/// bit 4 even though nothing on level 4 is ever tested against it.
+pub fn used_layers(pin_layer_levels: impl Iterator<Item = i32>) -> u32 {
+    let mut mask = 0u32;
+    for level in pin_layer_levels {
+        if level > 3 {
+            continue;
+        }
+        mask |= 1 << level;
+        mask |= 1 << (level + 1);
+    }
+    mask
+}
+
+/// Does a special-wire box contribute to `pixel.blocked_layers`?
+///
+/// `Grid::markBlocked`, transcribed: ROUTING layers with `1 < level <= 3` — so **M2 and M3 only**,
+/// M1 explicitly excluded — and ⛔ **only wires that are not HORIZONTAL**, because a horizontal
+/// strap runs along a row rather than across it.
+///
+/// ⚠️ `odb::Rect::getDir()` is horizontal when the box is WIDER than it is tall; a square box is
+/// therefore not horizontal and does block. Transcribed as-is rather than tidied — the boundary
+/// case is upstream's.
+pub fn blocks_layer(routing_level: i32, w: i64, h: i64) -> bool {
+    if routing_level <= 1 || routing_level > 3 {
+        return false;
+    }
+    // `getDir() == horizontal` ⟺ width > height.
+    w <= h
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    fn tech() -> Vec<(String, String)> {
+        [("li1", "ROUTING"), ("mcon", "CUT"), ("met1", "ROUTING"), ("via", "CUT"),
+         ("met2", "ROUTING"), ("via2", "CUT"), ("met3", "ROUTING")]
+            .iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    #[test]
+    fn cut_layers_do_not_consume_a_routing_level() {
+        let l = routing_levels(&tech());
+        assert_eq!(l["li1"], 1);
+        assert_eq!(l["met1"], 2);
+        assert_eq!(l["met3"], 4);
+        assert!(!l.contains_key("mcon"), "a CUT layer has no routing level");
+        assert!(routing_level_sanity(&l).is_ok());
+    }
+
+    #[test]
+    fn a_gap_in_the_levels_is_reported_not_used() {
+        // ⛔ The failure this guard exists for: levels that did not come from tech order.
+        let mut l = std::collections::HashMap::new();
+        l.insert("met1".to_string(), 1);
+        l.insert("met3".to_string(), 3);
+        assert!(routing_level_sanity(&l).is_err(), "1,3 is not contiguous");
+        assert!(routing_level_sanity(&std::collections::HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn a_pin_sets_its_own_level_and_the_one_above() {
+        // ⚠️ "for via access from above" — one pin, two bits.
+        assert_eq!(used_layers([1].into_iter()), (1 << 1) | (1 << 2));
+        assert_eq!(used_layers([3].into_iter()), (1 << 3) | (1 << 4));
+    }
+
+    #[test]
+    fn a_pin_above_level_three_contributes_nothing() {
+        assert_eq!(used_layers([4].into_iter()), 0);
+        assert_eq!(used_layers([4, 9].into_iter()), 0);
+        // ⚠️ And it does not suppress the others in the same master.
+        assert_eq!(used_layers([4, 2].into_iter()), (1 << 2) | (1 << 3));
+    }
+
+    #[test]
+    fn only_vertical_m2_and_m3_special_wires_block() {
+        assert!(blocks_layer(2, 100, 900), "vertical M2 strap blocks");
+        assert!(blocks_layer(3, 100, 900), "vertical M3 strap blocks");
+        assert!(!blocks_layer(2, 900, 100), "a HORIZONTAL strap runs along a row: no block");
+        assert!(!blocks_layer(1, 100, 900), "M1 is excluded by `level <= 1`");
+        assert!(!blocks_layer(4, 100, 900), "M4 is excluded by `level > 3`");
+    }
+
+    #[test]
+    fn a_square_wire_box_is_not_horizontal() {
+        // ⚠️ `getDir()` is horizontal only when WIDER than tall, so a square blocks. Upstream's
+        // boundary, kept rather than tidied.
+        assert!(blocks_layer(2, 500, 500));
+    }
+}

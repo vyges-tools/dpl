@@ -1496,6 +1496,25 @@ mod tests {
     }
 
     #[test]
+    fn the_clamp_is_in_grid_units_not_dbu() {
+        // ⛔ **The units contract of `init_position`, pinned.** `width`/`height` are SITES and
+        // ROWS; the clamp is `grid_w - width`, `grid_h - height`. Passing DBU makes both bounds
+        // negative, `.max(0)` collapses them to `clamp(0, 0)`, and every cell reports a start of
+        // (0, 0) — after which `targetCost` measures displacement from the core's bottom-left
+        // corner and drags the design there.
+        //
+        // ⚠️ Measured on `fragmented_row04` (FreePDK45, site 380, grid 32x4): the DEF places
+        // `_277_` at (8360, 5600) and we reported `init_grid [0, 0]`.
+        let row_y = [0, 2800, 5600, 8400, 11200];
+        let grid_units = init_position(8360, 5600, 3800, 2800, 380, &row_y, 4, 1, 32, 4);
+        assert_eq!(grid_units, (12, 1), "site 12 of row 1, which is where the DEF puts it");
+
+        // The same call with the master's DBU footprint — the bug, kept as the witness.
+        let dbu = init_position(8360, 5600, 3800, 2800, 380, &row_y, 1520, 2800, 32, 4);
+        assert_eq!(dbu, (0, 0), "DBU collapses both clamps: this is what the bug looked like");
+    }
+
+    #[test]
     fn the_order_does_not_depend_on_the_input_order() {
         let mk = || vec![k(0, 2, 2, 3), k(4, 1, 1, 1), k(4, 2, 1, 7), k(0, 2, 2, 0)];
         let (mut a, mut b) = (mk(), mk());
@@ -1735,12 +1754,18 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         if !mtype.contains("CORE") || !enters_model(&status, true) {
             continue;
         }
-        let (gx, gy) = init_position(
-            x as i64, y as i64, core.0 as i64, core.1 as i64, sw as i64,
-            &grid.row_y, w, h, gw, gh,
-        );
+        // ⛔ **`init_position` wants the footprint in GRID UNITS, not DBU**, because its clamp is
+        // `grid_w - width` and `grid_h - height`. Passing the master's DBU width and height makes
+        // both clamps negative, `.max(0)` turns them into `clamp(0, 0)`, and EVERY cell starts at
+        // site 0 of row 0 — which then makes `targetCost` pull the whole design to the core's
+        // bottom-left corner. Measured on `fragmented_row04`: the cell reported `init_grid
+        // [0, 0]` for an instance the DEF places at (8360, 5600), and landed at site 0.
         let cw = cell_width_in_sites(w as i64, sw as i64);
         let ch = grid.rows_spanned(y - core.1, h).max(1) as i32;
+        let (gx, gy) = init_position(
+            x as i64, y as i64, core.0 as i64, core.1 as i64, sw as i64,
+            &grid.row_y, cw, ch, gw, gh,
+        );
         // ⛔ Seeded where the cell IS. `init_x/init_y` are the same point and never move again —
         // `targetCost` measures displacement from them for the whole run.
         ngrid.add_usage(gx, gy, cw, ch, 1);
@@ -1916,6 +1941,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             y: ny + core.1,
             orient,
             moved: c.x != c.init_x || c.y != c.init_y,
+            init_grid: Some((c.init_x, c.init_y)),
         });
     }
     if !matches!(outcome, Outcome::Converged { .. }) {

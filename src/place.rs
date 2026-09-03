@@ -233,6 +233,14 @@ pub struct Placed {
     pub y: i32,
     pub orient: String,
     pub moved: bool,
+    /// Where the cell STARTED, in grid units (site column, row).
+    ///
+    /// 🔑 **Reported because the final position alone cannot be debugged.** A cell that ends at
+    /// site 0 is either a legalizer working from a start of 0 or one that dragged the cell across
+    /// the die, and those are different bugs. Measured 2026-09-02: `fragmented_row04` ended at
+    /// site 0 with `moved: false`, and only the start told us which.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub init_grid: Option<(i32, i32)>,
 }
 
 /// The result of a legalization run.
@@ -367,6 +375,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
                     y: ny + core.1,
                     orient,
                     moved: nx != m.x || ny != m.y,
+                    init_grid: None,
                 });
             }
             None => out.failures.push(m.name.clone()),

@@ -71,6 +71,8 @@ pub struct Grid {
     pub row_y: Vec<i32>,
     /// The orientation each grid row imposes on a cell placed in it.
     pub row_orient: Vec<String>,
+    /// Whether `mark_blocked_layers` found any special wire to record.
+    blocked_layers_populated: bool,
 }
 
 impl Grid {
@@ -149,8 +151,9 @@ impl Grid {
         }
 
         let mut g = Grid { core, site_width, row_count, row_site_count, pixels, row_sites, row_y,
-                           row_orient };
+                           row_orient, blocked_layers_populated: false };
         g.mark_blocked(db);
+        g.mark_blocked_layers(db);
         Ok(g)
     }
 
@@ -175,6 +178,57 @@ impl Grid {
                 }
             }
         }
+    }
+
+    /// `Grid::markBlocked`'s second half — the `blocked_layers` bitmask, from SPECIAL nets.
+    ///
+    /// ⛔ **A different thing from `mark_blocked` above, despite sharing upstream's function.**
+    /// That one invalidates squares under hard blockages; this one records WHICH low routing
+    /// levels a power strap crosses, so `checkBlockedLayers` can refuse a cell whose pins need
+    /// one of them. A square with `blocked_layers` set is still perfectly valid for a cell that
+    /// does not use those levels.
+    ///
+    /// ⚠️ Silently does nothing if the routing levels cannot be derived — and that is why
+    /// [`Grid::blocked_layer_status`] exists: a checker that reports "clean" from a mask that was
+    /// never populated is worse than one that says it could not check.
+    fn mark_blocked_layers(&mut self, db: &Db) {
+        let Ok(layers) = db.layers_with_direction() else { return };
+        let types: Vec<(String, String)> = layers
+            .iter()
+            .map(|(n, _)| (n.clone(), db.layer_get_type(n).unwrap_or_default()))
+            .collect();
+        let levels = crate::drc::routing_levels(&types);
+        if crate::drc::routing_level_sanity(&levels).is_err() {
+            return;
+        }
+        let Ok(boxes) = db.swire_boxes() else { return };
+        for (layer_no, x0, y0, x1, y1) in boxes {
+            let name = db.layer_name_by_number(layer_no);
+            let Some(&level) = levels.get(&name) else { continue };
+            if !crate::drc::blocks_layer(level, (x1 - x0) as i64, (y1 - y0) as i64) {
+                continue;
+            }
+            let (xlo, ylo, xhi, yhi) =
+                (x0 - self.core.0, y0 - self.core.1, x1 - self.core.0, y1 - self.core.1);
+            let gx0 = (xlo / self.site_width).max(0) as usize;
+            let gx1 = (((xhi + self.site_width - 1) / self.site_width).max(0) as usize)
+                .min(self.row_site_count);
+            for gy in self.grid_rows_covering(ylo, yhi) {
+                for gx in gx0..gx1 {
+                    self.pixels[gy][gx].blocked_layers |= 1 << level;
+                }
+            }
+            self.blocked_layers_populated = true;
+        }
+    }
+
+    /// Whether `blocked_layers` was actually populated, and from how many squares.
+    ///
+    /// 🔑 **A `checkBlockedLayers` pass over an empty mask is VACUOUS.** The caller reports the
+    /// count so a clean verdict can be told apart from a check that had nothing to look at.
+    pub fn blocked_layer_status(&self) -> (bool, usize) {
+        let n = self.pixels.iter().flatten().filter(|p| p.blocked_layers != 0).count();
+        (self.blocked_layers_populated, n)
     }
 
     /// Grid rows whose Y band intersects `[ylo, yhi)`, in core-relative DBU.
