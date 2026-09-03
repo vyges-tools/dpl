@@ -1836,27 +1836,55 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         masters.push(master.clone());
     }
 
-    // The three closures the sweep needs, bound to this database.
-    let row_has = |r: i32| r >= 0 && r < gh && grid.pixel(0, r as i64).is_some();
+    // The closures the sweep needs, bound to this database.
+    //
+    // ⚠️ `row_has_sites_` is "some square in this row has capacity", which is the NegGrid's
+    // question, not "a pixel exists there".
+    //
+    // 🔑 Snapshotted rather than queried: `buildGrid` fixes capacity and the sweep only ever
+    // changes USAGE, so this cannot go stale — and a closure holding the grid would stop the
+    // sweep borrowing it mutably.
+    let row_has_sites: Vec<bool> = (0..gh).map(|r| ngrid.row_has_sites(r)).collect();
+    let row_has = |r: i32| r >= 0 && (r as usize) < row_has_sites.len()
+                           && row_has_sites[r as usize];
     // ⚠️ Geometry is copied out so the closures below do not borrow `cells` — the sweep needs it
     // mutably. The dimensions never change during a run, so the copy cannot go stale.
     let dims: Vec<(i32, i32)> = cells.iter().map(|c| (c.width, c.height)).collect();
-    // `isValidRow`'s power guard. ⛔ **Multi-row cells only** — upstream tests
-    // `node->getMaster()->isMultiRow()` before calling `checkRowPowerCompatible`, and
-    // `powerCompatible`'s single-height branch returns `true` unconditionally anyway.
     let power = PowerModel::build(db, &grid, &levels);
+
+    // `isValidRow`, transcribed. ⛔ **The site map is consulted at the BOTTOM ROW and at the
+    // cell's own x — once, not over the footprint.** Upstream calls
+    // `getSiteOrientation(gridX, rowIdx, site)` with exactly those two coordinates; the rows
+    // above only have to have SOME sites, and the columns to the right are not asked at all.
+    //
+    // 🔑 That is not a gap in upstream, because full-footprint validity arrives by another
+    // route: `buildGrid` sets `capacity = is_valid ? 1 : 0` and `isCellLegal`'s final loop
+    // rejects any square with `capacity == 0`. Site identity and square usability are two
+    // different questions and upstream asks them in two different places.
+    //
+    // ⛔ Requiring the SITE at every square — which this did until 2026-09-02 — refuses cells
+    // upstream accepts, because a `dbRow` registers its site only at the grid row of its ORIGIN.
+    // A double-height row at y = 11200 puts `DoubleHeightSite` on grid row 4 and nothing on row
+    // 5, so a 2-row cell seated there failed the second row and was dropped.
+    // ⚠️ Measured on `multi_height_one_site_gap_disallow`: 2 of its 3 cells were reported as
+    // failures and left untouched at their input positions.
     let site_ok = |i: usize, x: i32, y: i32| -> bool {
         let (cw, ch) = dims[i];
-        if x < 0 || y < 0 || y >= gh || x + cw > gw {
+        // `rowIdx < 0 || rowIdx + cell.height > grid_h_`, plus our horizontal bound.
+        if x < 0 || y < 0 || y + ch > gh || x + cw > gw {
             return false;
         }
-        if !(0..ch).all(|dy| {
-            (0..cw).all(|dx| grid.site_valid_at((x + dx) as i64, (y + dy) as i64, &sites[i]))
-        }) {
+        // Every row the cell spans must have sites.
+        if !(0..ch).all(|dy| row_has(y + dy)) {
             return false;
         }
-        // ⚠️ Last, because the cheap geometric tests reject most candidates first — the ordering
-        // `isValidRow` uses.
+        // The bottom row must OFFER this cell's site, at this x.
+        if !grid.site_valid_at(x as i64, y as i64, &sites[i]) {
+            return false;
+        }
+        // ⬜ `checkMasterSym` belongs here and is not built.
+        // ⚠️ The power test is last: it is the expensive one, and upstream reaches it only for a
+        // multi-row master.
         ch <= 1 || power.compatible(&masters[i], y, ch)
     };
 
@@ -1995,16 +2023,14 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
             // geometry, the site name and the power rails are three different bugs and they all
             // read as "failed" without this.
             let (cw, ch) = (c.width, c.height);
-            let why = if c.x < 0 || c.y < 0 || c.y >= gh || c.x + cw > gw {
-                format!("off the grid at ({}, {}), grid is {gw}x{gh}", c.x, c.y)
-            } else if !(0..ch).any(|dy| (0..cw).any(|dx| {
-                grid.site_valid_at((c.x + dx) as i64, (c.y + dy) as i64, &sites[i])
-            })) {
-                format!("no square at ({}, {}) offers site `{}`", c.x, c.y, sites[i])
-            } else if ch > 1 && !power.compatible(&masters[i], c.y, ch) {
-                format!("power rails do not match row {} for a {ch}-row cell", c.y)
+            let why = if c.x < 0 || c.y < 0 || c.y + ch > gh || c.x + cw > gw {
+                format!("a {cw}x{ch} cell at ({}, {}) does not fit the {gw}x{gh} grid", c.x, c.y)
+            } else if let Some(r) = (0..ch).map(|dy| c.y + dy).find(|&r| !row_has(r)) {
+                format!("row {r} has no sites")
+            } else if !grid.site_valid_at(c.x as i64, c.y as i64, &sites[i]) {
+                format!("row {} does not offer site `{}` at x {}", c.y, sites[i], c.x)
             } else {
-                format!("part of the {cw}x{ch} footprint at ({}, {}) is off-site", c.x, c.y)
+                format!("power rails do not match row {} for a {ch}-row cell", c.y)
             };
             out.failures.push(format!("{}: {why}", c.name));
             continue;
