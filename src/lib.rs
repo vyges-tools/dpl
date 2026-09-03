@@ -14,6 +14,7 @@
 //! scoping estimate recorded before the source was read predicted the risk was "the `Grid`/
 //! `Padding` model rather than the search" — that is now confirmed rather than assumed.
 pub mod check;
+pub mod drc;
 pub mod grid;
 pub mod negotiate;
 pub mod place;
