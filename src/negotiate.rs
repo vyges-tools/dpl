@@ -208,6 +208,56 @@ impl NegGrid {
         }
     }
 
+    /// `Grid::paintPixel(cell, x, y)` — stamp this cell over its footprint.
+    ///
+    /// ⛔ **Unconditional, so a later painter OVERWRITES an earlier one.** Upstream writes
+    /// `pixel->cell = cell` with no test of what was there, which is what makes the slot lossy
+    /// under overlap. Refusing to overwrite would make our occupancy MORE complete than the
+    /// reference's and change what every `PlacementDRC` check sees.
+    ///
+    /// ℹ️ Padding reservations (`paintCellPadding`) are not stamped: this engine implements no
+    /// padding values, so the reserved band is empty. See `NOT_DONE`.
+    pub fn paint_cell(&mut self, idx: usize, x: i32, y: i32, w: i32, h: i32) {
+        for dy in 0..h {
+            for dx in 0..w {
+                let (gx, gy) = (x + dx, y + dy);
+                if gx < 0 || gy < 0 || gx as usize >= self.width || gy as usize >= self.height {
+                    continue;
+                }
+                self.pixels[gy as usize * self.width + gx as usize].cell = Some(idx);
+            }
+        }
+    }
+
+    /// `Grid::erasePixel(cell)` — clear this cell's stamp over its footprint.
+    ///
+    /// ⛔ **`if (pixel->cell == cell)` — a cell clears ONLY its own stamp.** Clearing the square
+    /// unconditionally would erase a co-located cell that upstream leaves in place; not testing
+    /// it at all would leave a stale stamp behind a cell that has moved. Both are wrong in a
+    /// direction the gate cannot see, because the difference only shows on shared squares.
+    pub fn erase_cell(&mut self, idx: usize, x: i32, y: i32, w: i32, h: i32) {
+        for dy in 0..h {
+            for dx in 0..w {
+                let (gx, gy) = (x + dx, y + dy);
+                if gx < 0 || gy < 0 || gx as usize >= self.width || gy as usize >= self.height {
+                    continue;
+                }
+                let p = &mut self.pixels[gy as usize * self.width + gx as usize];
+                if p.cell == Some(idx) {
+                    p.cell = None;
+                }
+            }
+        }
+    }
+
+    /// `pixel->cell` at a square, `None` off the grid or where nothing is stamped.
+    pub fn occupant(&self, x: i32, y: i32) -> Option<usize> {
+        if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height {
+            return None;
+        }
+        self.at(x as usize, y as usize).cell
+    }
+
     /// Total overuse across the grid — zero is what the negotiation converges to.
     pub fn total_overuse(&self) -> i32 {
         self.pixels.iter().map(|p| p.overuse()).sum()
@@ -225,6 +275,21 @@ pub struct NegPixel {
     pub hist_cost: f64,
     /// 1 for a usable square, 0 for a blockage or a fixed cell's footprint.
     pub capacity: i32,
+    /// `Pixel::cell` — WHICH cell is stamped here, or `None`.
+    ///
+    /// ⛔ **This is a different question from `usage > 0` and the two disagree under overlap.**
+    /// `usage` counts every cell claiming the square; this holds ONE index, the last painter's.
+    /// `PlacementDRC` reads this one — `checkPadding` tests `pixel->cell` and `checkOneSiteGap`
+    /// tests it for abutment — so a check driven off `usage` is answering a question upstream
+    /// never asks.
+    ///
+    /// ⚠️ **A ripped-up cell can therefore blank a square another cell still claims**, because
+    /// `erasePixel` clears the slot when it holds THIS cell and `usage` is decremented
+    /// separately. Upstream says so in `legalize`: *"overlapping cells share a single
+    /// pixel->cell slot; when one is ripped up, the other's presence is lost"*, and calls
+    /// `syncAllCellsToDplGrid` to repair it before counting violations. That lossiness is
+    /// behaviour, not a bug to improve on.
+    pub cell: Option<usize>,
 }
 
 impl NegPixel {
@@ -1078,6 +1143,65 @@ mod tests {
         assert_eq!(g.total_overuse(), 0);
     }
 
+    #[test]
+    fn a_later_painter_overwrites_the_occupancy_slot() {
+        // ⛔ `Grid::paintPixel` writes `pixel->cell = cell` with no test of what was there, so a
+        // square claimed by two cells remembers only the LAST one. Upstream depends on the
+        // lossiness: `legalize`'s own comment is "overlapping cells share a single pixel->cell
+        // slot; when one is ripped up, the other's presence is lost".
+        let mut g = NegGrid::build(4, 1, &|_, _| true);
+        g.paint_cell(0, 1, 0, 2, 1);
+        assert_eq!(g.occupant(1, 0), Some(0));
+        g.paint_cell(1, 1, 0, 2, 1);
+        assert_eq!(g.occupant(1, 0), Some(1), "the second painter wins the slot");
+    }
+
+    #[test]
+    fn a_cell_erases_only_its_own_stamp() {
+        // ⛔ `Grid::erasePixel` clears the slot under `if (pixel->cell == cell)`. Cell 0 painted
+        // first and cell 1 overwrote it, so cell 0's erase must leave the square alone — and
+        // cell 1's erase blanks it even though cell 0 is still there. Both halves are upstream.
+        let mut g = NegGrid::build(4, 1, &|_, _| true);
+        g.paint_cell(0, 1, 0, 1, 1);
+        g.paint_cell(1, 1, 0, 1, 1);
+        g.erase_cell(0, 1, 0, 1, 1);
+        assert_eq!(g.occupant(1, 0), Some(1), "cell 0 does not own the slot, so it clears nothing");
+        g.erase_cell(1, 1, 0, 1, 1);
+        assert_eq!(g.occupant(1, 0), None, "and the owner's erase blanks a square cell 0 claims");
+    }
+
+    #[test]
+    fn occupancy_and_usage_answer_different_questions() {
+        // 🔑 The reason `checkOneSiteGap` and `checkPadding` may not be driven off `usage`.
+        // After the owner is ripped up the square still carries a usage from the co-located
+        // cell, while `pixel->cell` reads empty — which is what upstream's DRC sees.
+        let mut g = NegGrid::build(4, 1, &|_, _| true);
+        for idx in [0, 1] {
+            g.add_usage(1, 0, 1, 1, 1);
+            g.paint_cell(idx, 1, 0, 1, 1);
+        }
+        g.add_usage(1, 0, 1, 1, -1);
+        g.erase_cell(1, 1, 0, 1, 1);
+        assert_eq!(g.at(1, 0).usage, 1, "cell 0 still claims the square");
+        assert_eq!(g.occupant(1, 0), None, "but the occupancy slot reads empty");
+    }
+
+    #[test]
+    fn the_re_sync_repairs_the_holes_and_repaints_fixed_last() {
+        // ⛔ `syncAllCellsToDplGrid` is three passes, not two: erase all, repaint all, then
+        // repaint the FIXED cells. Upstream's reason for the third is in the source — a movable
+        // cell painted over an endcap overwrites the slot and its next `erasePixel` clears the
+        // endcap, "making checkOneSiteGap blind to it".
+        let mut g = NegGrid::build(4, 1, &|_, _| true);
+        let cells = vec![sweep_cell("a", 1, 1), sweep_cell("b", 1, 1)];
+        let fixed: Vec<FixedPaint> = vec![(9, 1, 0, 1, 1)];
+        g.paint_cell(0, 1, 0, 1, 1);
+        g.erase_cell(0, 1, 0, 1, 1); // the hole a rip-up punches
+        assert_eq!(g.occupant(1, 0), None);
+        sync_all_cells_to_grid(&cells, &fixed, &mut g);
+        assert_eq!(g.occupant(1, 0), Some(9), "the fixed cell is repainted last and wins");
+    }
+
     fn window(seed: i32, quota: i32, scan: i32, grid_h: i32,
               usable: &dyn Fn(i32) -> bool) -> Vec<i32> {
         vertical_window_rows(seed, 1, grid_h, quota, scan, 2 * scan, true,
@@ -1241,7 +1365,7 @@ mod tests {
     }
 
     fn px(usage: i32) -> NegPixel {
-        NegPixel { usage, hist_cost: 1.0, capacity: 1 }
+        NegPixel { usage, hist_cost: 1.0, capacity: 1, cell: None }
     }
 
     #[test]
@@ -1461,6 +1585,7 @@ mod tests {
             window: &|_c, x, y| (-4, 4, vec![y; 1].into_iter().map(|_| y).collect()),
             placeable: &|c, x, _y| x >= 0 && x + c.width <= 8,
             drc_violations: &|_, _, _, _| 0,
+            fixed_paint: &[],
             max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
             max_disp_threshold: consts::MAX_DISP_THRESHOLD,
             drc_penalty: consts::DRC_PENALTY,
@@ -1481,6 +1606,7 @@ mod tests {
             placeable: &|_, x, _| (0..6).contains(&x),
             // Always dirty, wherever it sits.
             drc_violations: &|_, _, _, _| 1,
+            fixed_paint: &[],
             max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
             max_disp_threshold: consts::MAX_DISP_THRESHOLD,
             drc_penalty: consts::DRC_PENALTY,
@@ -1505,6 +1631,7 @@ mod tests {
             placeable: &|_, x, _| (0..6).contains(&x),
             // Only the bystander is dirty — the active cell is fine.
             drc_violations: &|c, _, _, _| i32::from(c.name == "bystander"),
+            fixed_paint: &[],
             max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
             max_disp_threshold: consts::MAX_DISP_THRESHOLD,
             drc_penalty: consts::DRC_PENALTY,
@@ -1528,6 +1655,7 @@ mod tests {
             window: &|_c, x, y| (-x, 3 - x, vec![y]),
             placeable: &|_, x, _| (0..4).contains(&x),
             drc_violations: &|_, _, _, _| 0,
+            fixed_paint: &[],
             max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
             max_disp_threshold: consts::MAX_DISP_THRESHOLD,
             drc_penalty: consts::DRC_PENALTY,
@@ -1553,6 +1681,7 @@ mod tests {
             window: &|_c, x, y| (-x, 3 - x, vec![y]),
             placeable: &|c, x, _| x >= 0 && x + c.width <= 4,
             drc_violations: &|_, _, _, _| 0,
+            fixed_paint: &[],
             max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
             max_disp_threshold: consts::MAX_DISP_THRESHOLD,
             drc_penalty: consts::DRC_PENALTY,
@@ -1675,10 +1804,45 @@ pub struct SweepCtx<'a> {
     /// the cell being placed — which is what upstream's `ripUp` (an `erasePixel` on the DPL
     /// grid) arranges before `findBestLocation` runs.
     pub drc_violations: &'a dyn Fn(&SweepCell, i32, i32, &NegGrid) -> i32,
+    /// Fixed-cell footprints, repainted into the occupancy map after every re-sync.
+    pub fixed_paint: &'a [FixedPaint],
     pub max_disp_multiplier: f64,
     pub max_disp_threshold: i64,
     pub drc_penalty: f64,
 }
+
+/// `syncAllCellsToDplGrid` — clear every movable cell from the occupancy map, repaint them all,
+/// then repaint the FIXED cells last.
+///
+/// ⛔ **The three passes are not interchangeable and the order is load-bearing.** Erasing and
+/// repainting in one pass would let a cell erased later blank a square an earlier cell had just
+/// claimed. Repainting fixed cells last is upstream's own fix, with its reason in the source: a
+/// movable cell painted over an endcap overwrites the slot, and *that cell's* next `erasePixel`
+/// then clears the endcap from the grid, "making `checkOneSiteGap` blind to it".
+///
+/// 🔑 **Why it is needed at all**: during a sweep, a ripped-up cell blanks squares a co-located
+/// cell still occupies (see [`NegPixel::cell`]). Upstream calls this before counting violations
+/// so the scan sees the true placement rather than the holes the sweep punched.
+pub fn sync_all_cells_to_grid(cells: &[SweepCell], fixed: &[FixedPaint], grid: &mut NegGrid) {
+    for (i, c) in cells.iter().enumerate() {
+        grid.erase_cell(i, c.x, c.y, c.width, c.height);
+    }
+    for (i, c) in cells.iter().enumerate() {
+        grid.paint_cell(i, c.x, c.y, c.width, c.height);
+    }
+    for &(idx, x, y, w, h) in fixed {
+        grid.paint_cell(idx, x, y, w, h);
+    }
+}
+
+/// A fixed cell in the occupancy map: `(index, x, y, width, height)` in grid units.
+///
+/// ⛔ **Fixed cells are carried separately because they are not in the sweep.** They never move,
+/// so nothing in `negotiation_iter` would place them — but `PlacementDRC` reads them through
+/// `pixel->cell` like any other occupant, and a checker blind to a macro or an endcap approves
+/// positions upstream refuses. Upstream keeps them in the same `cells_` vector behind a `fixed`
+/// flag; this engine's sweep vector holds movable cells only, so their footprints ride alongside.
+pub type FixedPaint = (usize, i32, i32, i32, i32);
 
 /// `negotiationIter` — one rip-up / re-place sweep over the active cells.
 ///
@@ -1716,6 +1880,20 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
     sort_by_negotiation_order(&mut keys);
 
     let drc_penalty = ctx.drc_penalty * (1.0 + iter as f64);
+    // ⚠️ **The sweep TRACE, and it is the only instrument that can settle an assignment.** Which
+    // cell ends up in which slot is decided by the sweep ORDER and by what `findBestLocation`
+    // returns for each cell in turn — neither of which any output artefact records. Upstream
+    // prints exactly this line from `negotiationIter` under
+    // `set_debug_level DPL negotiation 2`:
+    //
+    //     Negotiation iter {iter}, cell {name}, moves {n}, best location {x}, {y}
+    //
+    // ⛔ **The format is upstream's, character for character, so the two traces diff directly.**
+    // Reformatting it would mean writing a comparison script that can itself be wrong.
+    // `moves` counts cells actually swept (fixed and isolation-skipped cells do not increment
+    // it), which is upstream's `moves_count`.
+    let tracing = std::env::var_os("DPL_TRACE_NEGOTIATION").is_some();
+    let mut moves_count = 0;
     // ⚠️ Hoisted and reused across cells. It held one allocation per cell per iteration, which on
     // a design with thousands of active cells and hundreds of iterations is millions of them for
     // a buffer whose contents are discarded each time.
@@ -1733,6 +1911,10 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
         // 3. ⛔ Rip up FIRST. A cell still counted in `usage` competes with itself for its own
         //    square and the search will refuse to stay put.
         let c = cells[i].clone();
+        // ⛔ `ripUp` is `eraseCellFromDplGrid` THEN `addUsage(-1)` — both halves. The occupancy
+        // stamp has to go too, or `findBestLocation`'s DRC term sees the cell as still sitting
+        // where it was and refuses to put it back there.
+        ctx.grid.erase_cell(i, c.x, c.y, c.width, c.height);
         ctx.grid.add_usage(c.x, c.y, c.width, c.height, -1);
 
         // 4. Enumerate and score.
@@ -1775,8 +1957,21 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
         // 5. Place — even if nothing better was found, which restores the cell where it was.
         cells[i].x = best.2;
         cells[i].y = best.3;
+        // `place` is `addUsage(+1)` then `syncCellToDplGrid`, which is a `paintPixel`.
         ctx.grid.add_usage(best.2, best.3, c.width, c.height, 1);
+        ctx.grid.paint_cell(i, best.2, best.3, c.width, c.height);
+        moves_count += 1;
+        if tracing {
+            eprintln!("Negotiation iter {}, cell {}, moves {}, best location {}, {}",
+                      iter, c.name, moves_count, best.2, best.3);
+        }
     }
+
+    // 5b. ⛔ **Re-sync before counting.** The sweep above punches holes in the occupancy map:
+    // ripping up a cell blanks squares a co-located cell still claims, and every DRC-driven
+    // count below reads that map. Upstream puts `syncAllCellsToDplGrid()` exactly here, with
+    // the reason in its own comment — "leaving bystander cells invisible to DRC checks".
+    sync_all_cells_to_grid(cells, ctx.fixed_paint, ctx.grid);
 
     // 6. Count what is left. ⛔ **NOT `grid.total_overuse()`.**
     //
@@ -1971,6 +2166,10 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     let mut cells: Vec<SweepCell> = Vec::new();
     let mut sites: Vec<String> = Vec::new();
     let mut masters: Vec<String> = Vec::new();
+    // ⛔ **The occupancy map needs the fixed cells too.** They are not in the sweep — nothing
+    // moves them — but `PlacementDRC` reads every occupant through `pixel->cell`, so leaving
+    // them out makes each check blind to exactly the obstacles that matter most.
+    let mut fixed_boxes: Vec<(i32, i32, i32, i32)> = Vec::new();
     for i in 0..db.num_insts() {
         let name = db.nth_inst_name(i);
         let master = db.inst_master(&name);
@@ -1983,6 +2182,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         if fixed {
             let (x0, y0, x1, y1) = grid.covering(x - core.0, y - core.1, w, h);
             ngrid.blockade(x0 as i32, y0 as i32, (x1 - x0 + 1) as i32, (y1 - y0 + 1) as i32);
+            fixed_boxes.push((x0 as i32, y0 as i32, (x1 - x0 + 1) as i32, (y1 - y0 + 1) as i32));
             continue;
         }
         if !mtype.contains("CORE") || !enters_model(&status, true) {
@@ -2012,6 +2212,17 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
         sites.push(db.master_get_site(&master));
         masters.push(master.clone());
     }
+
+    // Indices past the movable cells, so `pixel->cell` names exactly one occupant either way.
+    let fixed_paint: Vec<FixedPaint> = fixed_boxes
+        .iter()
+        .enumerate()
+        .map(|(k, &(x, y, w, h))| (cells.len() + k, x, y, w, h))
+        .collect();
+    // `syncAllCellsToDplGrid` — the seeding call `legalize` makes right after `addUsage`, before
+    // the first legality scan. ⛔ Without it the map is empty and every DRC check passes
+    // vacuously on the first pass.
+    sync_all_cells_to_grid(&cells, &fixed_paint, &mut ngrid);
 
     // The closures the sweep needs, bound to this database.
     //
@@ -2088,7 +2299,11 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
                 if px < 0 || py < 0 || px as usize >= g.width || py as usize >= g.height {
                     None // off the grid
                 } else {
-                    Some(g.at(px as usize, py as usize).usage > 0)
+                    // ⛔ **`pixel->cell`, not `usage > 0`.** `checkOneSiteGap`'s `isAbutted` and
+                    // `cellAtSite` both test the occupancy slot, and the two answers diverge on
+                    // a shared square: rip-up clears the slot while `usage` still counts the
+                    // co-located cell. Reading usage reports an abutment upstream does not see.
+                    Some(g.occupant(px, py).is_some())
                 }
             })
     };
@@ -2204,6 +2419,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
                 let mut ctx = SweepCtx {
                     grid: &mut ngrid, window: &window, placeable: &placeable,
                     drc_violations: &drc,
+                    fixed_paint: &fixed_paint,
                     max_disp_multiplier: consts::MAX_DISP_MULTIPLIER,
                     max_disp_threshold: consts::MAX_DISP_THRESHOLD,
                     drc_penalty: consts::DRC_PENALTY,
