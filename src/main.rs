@@ -5,11 +5,22 @@ use vyges_opendb::Db;
 
 /// The machine-readable contract `vyges mcp` and the docs generator read.
 ///
-/// ⛔ **`maturity` is `partial`, and that is the honest word.** Seven of upstream's nine check
-/// families are evaluated, and 35 of its 63 `detailed_placement` cases are outside what this
-/// engine implements at all. A descriptor that claimed otherwise would be the defect this suite
-/// has already hit twice — `pad` called five shipped commands "not implemented", `tap` said
-/// "NOTHING IS PLACED" after scoring 9 of 9.
+/// ⛔ **`maturity` has exactly THREE legal values** — `discovered`, `structured`,
+/// `workflow-validated` — and `partial`, which this said until 2026-09-02, is not one of them.
+/// `Maturity::parse` returns `None` for an unknown word and the JSON schema's `enum` rejects it,
+/// so an invalid maturity does not read as a modest claim: it degrades to `discovered`, where
+/// `can_assert()` is false and **the verdict is suppressed to `unknown` however well-formed the
+/// assertion is**. A word chosen to be humble silently threw the result away.
+///
+/// 🔑 **The rung describes the shape of the EVIDENCE, not feature completeness.** `structured` is
+/// "publishes a versioned operation and a normalized result"; `workflow-validated` additionally
+/// requires a pinned design in-repo that the test suite runs end to end and asserts against. This
+/// engine's correlation harness lives outside the repository, so `structured` is the honest rung.
+/// What is unbuilt goes in `provenance_limitations`, which is required and can carry nuance.
+///
+/// ⚠️ A descriptor that outlives the truth is this suite's recurring defect — `pad` called five
+/// shipped commands "not implemented", `tap` said "NOTHING IS PLACED" after scoring 9 of 9, and
+/// this one said legalization was unimplemented while it matched the reference on every case.
 ///
 /// ⚠️ **And it hit this engine too, in the OTHER direction**: this descriptor said
 /// *"`detailed_placement` (legalization) is NOT implemented ... never makes one legal"* while
@@ -21,7 +32,7 @@ const DESCRIBE: &str = r#"{
   "openroad_pin": "945a9f48dc6e5cc91d865daa92c45a1094cb682c",
   "name": "dpl",
   "summary": "detailed placement: legality checking and legalization over the design database",
-  "maturity": "partial",
+  "maturity": "structured",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
     "LEGALIZATION is implemented and is the default path: the NEGOTIATION legalizer, which is what upstream's `detailed_placement` runs when `-use_diamond_legalizer` is absent. `--use-diamond-legalizer` selects the other one. The two produce DIFFERENT placements, so the report names which ran.",
@@ -423,15 +434,26 @@ mod descriptor_tests {
     }
 
     #[test]
-    fn maturity_is_partial_while_anything_is_unbuilt() {
-        // 🔑 The claim and the code have to move together: if BOTH lists empty, this fails and
-        // forces the maturity word to be revisited rather than left behind.
-        let unchecked = vyges_dpl::check::NOT_CHECKED.len();
-        let undone = vyges_dpl::negotiate::NOT_DONE.len();
-        if unchecked > 0 || undone > 0 {
-            assert_eq!(json()["maturity"], "partial",
-                       "{unchecked} check families and {undone} legalizer families are unbuilt, \
-                        so maturity is not `structured`");
+    fn maturity_is_one_of_the_three_legal_rungs() {
+        // ⛔ **The ladder is a closed enum**, and this test exists because the previous one
+        // asserted `partial` — a word that is not on it. `Maturity::parse` returns `None` for an
+        // unknown value and the consumer then treats the engine as `discovered`, where a verdict
+        // is suppressed to `unknown` however well-formed the assertion is. ⟹ **An invalid
+        // maturity is not a modest claim, it is a discarded result.**
+        let m = json()["maturity"].as_str().unwrap_or_default().to_string();
+        assert!(["discovered", "structured", "workflow-validated"].contains(&m.as_str()),
+                "`{m}` is not a legal maturity; an unrecognised one degrades to `discovered` \
+                 and suppresses the verdict");
+        // 🔑 And the rung must not overstate the EVIDENCE. `workflow-validated` requires a pinned
+        // design in-repo that the suite runs end to end and asserts against; this engine's
+        // correlation harness lives elsewhere, so claiming it here would be false.
+        assert_ne!(m, "workflow-validated",
+                   "no in-repo end-to-end fixture asserts against a pinned golden");
+        // ⚠️ What is UNBUILT belongs in the limitations, not in the rung — and it must be there.
+        let unbuilt = vyges_dpl::check::NOT_CHECKED.len() + vyges_dpl::negotiate::NOT_DONE.len();
+        if unbuilt > 0 {
+            assert!(!json()["provenance_limitations"].as_array().unwrap().is_empty(),
+                    "{unbuilt} families are unbuilt and the descriptor states no limitation");
         }
     }
 
