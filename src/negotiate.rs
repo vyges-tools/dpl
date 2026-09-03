@@ -75,6 +75,20 @@ pub fn status_is_fixed(placement_status: &str) -> bool {
     matches!(placement_status, "LOCKED" | "FIRM" | "COVER")
 }
 
+/// `Node::isStdCell` — `dbInst::isCore() || dbInst::isEndCap()`.
+///
+/// ⛔ **This is the gate on the WRITE-BACK, not on the model.** `updateDbInstLocations` moves a
+/// node only `if (!cell->isFixed() && cell->isStdCell())`, so a macro that the negotiation
+/// legalizer swept — and it does sweep placed-but-not-fixed macros — never reaches the database.
+///
+/// 🔑 **Which is how upstream reconciles two things that look contradictory**: `initFromDb` reads
+/// the dbInst's status and calls the macro movable, while `dbToOpendp` warns DPL-404 and sets the
+/// NETWORK node fixed. The macro is negotiated and its answer is then discarded. ⟹ A cell being
+/// in the sweep and a cell being written back are two different questions.
+pub fn is_std_cell(master_type: &str) -> bool {
+    master_type.starts_with("CORE") || master_type.starts_with("ENDCAP")
+}
+
 /// A cell's width in SITES — `initFromDb`'s sizing.
 ///
 /// ⛔ **`round(width / site_width)`, floored at 1 — NOT `divCeil`.** `Grid::gridWidth` uses
@@ -1034,6 +1048,19 @@ mod tests {
                   "COVER", "COVER_BUMP", "RING", "PAD", "PAD_AREAIO", "PAD_INPUT", "PAD_OUTPUT",
                   "PAD_INOUT", "PAD_POWER", "PAD_SPACER", "SOMETHING_NEW"] {
             assert!(!is_core_auto_placeable(t), "{t} is not placeable upstream");
+        }
+    }
+
+    #[test]
+    fn the_write_back_covers_std_cells_and_endcaps_only() {
+        // ⛔ `Node::isStdCell` is `isCore() || isEndCap()`, and `updateDbInstLocations` gates on
+        // it. A macro is SWEPT and then its answer is discarded — being in the model and being
+        // written back are two different questions.
+        for t in ["CORE", "CORE_WELLTAP", "CORE_SPACER", "ENDCAP", "ENDCAP_LEF58_TOPEDGE"] {
+            assert!(is_std_cell(t), "{t} is written back");
+        }
+        for t in ["BLOCK", "BLOCK_BLACKBOX", "BLOCK_SOFT", "PAD", "COVER", "RING"] {
+            assert!(!is_std_cell(t), "{t} is not, however it was negotiated");
         }
     }
 
@@ -2678,7 +2705,15 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
     };
 
     // 6. Sync back.
+    //
+    // ⛔ **`updateDbInstLocations` writes only `!isFixed() && isStdCell()`.** A swept macro's new
+    // position is computed and then thrown away, so writing it back moves an instance upstream
+    // leaves alone — measured on `macro_placed_not_fixed`, where the macro drifted from
+    // (20000, 20000) to (19760, 19600) purely by being snapped to the site grid.
     for (i, c) in cells.iter().enumerate() {
+        if !is_std_cell(&cell_types[i]) {
+            continue;
+        }
         if !site_ok(i, c.x, c.y) {
             // ⛔ **Say WHICH test refused it.** A failure list of bare names cannot be debugged:
             // geometry, the site name and the power rails are three different bugs and they all
