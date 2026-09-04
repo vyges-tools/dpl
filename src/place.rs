@@ -231,7 +231,9 @@ pub struct Placed {
     /// ABSOLUTE DBU, ready to write back — core offset already added.
     pub x: i32,
     pub y: i32,
-    pub orient: String,
+    /// `None` = leave the instance's orientation alone; upstream sets it only when the site
+    /// actually offers one (`if (orient.has_value())` in `commitNegotiationPosToDpl`).
+    pub orient: Option<String>,
     pub moved: bool,
     /// Where the cell STARTED, in grid units (site column, row).
     ///
@@ -393,7 +395,7 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
                 let nx = px as i32 * grid.site_width;
                 let ny = grid.row_y[py as usize];
                 grid.paint(nx, ny, m.w, m.h, true);
-                let orient = grid.site_orient_at(px, py, &m.site).unwrap_or_else(|| "R0".into());
+                let orient = Some(grid.site_orient_at(px, py, &m.site).unwrap_or_else(|| "R0".into()));
                 out.placed.push(Placed {
                     name: m.name.clone(),
                     x: nx + core.0,

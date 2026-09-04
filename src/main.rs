@@ -313,8 +313,10 @@ fn legalize(args: &[String]) -> ExitCode {
             //
             // ⚠️ The `tap` engine hit this exact bug: its applier was right about where cells go
             // and wrong about the order it wrote them in.
-            if db.inst_get_orient(&p.name) != p.orient {
-                let _ = db.set_inst_orient(&p.name, &p.orient);
+            if let Some(orient) = &p.orient {
+                if db.inst_get_orient(&p.name) != *orient {
+                    let _ = db.set_inst_orient(&p.name, orient);
+                }
             }
             if db.inst_location(&p.name) != (p.x, p.y) {
                 if let Err(e) = db.set_inst_location(&p.name, p.x, p.y) {

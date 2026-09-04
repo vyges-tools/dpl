@@ -2058,6 +2058,42 @@ mod tests {
     }
 
     #[test]
+    /// `fragmented_row03`, cell `_277_`, at pin `7d490b8` — the reference's own numbers.
+    ///
+    /// The design has two one-site rows at DBU 28000 and 34460 with a 6080-DBU gap between them,
+    /// and a BUF_X4 sitting in the gap at x = 31230. No site can hold it: both engines fail the
+    /// placement and the golden carries `DPL-0004 Placed in rows check failed (1)`.
+    ///
+    /// ⛔ **Upstream still MOVES it, to 31420.** `gridRoundX(31230 - 28000) = divRound(3230, 380)
+    /// = round(8.5) = 9`, and `commitNegotiationPosToDpl` writes `9 * 380 = 3420` core-relative
+    /// with no legality guard, so `updateDbInstLocations` writes 28000 + 3420. Upstream's own
+    /// trace agrees: *"Diamond search _277_ (9, 0) bounds (0-17, 0-0)"* — it is working in grid
+    /// coordinates, and site 9 is where the cell already is as far as the legalizer is concerned.
+    ///
+    /// ⚠️ We wrote back 31230 — the raw input — because the sync-back `continue`d on an illegal
+    /// site. That is the same answer ONLY when the input was already on-grid; here the entry snap
+    /// had rounded it by exactly half a site, and half a site is what we lost.
+    #[test]
+    fn an_unplaceable_cell_is_written_at_its_snapped_position_not_its_input() {
+        // Row 0 sits at the core origin, so `row_y` is core-relative zero.
+        let core = (28000, 28000);
+        let got = committed_position(9, 0, 380, &[0], core).expect("row 0 exists");
+        assert_eq!(got, (31420, 28000), "the reference's golden position for _277_");
+
+        // ⚠️ The probe must be able to FAIL: the input position is a DIFFERENT number, so a
+        // sync-back that leaves an unplaceable cell alone cannot pass this.
+        assert_ne!(got.0, 31230, "31230 is the raw input, which is what the bug wrote");
+        assert_eq!(got.0 - 31230, 190, "exactly half of the 380-DBU site");
+    }
+
+    /// `gridRoundX` is `divRound`, and `divRound(a, b) = round(double(a) / b)` — `std::round`,
+    /// which breaks a tie AWAY FROM ZERO. 8.5 sites must go to 9, not to 8.
+    #[test]
+    fn the_entry_snap_breaks_a_tie_upward() {
+        let (gx, _) = init_position(31230, 28000, 28000, 28000, 380, &[0], 6, 1, 100, 1);
+        assert_eq!(gx, 9, "round(8.5) is 9 away from zero, not 8");
+    }
+
     fn unplaced_and_non_core_instances_stay_out_of_the_model() {
         assert!(enters_model("PLACED", true));
         assert!(enters_model("FIRM", true));
@@ -3077,6 +3113,31 @@ impl Default for Options {
 /// 5. [`run_negotiation`] — two phases, [`negotiation_iter`] per iteration, history updated
 ///    after each, diamond recovery on a 3-iteration stall;
 /// 6. sync back: grid units → absolute DBU, ⚠️ **orientation from the row landed in**.
+/// Where `commitNegotiationPosToDpl` writes a cell — **legal or not**.
+///
+/// ```text
+/// const int coreX = cell.x * site_width_;
+/// const int coreY = opendp_->grid_->gridYToDbu(GridY{cell.y}).v;
+/// cell.node->setLeft(DbuX(coreX));  cell.node->setBottom(DbuY(coreY));
+/// ```
+///
+/// ⛔ **There is no legality guard on that loop.** Every non-fixed cell carrying a node is
+/// committed at its GRID position, which is the position it was rounded to on entry by
+/// `gridRoundX`/`gridRoundY` — never the raw DBU it arrived with. `updateDbInstLocations` then
+/// adds the core origin and writes it to the database.
+///
+/// 🔑 So a cell the legalizer could not seat still MOVES, by however much the entry snap rounded
+/// it. Treating "could not place" as "leave it alone" is a divergence of up to half a site.
+///
+/// Returns `None` only when the row index has no `row_y` entry, which upstream cannot reach
+/// because `cell.y` is clamped into the grid at init.
+pub fn committed_position(
+    gx: i32, gy: i32, site_width: i32, row_y: &[i32], core: (i32, i32),
+) -> Option<(i32, i32)> {
+    let ny = *row_y.get(gy.max(0) as usize)?;
+    Some((gx * site_width + core.0, ny + core.1))
+}
+
 pub fn legalize(db: &Db) -> Result<Legalized, String> {
     legalize_with(db, Options::default())
 }
@@ -3792,17 +3853,39 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
                 format!("power rails do not match row {} for a {ch}-row cell", c.y)
             };
             out.failures.push(format!("{}: {why}", c.name));
-            continue;
+            // ⛔ **AND FALL THROUGH — the refusal decides the FAILURE LIST, not whether the cell
+            // is written.** `commitNegotiationPosToDpl` has no legality guard at all: it writes
+            // `coreX = cell.x * site_width_` for every non-fixed cell with a node, converged or
+            // not, and `updateDbInstLocations` then writes that to the database. So a cell the
+            // legalizer could not seat is still written at its SNAPPED grid position — the
+            // position it was rounded to on entry, never the raw one it arrived with.
+            //
+            // ⚠️ `continue`ing here left such a cell at its input DBU, which is only the same
+            // answer when the input was already on-grid. Measured on `fragmented_row03`, whose
+            // one cell cannot be placed at all because both rows are a single site wide and far
+            // away: input x = 31230, and `gridRoundX(31230 - 28000) = round(8.5) = 9`, so
+            // upstream writes 9 * 380 + 28000 = 31420 while we wrote back 31230 — half a site,
+            // the exact width of the rounding this guard was discarding.
+            //
+            // 🔑 Both engines correctly FAIL to place it: the golden carries `DPL-0004 Placed in
+            // rows check failed (1)` and DPL-0701's non-convergence. The divergence was never
+            // about legality, only about where an unplaceable cell is left.
         }
-        let nx = c.x * sw;
-        let ny = grid.row_y[c.y as usize];
-        let orient = grid
-            .site_orient_at(c.x as i64, c.y as i64, &sites[i])
-            .unwrap_or_else(|| "R0".into());
+        // ⚠️ A refused cell can sit on a row index with no `row_y` entry, so this must not index
+        // blindly; upstream's `gridYToDbu` is total over the grid's row range.
+        let Some((px, py)) = committed_position(c.x, c.y, sw, &grid.row_y, (core.0, core.1)) else {
+            continue;
+        };
+        // ⛔ **Orientation is set ONLY when the site HAS one**, matching
+        // `if (orient.has_value()) { cell.node->setOrient(orient.value()); }`. A cell sitting
+        // where no row offers its site has no site orientation, and upstream leaves the
+        // instance's own orientation alone — defaulting it to `R0` would rotate a cell the
+        // reference never touches.
+        let orient = grid.site_orient_at(c.x as i64, c.y as i64, &sites[i]);
         out.placed.push(Placed {
             name: c.name.clone(),
-            x: nx + core.0,
-            y: ny + core.1,
+            x: px,
+            y: py,
             orient,
             moved: c.x != c.init_x || c.y != c.init_y,
             init_grid: Some((c.init_x, c.init_y)),
