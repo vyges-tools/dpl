@@ -13,6 +13,15 @@
 //! why upstream runs the one-site-gap loop separately, afterwards, with a comment saying so. A
 //! scoping estimate recorded before the source was read predicted the risk was "the `Grid`/
 //! `Padding` model rather than the search" — that is now confirmed rather than assumed.
+//!
+//! **Filler insertion is not modelled, and is treated as ADDITIVE by every consumer.** Filling the
+//! row gaps only creates new instances — placed, oriented, connected to no signal net — and never
+//! moves, flips or reconnects an instance that was already there. Its effect downstream is therefore
+//! exactly the set of new instances: a routing result or guide set produced before it is unchanged
+//! by it, and a harness may skip it when the only thing scored is such a result. ⛔ That holds only
+//! while nothing AFTER it reads the placement: a later legalization, route or repair sees the
+//! fillers as occupied sites, so there it must be refused until it is modelled. A placement or DEF
+//! comparison after it is never unaffected.
 pub mod check;
 pub mod drc;
 pub mod grid;
