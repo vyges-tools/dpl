@@ -35,8 +35,12 @@ diamond search outward from each cell's own position — mirroring upstream's fl
 ⚠️ The two produce **different placements**, so the report says which one ran. Comparing one
 legalizer's output against the other's expected result measures nothing.
 
-⬜ Not implemented, and named in `not_done` on every run: groups and regions, placement padding
-values, incremental placement, and two of `countDRCViolations`' four terms — `checkEdgeSpacing`
+✅ **Placement padding** (`set_placement_padding` — global, per master, per instance, for the
+padded CORE classes only) is modelled on the negotiation path: `--padding-global L R`,
+`--padding-master M L R`, `--padding-inst I L R`, in sites. Padding lives in opendp's memory, not
+the database, so a caller that set it must pass it. With the diamond legalizer it is refused.
+
+⬜ Not implemented, and named in `not_done` on every run: groups and regions, incremental placement, and two of `countDRCViolations`' four terms — `checkEdgeSpacing`
 (needs each master's LEF58 cell-edge list) and `checkBlockedLayers`.
 
 ⚠️ **Nothing in the comparable corpus exercises those two DRC terms**, so their absence is
@@ -54,7 +58,7 @@ rows, padding, blocked layers and one-site gaps.
 | family | status |
 | --- | --- |
 | site alignment · placed · overlap · in rows | ✅ evaluated |
-| padding | ✅ evaluated, with **zero padding** — no `set_placement_padding` model, so only class-pair conflicts are caught |
+| padding | ✅ evaluated by `check-placement` with **zero padding** — the checker takes no padding values yet (the legalizer does), so only class-pair conflicts are caught |
 | blocked layers | ✅ evaluated where the design has a vertical M2/M3 special wire; where it has none the mask is empty and a pass would be vacuous, so it is reported as unchecked instead |
 | one-site gaps | ✅ evaluated when the technology has no one-site master — the condition upstream derives it from, not a user option |
 | region placement | ⬜ needs a region model |
@@ -65,6 +69,18 @@ order to be useful — and upstream's own suite leans on it harder: **77 of 92 `
 `check_placement`, 68 call `detailed_placement`**.
 
 ## Status
+
+At pin `da9f29f18b6487825aa880597176e0fa97110b31` (2026-09-22), with padding modelled:
+**33 of 35 comparable cases match** the reference component for component, the padding cases
+`pad01`, `pad04`, `pad05` and `pad06` among them. The two that do not:
+
+- `cell_on_block2` (padding `-right 4` over a macro with site-less channels): the sweep trace
+  agrees for **12,984 lines — 19 iterations** — and first differs on `_3757_`'s best location.
+  ⬜ Next: the reference's candidate costs for that one call.
+- `obstruction2`: an error-path case (`catch { detailed_placement }`), now seen by the harness;
+  it uses no padding, and this change leaves an unpadded run's grid bit for bit as it was.
+
+The earlier statement, kept for its history:
 
 ✅ **Legalization matches the reference on every comparable case in its own regression suite** —
 **28 of 28**, at pin `7d490b8ecd357199c0c0e9f3e32becd5eb507c34`.

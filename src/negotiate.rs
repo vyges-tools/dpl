@@ -407,12 +407,15 @@ pub struct NegCell {
 /// inert until something bumped it.
 ///
 /// ℹ️ **Footprint only — padding is left to `PlacementDRC`**, which knows both masters and can
-/// apply class-pair rules that a plain capacity cannot express.
+/// apply class-pair rules that a plain capacity cannot express. The capacity and usage never see
+/// padding; only the occupancy stamp (`cell`, `reserver`) does.
 pub struct NegGrid {
     pub width: usize,
     pub height: usize,
     pixels: Vec<NegPixel>,
     row_has_sites: Vec<bool>,
+    /// Each occupant's padding in sites, `(left, right)`, by occupant index. Missing is `(0, 0)`.
+    pub pads: Vec<(i32, i32)>,
 }
 
 impl NegGrid {
@@ -427,7 +430,7 @@ impl NegGrid {
                 p.hist_cost = 1.0;
             }
         }
-        let mut g = NegGrid { width, height, pixels, row_has_sites: vec![false; height] };
+        let mut g = NegGrid { width, height, pixels, row_has_sites: vec![false; height], pads: Vec::new() };
         g.recompute_rows();
         g
     }
@@ -495,8 +498,8 @@ impl NegGrid {
     /// under overlap. Refusing to overwrite would make our occupancy MORE complete than the
     /// reference's and change what every `PlacementDRC` check sees.
     ///
-    /// ℹ️ Padding reservations (`paintCellPadding`) are not stamped: this engine implements no
-    /// padding values, so the reserved band is empty. See `NOT_DONE`.
+    /// ⛔ **Then `paintCellPadding`: the `left` squares before the footprint and the `right` squares
+    /// after it, over the same rows, are RESERVED by this cell** — again unconditionally.
     pub fn paint_cell(&mut self, idx: usize, x: i32, y: i32, w: i32, h: i32) {
         for dy in 0..h {
             for dx in 0..w {
@@ -507,6 +510,28 @@ impl NegGrid {
                 self.pixels[gy as usize * self.width + gx as usize].cell = Some(idx);
             }
         }
+        let (left, right) = self.pad(idx);
+        for gx in (x - left..x).chain(x + w..x + w + right) {
+            for gy in y..y + h {
+                if gx < 0 || gy < 0 || gx as usize >= self.width || gy as usize >= self.height {
+                    continue;
+                }
+                self.pixels[gy as usize * self.width + gx as usize].reserver = Some(idx);
+            }
+        }
+    }
+
+    /// An occupant's padding, `(left, right)` in sites.
+    pub fn pad(&self, idx: usize) -> (i32, i32) {
+        self.pads.get(idx).copied().unwrap_or((0, 0))
+    }
+
+    /// `pixel->padding_reserved_by` at a square, `None` off the grid.
+    pub fn reserver(&self, x: i32, y: i32) -> Option<usize> {
+        if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height {
+            return None;
+        }
+        self.at(x as usize, y as usize).reserver
     }
 
     /// `Grid::erasePixel(cell)` — clear this cell's stamp over its footprint.
@@ -515,16 +540,23 @@ impl NegGrid {
     /// unconditionally would erase a co-located cell that upstream leaves in place; not testing
     /// it at all would leave a stale stamp behind a cell that has moved. Both are wrong in a
     /// direction the gate cannot see, because the difference only shows on shared squares.
+    ///
+    /// ⛔ **Over the PADDED span** (`gridCoveringPadded`: `left` squares before to `right` after),
+    /// clearing the occupancy AND the padding reservation where this cell holds them.
     pub fn erase_cell(&mut self, idx: usize, x: i32, y: i32, w: i32, h: i32) {
+        let (left, right) = self.pad(idx);
         for dy in 0..h {
-            for dx in 0..w {
-                let (gx, gy) = (x + dx, y + dy);
+            for gx in x - left..x + w + right {
+                let gy = y + dy;
                 if gx < 0 || gy < 0 || gx as usize >= self.width || gy as usize >= self.height {
                     continue;
                 }
                 let p = &mut self.pixels[gy as usize * self.width + gx as usize];
                 if p.cell == Some(idx) {
                     p.cell = None;
+                }
+                if p.reserver == Some(idx) {
+                    p.reserver = None;
                 }
             }
         }
@@ -570,6 +602,12 @@ pub struct NegPixel {
     /// `syncAllCellsToDplGrid` to repair it before counting violations. That lossiness is
     /// behaviour, not a bug to improve on.
     pub cell: Option<usize>,
+    /// `Pixel::padding_reserved_by` — the cell whose PADDING covers this square, or `None`.
+    ///
+    /// ⛔ **Last painter wins here too**, and a cell clears only its own reservation.
+    /// `PlacementDRC::checkPadding` reads it beside `cell`: a square nobody occupies can still be
+    /// in another cell's spacing.
+    pub reserver: Option<usize>,
 }
 
 impl NegPixel {
@@ -1982,7 +2020,7 @@ mod tests {
     }
 
     fn px(usage: i32) -> NegPixel {
-        NegPixel { usage, hist_cost: 1.0, capacity: 1, cell: None }
+        NegPixel { usage, hist_cost: 1.0, capacity: 1, cell: None, reserver: None }
     }
 
     #[test]
@@ -2393,6 +2431,37 @@ mod tests {
         };
         assert_eq!(run(false), 0, "without the term the tie goes to the nearer, OCCUPIED square");
         assert_eq!(run(true), 1, "with it the cell steps one site over, as upstream does");
+    }
+
+    #[test]
+    fn padding_is_reserved_beside_the_footprint_and_erased_with_it() {
+        // `paintPixel` = the footprint, then `paintCellPadding`: `left` squares before and
+        // `right` after, over the cell's rows. `erasePixel` clears over the PADDED span, but only
+        // what this cell holds — a neighbour's later reservation survives.
+        let mut g = NegGrid::build(10, 1, &|_, _| true);
+        g.pads = vec![(2, 1), (0, 0)];
+        g.paint_cell(0, 4, 0, 2, 1);
+        let reserved: Vec<Option<usize>> = (0..10).map(|x| g.reserver(x, 0)).collect();
+        assert_eq!(reserved, vec![None, None, Some(0), Some(0), None, None, Some(0), None, None, None]);
+        assert_eq!((g.occupant(4, 0), g.occupant(5, 0), g.occupant(3, 0)), (Some(0), Some(0), None));
+        // cell 1 paints over one of cell 0's padding squares: last painter wins the occupancy,
+        // and cell 0's reservation there is left as it was (a different slot)
+        g.paint_cell(1, 3, 0, 1, 1);
+        g.erase_cell(0, 4, 0, 2, 1);
+        assert_eq!((g.reserver(2, 0), g.reserver(3, 0), g.reserver(6, 0)), (None, None, None));
+        assert_eq!(g.occupant(3, 0), Some(1), "a cell clears only its own stamp");
+    }
+
+    #[test]
+    fn padding_applies_to_padded_types_only_instance_then_master_then_global() {
+        let mut p = Padding { global: (1, 2), ..Padding::default() };
+        p.masters.insert("BUF".into(), (3, 3));
+        p.insts.insert("u1".into(), (5, 0));
+        assert_eq!(p.of("u1", "BUF", "CORE"), (5, 0));
+        assert_eq!(p.of("u2", "BUF", "CORE"), (3, 3));
+        assert_eq!(p.of("u3", "INV", "CORE ANTENNACELL"), (1, 2));
+        assert_eq!(p.of("u1", "BUF", "ENDCAP"), (0, 0));
+        assert_eq!(p.of("m", "RAM", "BLOCK"), (0, 0));
     }
 
     fn sweep_cell(name: &str, x: i32, w: i32) -> SweepCell {
@@ -3047,9 +3116,6 @@ pub const NOT_DONE: &[&str] = &[
     // is still an UNDER-count — it never over-reports, but it will prefer a location upstream
     // would not.
     "drc: edge_spacing and blocked_layers are not evaluated by the legalizer",
-    // ⚠️ `checkPadding` runs, but with a padding of zero: `set_placement_padding` is unbuilt, so
-    // the scan is never widened and nothing ever reserves a square it does not occupy.
-    "padding values (set_placement_padding, padding_reserved_by)",
     // ⬜ `-incremental`: upstream clears `setPlaced(false)` on every movable cell unless it is
     // given. This engine has no per-cell `placed` flag, so the flag would be inert.
     "incremental placement (-incremental)",
@@ -3144,6 +3210,39 @@ pub fn legalize(db: &Db) -> Result<Legalized, String> {
 
 /// [`legalize`] with the tunables `detailed_placement` exposes.
 pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
+    legalize_padded(db, opts, &Padding::default())
+}
+
+/// `set_placement_padding`: opendp's `Padding`, in sites.
+///
+/// ⛔ **Instance, then master, then global — and only for a PADDED TYPE** (`isPaddedType`: the
+/// CORE classes, antenna cells and well taps included; endcaps, spacers, blocks, pads and covers
+/// never). It lives in `Opendp`'s memory, not in the database, so a caller that set it must pass
+/// it here.
+#[derive(Debug, Clone, Default)]
+pub struct Padding {
+    pub global: (i32, i32),
+    pub masters: std::collections::BTreeMap<String, (i32, i32)>,
+    pub insts: std::collections::BTreeMap<String, (i32, i32)>,
+}
+
+impl Padding {
+    /// `Padding::padLeft` / `padRight` of one instance.
+    pub fn of(&self, inst: &str, master: &str, master_type: &str) -> (i32, i32) {
+        if !is_padded_type(master_type) {
+            return (0, 0);
+        }
+        self.insts.get(inst).or_else(|| self.masters.get(master)).copied().unwrap_or(self.global)
+    }
+}
+
+/// `Padding::isPaddedType`.
+pub fn is_padded_type(master_type: &str) -> bool {
+    matches!(master_type, "CORE" | "CORE ANTENNACELL" | "CORE FEEDTHRU" | "CORE TIEHIGH" | "CORE TIELOW" | "CORE WELLTAP")
+}
+
+/// [`legalize_with`] with `set_placement_padding` in force.
+pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Legalized, String> {
     let grid = Grid::build(db)?;
     let core = grid.core;
     let (gw, gh) = (grid.row_site_count as i32, grid.row_count as i32);
@@ -3181,6 +3280,9 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
     // Master class per occupant, for the CR/WT/BL/SP pair rules `checkPadding` applies. Movable
     // cells first and the fixed ones after, so an index into this is an index in the map.
     let mut cell_types: Vec<String> = Vec::new();
+    // Each occupant's padding, movable first and fixed after — the same index space as the classes.
+    let mut cell_pads: Vec<(i32, i32)> = Vec::new();
+    let mut fixed_pads: Vec<(i32, i32)> = Vec::new();
     for i in 0..db.num_insts() {
         let name = db.nth_inst_name(i);
         let master = db.inst_master(&name);
@@ -3240,6 +3342,7 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
             // position, which for a fixed cell is where the DEF put it.
             fixed_boxes.push((x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32));
             fixed_types.push(mtype.clone());
+            fixed_pads.push(padding.of(&name, &master, &mtype));
             continue;
         }
         // ⛔ **`init_position` wants the footprint in GRID UNITS, not DBU**, because its clamp is
@@ -3276,6 +3379,7 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
         sites.push(db.master_get_site(&master));
         masters.push(master.clone());
         cell_types.push(mtype.clone());
+        cell_pads.push(padding.of(&name, &master, &mtype));
         sym.push((
             db.master_get_symmetry_x(&master),
             db.master_get_symmetry_y(&master),
@@ -3361,6 +3465,7 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
         .chain(fixed_types.iter())
         .map(|t| crate::drc::classify(t))
         .collect();
+    ngrid.pads = cell_pads.iter().chain(fixed_pads.iter()).copied().collect();
     // `syncAllCellsToDplGrid` — the seeding call `legalize` makes right after `addUsage`, before
     // the first legality scan. ⛔ Without it the map is empty and every DRC check passes
     // vacuously on the first pass.
@@ -3483,18 +3588,19 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
     // free the reference picks it, and with either a single- or a double-height cell on it the
     // reference steps one site over.
     //
-    // ℹ️ Padding VALUES are still not implemented — `set_placement_padding` cases are skipped —
-    // so the scan is never widened and `padding_reserved_by` is always empty. See `NOT_DONE`.
+    // ⛔ With `set_placement_padding` the scan is WIDENED by the cell's own padding, and a square
+    // another cell's padding reserves conflicts just as its footprint does (`padding_reserved_by`).
     let pad_ok = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
-        // `checkPadding` walks `x .. x + grid_->gridWidth(cell)`, widened by the padding.
+        // `checkPadding` walks `x - left .. x + grid_->gridWidth(cell) + right`.
         let (cw, ch) = dpl_dims[i];
+        let (left, right) = g.pad(i);
         crate::drc::check_padding(
-            x, x + cw, y, y + ch, 0, 0, classes[i],
+            x, x + cw, y, y + ch, left, right, classes[i],
             &|px, py| {
                 if px < 0 || py < 0 || px as usize >= g.width || py as usize >= g.height {
                     return None; // off the grid — the core edge, skipped rather than failed
                 }
-                Some((g.occupant(px, py).map(|o| (classes[o], o == i)), None))
+                Some((g.occupant(px, py).map(|o| (classes[o], o == i)), g.reserver(px, py).map(|o| (classes[o], o == i))))
             })
     };
 

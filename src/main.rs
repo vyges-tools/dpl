@@ -56,7 +56,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
     "LEGALIZATION is implemented and is the default path: the NEGOTIATION legalizer, which is what upstream's `detailed_placement` runs when `-use_diamond_legalizer` is absent. `--use-diamond-legalizer` selects the other one. The two produce DIFFERENT placements, so the report names which ran.",
-    "Correlated at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34: `detailed_placement` matches the reference on 28 of 28 comparable cases from its own regression suite, including aes (21340 components), ibex (34184) and gcd (549). The agreement is SWEEP-LEVEL, not final-placement only -- upstream's per-iteration debug trace and this engine's match line for line, every cell, every iteration, on simple05, simple07, gcd (574 lines) and hybrid_cells.",
+    "At pin da9f29f18b6487825aa880597176e0fa97110b31, with placement padding modelled, `detailed_placement` matches the reference on 33 of 35 comparable cases (cell_on_block2 first diverges after 12,984 agreeing sweep lines; obstruction2 is an error-path case). Earlier, at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34, it matched 28 of 28 comparable cases from its own regression suite, including aes (21340 components), ibex (34184) and gcd (549). The agreement is SWEEP-LEVEL, not final-placement only -- upstream's per-iteration debug trace and this engine's match line for line, every cell, every iteration, on simple05, simple07, gcd (574 lines) and hybrid_cells.",
     "It read 18 of 28 when the pin first moved from 945a9f48dc6e5cc91d865daa92c45a1094cb682c, because upstream reworked the negotiation legalizer's INITIAL SNAPPING across 7 commits and refreshed 24 of its own goldens. Four mechanisms were transcribed to recover it: `Grid::gridRoundX` (initial x ROUNDS to the nearest site rather than truncating), `displacementInSites`/`rowDispInSites` replacing the deleted `NegCell::displacement()` so displacement is site widths on BOTH axes, `initialSnap()`'s diamond search in place of a four-direction scan, and -- the one that mattered most -- running that snap as its OWN pass after every fixed cell is blockaded, testing grid CAPACITY rather than merely whether a site exists.",
     "BUT 35 of upstream's 63 `detailed_placement` cases are OUTSIDE that number and are not scored at all: 12 ship no golden, 8 need filler placement, 7 declare REGIONS/GROUPS, 7 need placement padding values, 1 needs both. `18 of 28` is a claim about what the corpus asks, not about every design.",
     "AND THE DENOMINATOR IS SHORT: upstream ships 69 .tcl cases calling `detailed_placement`, not 63. Five of them -- report_failures, fragmented_row03, pad02, fillers8, obstruction2 -- wrap the call as `catch { detailed_placement }`, so the harness's command filter does not see them and they are scored by nothing. All five are error-path cases.",
@@ -208,6 +208,7 @@ fn legalize(args: &[String]) -> ExitCode {
     // ⛔ Defaults are upstream's, in `negotiate::Options` — not repeated here, so there is one
     // place to be wrong about them.
     let mut opts = vyges_dpl::negotiate::Options::default();
+    let mut padding = vyges_dpl::negotiate::Padding::default();
     // `-max_displacement disp|{disp_x disp_y}`: ONE value sets both axes, two set them
     // separately. Upstream accepts a Tcl list; the shell equivalent is `X` or `X,Y`.
     let mut num = |i: &mut usize, what: &str| -> Option<String> {
@@ -225,6 +226,20 @@ fn legalize(args: &[String]) -> ExitCode {
             "--dry-run" => dry = true,
             "--use-diamond-legalizer" => diamond = true,
             "--disable-window-extension" => opts.disable_window_extension = true,
+            // set_placement_padding, which lives in opendp's memory and not in the database:
+            // --padding-global L R, --padding-master M L R, --padding-inst I L R (sites).
+            "--padding-global" | "--padding-master" | "--padding-inst" => {
+                let flag = args[i].clone();
+                let key = if flag == "--padding-global" { None } else { i += 1; args.get(i).cloned() };
+                let side = |k: usize| args.get(k).and_then(|v| v.parse::<i32>().ok());
+                match (side(i + 1), side(i + 2), key) {
+                    (Some(l), Some(r), None) => padding.global = (l, r),
+                    (Some(l), Some(r), Some(k)) if flag == "--padding-master" => { padding.masters.insert(k, (l, r)); }
+                    (Some(l), Some(r), Some(k)) => { padding.insts.insert(k, (l, r)); }
+                    _ => { eprintln!("vyges-dpl: {flag} needs [NAME] LEFT RIGHT (sites)"); bad = true; }
+                }
+                i += 2;
+            }
             "--max-displacement" => match num(&mut i, "--max-displacement") {
                 None => bad = true,
                 Some(v) => {
@@ -293,8 +308,13 @@ fn legalize(args: &[String]) -> ExitCode {
     };
     // ⚠️ The tunables belong to the NEGOTIATION legalizer — upstream's setters are on
     // `NegotiationLegalizer`, and `diamondDPL` reads only the displacement caps.
+    let padded = padding.global != (0, 0) || !padding.masters.is_empty() || !padding.insts.is_empty();
+    if diamond && padded {
+        eprintln!("vyges-dpl: placement padding with the diamond legalizer is not modelled");
+        return ExitCode::from(2);
+    }
     let res = match if diamond { vyges_dpl::place::legalize(&db) }
-                    else { vyges_dpl::negotiate::legalize_with(&db, opts) } {
+                    else { vyges_dpl::negotiate::legalize_padded(&db, opts, &padding) } {
         Ok(r) => r,
         Err(e) => { eprintln!("vyges-dpl: {e}"); return ExitCode::from(2); }
     };
