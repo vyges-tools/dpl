@@ -24,8 +24,10 @@
 //! is what `filler-placement` is for.
 pub mod check;
 pub mod drc;
+pub mod edges;
 pub mod fillers;
 pub mod grid;
+pub mod mirror;
 pub mod negotiate;
 pub mod network;
 pub mod place;

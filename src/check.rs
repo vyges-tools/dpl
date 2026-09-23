@@ -239,39 +239,14 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
             .collect();
         crate::drc::routing_levels(&types)
     };
-    // `checkEdgeSpacing`'s table and each master's edges (`makeCellEdgeSpacingTable`, `addMaster`).
-    // ⛔ An EMPTY table skips the check, as `hasCellEdgeSpacingTable` does.
-    let edge_table =
-        crate::drc::EdgeSpacingTable::build(&db.tech_cell_edge_spacing().unwrap_or_default());
-    let mut master_edges: std::collections::HashMap<String, (crate::drc::EdgeBox, Vec<(usize, crate::drc::EdgeBox)>)> =
-        std::collections::HashMap::new();
-    if let (false, Ok(g)) = (edge_table.is_empty(), grid.as_ref()) {
-        for (n, _, _) in &boxes {
-            let m = db.inst_master(n);
-            if master_edges.contains_key(&m) {
-                continue;
-            }
-            let b = db.master_placement_boundary(&m).unwrap_or_default();
-            let bbox = if b.len() == 4 { (b[0], b[1], b[2], b[3]) } else { (0, 0, 0, 0) };
-            let rows = g.grid_height(db.master_get_height(&m) as i32,
-                                     db.row_pattern(&db.master_get_site(&m)).map_or(0, |p| p.len()));
-            let spacer = crate::drc::is_core_spacer(&db.master_get_type(&m).unwrap_or_default());
-            let lef = db.master_edge_types(&m).unwrap_or_default();
-            let edges = crate::drc::master_edges(bbox, &lef, rows, &edge_table, spacer);
-            master_edges.insert(m, (bbox, edges));
-        }
-    }
-    // A cell's edges placed where it sits, in its own orientation — `adjustNodesOrient` gives every
-    // node its instance's orient, and a neighbour's edges are taken at `getLeft/getBottom`.
+    // `checkEdgeSpacing`'s model ([`crate::edges::EdgeModel`], shared with `optimize_mirroring`).
+    // A cell's edges are taken in its own orientation — `adjustNodesOrient` gives every node its
+    // instance's orient — and a neighbour's where it sits (`getLeft/getBottom/getOrient`).
+    let inst_masters: Vec<String> = boxes.iter().map(|(n, _, _)| db.inst_master(n)).collect();
+    // `None` exactly when no grid could be built — and then no `PlacementDRC` rule runs at all.
+    let edge_model = grid.as_ref().ok()
+        .map(|g| crate::edges::EdgeModel::build(db, g, inst_masters.iter().map(String::as_str)));
     let orients: Vec<String> = boxes.iter().map(|(n, _, _)| db.inst_get_orient(n)).collect();
-    let edges_at = |o: usize, x: i32, y: i32| -> Vec<(usize, crate::drc::EdgeBox)> {
-        let Some((bbox, edges)) = master_edges.get(&db.inst_master(&boxes[o].0)) else {
-            return Vec::new();
-        };
-        edges.iter()
-            .map(|&(t, e)| (t, crate::drc::transform_edge_rect(e, *bbox, &orients[o], x, y)))
-            .collect()
-    };
 
     // `checkRowPowerCompatible`'s model, as the legalizer builds it.
     let power = grid.as_ref().ok().map(|g| crate::negotiate::PowerModel::build(db, g, &levels));
@@ -438,24 +413,15 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
 
             // `checkEdgeSpacing(cell)` — at `gridX(cell)`, `gridRoundY(cell)`, the cell's orient;
             // against the cells painted BEFORE it. ⛔ After `paintCellPadding`, as upstream.
-            if !edge_table.is_empty() {
-                let (gx, gy) = (cx.div_euclid(g.site_width), g.grid_round_y(cy));
-                let (xr, yr) = (gx * g.site_width, g.row_y.get(gy).copied().unwrap_or(0));
-                let mine = edges_at(idx, xr, yr);
-                let sw = g.site_width;
-                let row_y = &g.row_y;
-                let ok = crate::drc::check_edge_spacing(
-                    &edge_table, idx, &mine,
-                    &|v| v.div_euclid(sw),
-                    &|v| (f64::from(v) / f64::from(sw)).ceil() as i32,
-                    &|v| row_y.iter().position(|&ry| ry >= v).unwrap_or(row_y.len()) as i32,
-                    &|px, py| g.pixel(px as i64, py as i64).and_then(|p| p.cell).map(|c| c as usize),
-                    &|o| edges_at(o, boxes[o].1.0 as i32 - g.core.0, boxes[o].1.1 as i32 - g.core.1),
-                );
-                if !ok {
-                    out.failures.push(Failure { family: "edge_spacing".into(), cell: name.clone(),
-                                                with: None });
-                }
+            let ok = edge_model.as_ref().map_or(true, |em| em.check(
+                g, idx, &inst_masters[idx], &orients[idx], cx, cy,
+                &|px, py| g.pixel(px as i64, py as i64).and_then(|p| p.cell).map(|c| c as usize),
+                &|o| em.edges_at(&inst_masters[o], &orients[o],
+                                 boxes[o].1.0 as i32 - g.core.0, boxes[o].1.1 as i32 - g.core.1),
+            ));
+            if !ok {
+                out.failures.push(Failure { family: "edge_spacing".into(), cell: name.clone(),
+                                            with: None });
             }
 
             let used = used_layers_of(db, name);

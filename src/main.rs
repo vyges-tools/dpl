@@ -56,7 +56,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
     "LEGALIZATION is implemented and is the default path: the NEGOTIATION legalizer, which is what upstream's `detailed_placement` runs when `-use_diamond_legalizer` is absent. `--use-diamond-legalizer` selects the other one. The two produce DIFFERENT placements, so the report names which ran.",
-    "At pin da9f29f18b6487825aa880597176e0fa97110b31, with placement padding modelled, `detailed_placement` matches the reference on 65 of 65 comparable cases -- a case with no archived golden is scored against a fresh reference run of its own flow -- including aes (21340 components), cases followed by `filler_placement` or `remove_fillers` and scored with them, and eight region (fence) designs on both legalizers. Skipped, and named: 3 whose input file is not in the reference checkout. Earlier, at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34, it matched 28 of 28 comparable cases from its own regression suite, including aes (21340 components), ibex (34184) and gcd (549). The agreement is SWEEP-LEVEL, not final-placement only -- upstream's per-iteration debug trace and this engine's match line for line, every cell, every iteration, on simple05, simple07, gcd (574 lines) and hybrid_cells.",
+    "At pin da9f29f18b6487825aa880597176e0fa97110b31, with placement padding modelled, `detailed_placement` matches the reference on 67 of 67 comparable cases -- a case with no archived golden is scored against a fresh reference run of its own flow -- including aes (21340 components), cases followed by `filler_placement` or `remove_fillers` and scored with them, eight region (fence) designs on both legalizers, and every `optimize_mirroring` case (mirror1-3 on gcd, 138-140 cells flipped; mirror_edge_spacing, where the edge-spacing rule vetoes a flip). Skipped, and named: the 9 cases that run only `improve_placement` (NOT implemented), and 3 whose input file is not in the reference checkout. Earlier, at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34, it matched 28 of 28 comparable cases from its own regression suite, including aes (21340 components), ibex (34184) and gcd (549). The agreement is SWEEP-LEVEL, not final-placement only -- upstream's per-iteration debug trace and this engine's match line for line, every cell, every iteration, on simple05, simple07, gcd (574 lines) and hybrid_cells.",
     "It read 18 of 28 when the pin first moved from 945a9f48dc6e5cc91d865daa92c45a1094cb682c, because upstream reworked the negotiation legalizer's INITIAL SNAPPING across 7 commits and refreshed 24 of its own goldens. Four mechanisms were transcribed to recover it: `Grid::gridRoundX` (initial x ROUNDS to the nearest site rather than truncating), `displacementInSites`/`rowDispInSites` replacing the deleted `NegCell::displacement()` so displacement is site widths on BOTH axes, `initialSnap()`'s diamond search in place of a four-direction scan, and -- the one that mattered most -- running that snap as its OWN pass after every fixed cell is blockaded, testing grid CAPACITY rather than merely whether a site exists.",
     "BUT 35 of upstream's 63 `detailed_placement` cases are OUTSIDE that number and are not scored at all: 12 ship no golden, 8 need filler placement, 7 declare REGIONS/GROUPS, 7 need placement padding values, 1 needs both. `18 of 28` is a claim about what the corpus asks, not about every design.",
     "AND THE DENOMINATOR IS SHORT: upstream ships 69 .tcl cases calling `detailed_placement`, not 63. Five of them -- report_failures, fragmented_row03, pad02, fillers8, obstruction2 -- wrap the call as `catch { detailed_placement }`, so the harness's command filter does not see them and they are scored by nothing. All five are error-path cases.",
@@ -117,6 +117,15 @@ const DESCRIBE: &str = r#"{
         { "arg": "out_odb", "flag": "--out-odb", "description": "write the database here" }
       ],
       "assertion": { "id": "fillers-removed", "field": "status", "pass_when": { "eq": "removed" } }
+    },
+    {
+      "name": "optimize-mirroring",
+      "summary": "flip placed cells about Y where that does not lengthen their nets",
+      "args_template": ["optimize-mirroring", "{odb}"],
+      "optional": [
+        { "arg": "out_odb", "flag": "--out-odb", "description": "write the database here" }
+      ],
+      "assertion": { "id": "mirroring-optimized", "field": "status", "pass_when": { "eq": "optimized" } }
     }
   ],
   "inputs": {
@@ -149,6 +158,7 @@ USAGE:
   vyges physical dpl detailed-placement <design.odb> [--out-odb FILE] [--dry-run] [OPTIONS]
   vyges physical dpl filler-placement   <design.odb> PATTERN... [--prefix P] [--out-odb FILE]
   vyges physical dpl remove-fillers     <design.odb> [--out-odb FILE]
+  vyges physical dpl optimize-mirroring <design.odb> [--out-odb FILE]
   vyges physical dpl --describe | --help | --version
 
 OPTIONS:
@@ -205,6 +215,7 @@ fn main() -> ExitCode {
         Some("detailed-placement") => legalize(&args[1..]),
         Some("filler-placement") => fill(&args[1..]),
         Some("remove-fillers") => remove_fillers(&args[1..]),
+        Some("optimize-mirroring") => optimize_mirroring(&args[1..]),
         // A diagnostic, not a command anyone should need in a flow.
         Some("grid-facts") => {
             let Some(p) = args.get(1) else { eprintln!("need <design.odb>"); return ExitCode::from(2) };
@@ -317,6 +328,54 @@ fn remove_fillers(args: &[String]) -> ExitCode {
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
         "tool": "vyges-dpl", "command": "remove-fillers", "status": "removed",
         "removed": removed.len(), "instances": removed,
+    })).expect("valid JSON"));
+    ExitCode::SUCCESS
+}
+
+/// `optimize_mirroring` — flip cells about Y where that does not lengthen their nets.
+fn optimize_mirroring(args: &[String]) -> ExitCode {
+    let (mut odb, mut out_odb) = (None, None);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out-odb" => { i += 1; out_odb = args.get(i).cloned(); }
+            a if odb.is_none() => odb = Some(a.to_string()),
+            a => {
+                eprintln!("vyges-dpl: optimize-mirroring: unexpected argument {a}\n\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = odb else {
+        eprintln!("vyges-dpl: optimize-mirroring needs <design.odb>\n\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let mut db = match Db::open(&path) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
+    };
+    let rep = match vyges_dpl::mirror::optimize_mirroring(&mut db) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("vyges-dpl: {e}"); return ExitCode::from(1); }
+    };
+    if !rep.mirrored.is_empty() {
+        eprintln!("[INFO DPL-0020] Mirrored {} instances", rep.mirrored.len());
+    }
+    if !rep.edge_spacing_rejected.is_empty() {
+        eprintln!("[INFO DPL-0024] Skipped {} instances that would violate cell edge spacing rules when mirrored",
+                  rep.edge_spacing_rejected.len());
+    }
+    if let Some(o) = out_odb.as_deref() {
+        if let Err(e) = db.write(o) {
+            eprintln!("vyges-dpl: cannot write {o}: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "tool": "vyges-dpl", "command": "optimize-mirroring", "status": "optimized",
+        "candidates": rep.candidates, "mirrored": rep.mirrored,
+        "edge_spacing_rejected": rep.edge_spacing_rejected,
     })).expect("valid JSON"));
     ExitCode::SUCCESS
 }
