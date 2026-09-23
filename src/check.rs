@@ -168,14 +168,14 @@ pub fn check_placement(db: &Db) -> Report {
     // ⚠️ Taking it as a caller-supplied option would be wrong in both directions: it would let a
     // caller demand the check on a technology where upstream does not apply it, and skip it where
     // upstream does. It is a property of the library, not a preference.
-    check_placement_opts(db, !db.has_one_site_master())
+    check_placement_opts(db, !db.has_one_site_master(), &crate::negotiate::Padding::default())
 }
 
 /// `check_placement` with the one-site-gap decision supplied.
 ///
 /// ℹ️ Exposed for tests, which need to exercise both settings on one design. Production callers
 /// want [`check_placement`], which derives it the way upstream does.
-pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool) -> Report {
+pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &crate::negotiate::Padding) -> Report {
     let ys = row_ys(db);
     let sw = site_width(db);
     let x0 = core_x_min(db);
@@ -242,14 +242,14 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool) -> Report {
         m
     };
 
-    // ⛔ **Zero padding, because this engine has no `set_placement_padding` model.** The rule
-    // still fires on the CLASS matrix — a CORE cell sharing a square with a WELLTAP is a padding
-    // conflict at zero padding too — but it cannot catch a violation that only a nonzero pad
-    // would create. Stated in `limitations`, not left for a reader to infer.
-    let (left_pad, right_pad) = (0i64, 0i64);
-    out.limitations.push(
-        "padding: evaluated with zero padding (no set_placement_padding model), so only \
-         class-pair conflicts are caught".into());
+    // `set_placement_padding` lives in the session, not the database: the caller passes it
+    // (`--padding-global/-master/-inst`), and each cell's `padLeft`/`padRight` is
+    // [`Padding::of`](crate::negotiate::Padding::of) — instance, then master, then global, CORE
+    // types only. With none given the rule still fires on the CLASS matrix alone.
+    if *padding == crate::negotiate::Padding::default() {
+        out.limitations.push(
+            "padding: no set_placement_padding given, so only class-pair conflicts are caught".into());
+    }
     if disallow_one_site_gaps {
         out.limitations.push(
             "one_site_gap: PlacementDRC's reading, where a square off the grid counts as \
@@ -355,6 +355,9 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool) -> Report {
             g.paint_cell(cx, cy, bx.2 as i32, bx.3 as i32, Some(me));
 
             let cls = classes[idx];
+            let master = db.inst_master(name);
+            let (left_pad, right_pad) =
+                padding.of(name, &master, &db.master_get_type(&master).unwrap_or_default());
             let at = |px: i32, py: i32| -> Option<(Option<(crate::drc::Class, bool)>,
                                                    Option<(crate::drc::Class, bool)>)> {
                 let p = g.pixel(px as i64, py as i64)?;
@@ -362,7 +365,7 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool) -> Report {
                       p.padding_reserved_by.map(|c| (classes[c as usize], c == me))))
             };
             if !crate::drc::check_padding(gx0 as i32, gx1 as i32, gy0 as i32, gy1 as i32,
-                                          left_pad as i32, right_pad as i32, cls, &at) {
+                                          left_pad, right_pad, cls, &at) {
                 out.failures.push(Failure { family: "padding".into(), cell: name.clone(),
                                             with: None });
             }
@@ -376,25 +379,78 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool) -> Report {
                                             with: None });
             }
 
-            if disallow_one_site_gaps
-                && !crate::drc::check_one_site_gap(
-                    true, gx0 as i32, gx1 as i32, gy0 as i32, gy1 as i32,
-                    crate::drc::EdgeReading::OffGridIsOccupied,
-                    &|px, py| g.pixel(px as i64, py as i64).map(|p| p.cell.is_some()))
-            {
-                out.failures.push(Failure { family: "one_site_gap".into(), cell: name.clone(),
-                                            with: None });
+            g.paint_cell_padding(gx0, gy0, gx1 - gx0, bx.3 as i32, left_pad as i64, right_pad as i64, me);
+        }
+    }
+    // `checkOneSiteGaps` — ⛔ a SECOND loop, after every cell is painted, as upstream runs it ("it
+    // needs to be done after the overlap check"): each cell sees its neighbours on BOTH sides.
+    // Checked inline, a cell saw only the cells visited before it and missed a gap to a later one.
+    // Every network cell is visited, a site-misaligned one included (upstream's loop does not skip
+    // it), against the grid as the first loop left it.
+    if disallow_one_site_gaps {
+        if let Some(g) = drc_grid.as_ref() {
+            for (name, bx, _) in &boxes {
+                let (cx, cy) = (bx.0 as i32 - g.core.0, bx.1 as i32 - g.core.1);
+                let (gx0, gy0, gx1, gy1) = g.covering(cx, cy, bx.2 as i32, bx.3 as i32);
+                let at = |px: i64, py: i64| g.pixel(px, py).map(|p| (p.is_valid, p.cell.is_some()));
+                if check_one_site_gaps(gx0, gy0, gx1, gy1, &at) {
+                    out.failures.push(Failure { family: "one_site_gap".into(), cell: name.clone(),
+                                                with: None });
+                }
             }
-
-            g.paint_cell_padding(gx0, gy0, gx1 - gx0, bx.3 as i32, left_pad, right_pad, me);
         }
     }
     out.failures.sort();
     out
 }
 
+/// `Opendp::checkOneSiteGaps` (`CheckPlacement.cpp`) — NOT `PlacementDRC::checkOneSiteGap`: the
+/// checker has its own. Along the cell's left and right edges (`visitCellBoundaryPixels`, WEST then
+/// EAST per row), where the square just outside is a VALID site holding no cell, the square two out
+/// is read and `gap_cell` is ASSIGNED from it — so a later edge that finds no cell there clears a
+/// gap an earlier one found. `at(x, y)` is `(is_valid, holds a cell)`, `None` off the grid.
+pub fn check_one_site_gaps(
+    gx0: i64, gy0: i64, gx1: i64, gy1: i64, at: &dyn Fn(i64, i64) -> Option<(bool, bool)>,
+) -> bool {
+    let mut gap = false;
+    for y in gy0..gy1 {
+        for (x, step) in [(gx0, -1i64), (gx1 - 1, 1)] {
+            if at(x, y).is_none() {
+                continue; // the boundary square itself is off the grid: not visited
+            }
+            let (valid, occupied) = at(x + step, y).unwrap_or((false, false));
+            if valid && !occupied {
+                if let Some((_, cell)) = at(x + 2 * step, y) {
+                    gap = cell;
+                }
+            }
+        }
+    }
+    gap
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_gap_is_seen_on_both_sides_and_a_later_edge_can_clear_it() {
+        use super::check_one_site_gaps;
+        // Row of 10 squares, all valid; the cell spans 4..6.
+        let grid = |cells: &'static [i64]| move |x: i64, y: i64| {
+            (y == 0 && (0..10).contains(&x)).then(|| (true, cells.contains(&x)))
+        };
+        // A neighbour two squares RIGHT (x=7): gap — seen whichever cell was visited first.
+        assert!(check_one_site_gaps(4, 0, 6, 1, &grid(&[4, 5, 7])));
+        // A neighbour two squares LEFT (x=2) and the cell ABUTTED on the right (x=6): gap — the
+        // east edge finds an occupied square next door and assigns nothing.
+        assert!(check_one_site_gaps(4, 0, 6, 1, &grid(&[4, 5, 2, 6])));
+        // ⛔ The same left neighbour with OPEN space to the right: NO failure. The east edge runs
+        // last, finds a valid empty square at x=6, reads the empty x=7 and ASSIGNS no-cell over the
+        // gap the west edge found — upstream's `gap_cell = gap_pixel->cell`, transcribed.
+        assert!(!check_one_site_gaps(4, 0, 6, 1, &grid(&[4, 5, 2])));
+        // Abutting on the left (x=3 occupied): not a gap.
+        assert!(!check_one_site_gaps(4, 0, 6, 1, &grid(&[4, 5, 3, 2])));
+    }
+
     use super::rects_overlap;
 
     #[test]

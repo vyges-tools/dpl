@@ -71,7 +71,7 @@ order to be useful — and upstream's own suite leans on it harder: **77 of 92 `
 ## Status
 
 At pin `da9f29f18b6487825aa880597176e0fa97110b31` (2026-09-22), with padding modelled:
-**44 of 44 comparable cases match** the reference component for component, with filler
+**46 of 46 comparable cases match** the reference component for component, with filler
 placement (`filler-placement`) scored on eight of them — `obstruction1` alone is 19,768 components —
 and the sweep trace (upstream's `negotiationIter` debug line) identical for the whole run on
 `cell_on_block2` (16,176 lines), `obstruction2` (248) and `edge_spacing`, among others.

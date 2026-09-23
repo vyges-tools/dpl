@@ -56,7 +56,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
     "LEGALIZATION is implemented and is the default path: the NEGOTIATION legalizer, which is what upstream's `detailed_placement` runs when `-use_diamond_legalizer` is absent. `--use-diamond-legalizer` selects the other one. The two produce DIFFERENT placements, so the report names which ran.",
-    "At pin da9f29f18b6487825aa880597176e0fa97110b31, with placement padding modelled, `detailed_placement` matches the reference on 44 of 44 comparable cases, eight of them followed by `filler_placement` (`filler-placement` here) and scored with the fillers. Earlier, at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34, it matched 28 of 28 comparable cases from its own regression suite, including aes (21340 components), ibex (34184) and gcd (549). The agreement is SWEEP-LEVEL, not final-placement only -- upstream's per-iteration debug trace and this engine's match line for line, every cell, every iteration, on simple05, simple07, gcd (574 lines) and hybrid_cells.",
+    "At pin da9f29f18b6487825aa880597176e0fa97110b31, with placement padding modelled, `detailed_placement` matches the reference on 46 of 46 comparable cases, eight of them followed by `filler_placement` (`filler-placement` here) and scored with the fillers. Earlier, at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34, it matched 28 of 28 comparable cases from its own regression suite, including aes (21340 components), ibex (34184) and gcd (549). The agreement is SWEEP-LEVEL, not final-placement only -- upstream's per-iteration debug trace and this engine's match line for line, every cell, every iteration, on simple05, simple07, gcd (574 lines) and hybrid_cells.",
     "It read 18 of 28 when the pin first moved from 945a9f48dc6e5cc91d865daa92c45a1094cb682c, because upstream reworked the negotiation legalizer's INITIAL SNAPPING across 7 commits and refreshed 24 of its own goldens. Four mechanisms were transcribed to recover it: `Grid::gridRoundX` (initial x ROUNDS to the nearest site rather than truncating), `displacementInSites`/`rowDispInSites` replacing the deleted `NegCell::displacement()` so displacement is site widths on BOTH axes, `initialSnap()`'s diamond search in place of a four-direction scan, and -- the one that mattered most -- running that snap as its OWN pass after every fixed cell is blockaded, testing grid CAPACITY rather than merely whether a site exists.",
     "BUT 35 of upstream's 63 `detailed_placement` cases are OUTSIDE that number and are not scored at all: 12 ship no golden, 8 need filler placement, 7 declare REGIONS/GROUPS, 7 need placement padding values, 1 needs both. `18 of 28` is a claim about what the corpus asks, not about every design.",
     "AND THE DENOMINATOR IS SHORT: upstream ships 69 .tcl cases calling `detailed_placement`, not 63. Five of them -- report_failures, fragmented_row03, pad02, fillers8, obstruction2 -- wrap the call as `catch { detailed_placement }`, so the harness's command filter does not see them and they are scored by nothing. All five are error-path cases.",
@@ -68,7 +68,7 @@ const DESCRIBE: &str = r#"{
     "A site-alignment failure removes the cell from the overlap comparison entirely. That is a side effect of upstream's `continue`, not a separate rule: checkOverlap is what paints a cell into its pixels, so a cell that was skipped is never there for a later cell to collide with.",
     "OVERLAP is upstream's pixel walk, in upstream's visit order (instances sorted by NAME): a cell fails only when a square it covers already holds an EARLIER cell it genuinely overlaps, so only the later cell of a pair is reported. An earlier rectangle sweep reported both, and its claim that the failing set matched was wrong -- the checker gate measured it on check2.",
     "status is one of clean, violations, vacuous or error. VACUOUS IS NOT CLEAN: it means the run examined no cell, and a design with no instances is an absent placement rather than a legal one.",
-    "check-placement is scored at pin da9f29f18b6487825aa880597176e0fa97110b31 by a gate over every upstream case that calls check_placement: the reference places the design, our checker reads that database, and its failing cells per family are compared with a fresh reference run's own warnings -- 57 of 57 comparable cases agree. Skipped, and named: 11 that set placement padding (check-placement takes none), 8 region designs, 3 whose input file is not in the reference checkout. Earlier, at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c, it was correlated by hand on three designs."
+    "check-placement is scored at pin da9f29f18b6487825aa880597176e0fa97110b31 by a gate over every upstream case that calls check_placement: the reference places the design, our checker reads that database, and its failing cells per family are compared with a fresh reference run's own warnings -- 68 of 68 comparable cases agree, set_placement_padding passed as --padding-* flags. Skipped, and named: 8 region designs, 3 whose input file is not in the reference checkout. One-site gaps are checked in a second pass after every cell is painted, with the checker's own checkOneSiteGaps; no comparable case reports one, so that rule is pinned by constructed cases only. Earlier, at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c, it was correlated by hand on three designs."
   ],
   "invocation": {
     "args_template": ["check-placement", "{odb}"],
@@ -136,7 +136,7 @@ const USAGE: &str = "\
 vyges physical dpl — detailed placement: legality checking and legalization over the design database
 
 USAGE:
-  vyges physical dpl check-placement    <design.odb> [--json] [-o FILE]
+  vyges physical dpl check-placement    <design.odb> [--json] [-o FILE] [--padding-* ...]
   vyges physical dpl detailed-placement <design.odb> [--out-odb FILE] [--dry-run] [OPTIONS]
   vyges physical dpl filler-placement   <design.odb> PATTERN... [--prefix P] [--out-odb FILE]
   vyges physical dpl --describe | --help | --version
@@ -279,6 +279,8 @@ fn legalize(args: &[String]) -> ExitCode {
     // place to be wrong about them.
     let mut opts = vyges_dpl::negotiate::Options::default();
     let mut padding = vyges_dpl::negotiate::Padding::default();
+    // `-masters` patterns, in call order, resolved once the database is open.
+    let mut master_pads: Vec<(String, (i32, i32))> = Vec::new();
     // `-max_displacement disp|{disp_x disp_y}`: ONE value sets both axes, two set them
     // separately. Upstream accepts a Tcl list; the shell equivalent is `X` or `X,Y`.
     let mut num = |i: &mut usize, what: &str| -> Option<String> {
@@ -304,7 +306,7 @@ fn legalize(args: &[String]) -> ExitCode {
                 let side = |k: usize| args.get(k).and_then(|v| v.parse::<i32>().ok());
                 match (side(i + 1), side(i + 2), key) {
                     (Some(l), Some(r), None) => padding.global = (l, r),
-                    (Some(l), Some(r), Some(k)) if flag == "--padding-master" => { padding.masters.insert(k, (l, r)); }
+                    (Some(l), Some(r), Some(k)) if flag == "--padding-master" => { master_pads.push((k, (l, r))); }
                     (Some(l), Some(r), Some(k)) => { padding.insts.insert(k, (l, r)); }
                     _ => { eprintln!("vyges-dpl: {flag} needs [NAME] LEFT RIGHT (sites)"); bad = true; }
                 }
@@ -376,6 +378,7 @@ fn legalize(args: &[String]) -> ExitCode {
         Ok(d) => d,
         Err(e) => { eprintln!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
     };
+    resolve_master_pads(&db, &mut padding, &master_pads);
     // ⚠️ The tunables belong to the NEGOTIATION legalizer — upstream's setters are on
     // `NegotiationLegalizer`, and `diamondDPL` reads only the displacement caps.
     let padded = padding.global != (0, 0) || !padding.masters.is_empty() || !padding.insts.is_empty();
@@ -453,9 +456,25 @@ fn legalize(args: &[String]) -> ExitCode {
                    _ => ExitCode::from(1) }
 }
 
+/// `set_placement_padding -masters`: each pattern is a Tcl glob over every library's masters
+/// (`get_masters_arg`), applied in CALL order — a later call for the same master replaces an
+/// earlier one, as upstream's per-master map does.
+fn resolve_master_pads(db: &Db, padding: &mut vyges_dpl::negotiate::Padding, pads: &[(String, (i32, i32))]) {
+    let all: Vec<String> = (0..db.num_masters().unwrap_or(0)).map(|i| db.nth_master_name(i).unwrap_or_default()).collect();
+    for (pattern, lr) in pads {
+        for m in all.iter().filter(|m| vyges_dpl::fillers::tcl_string_match(pattern, m)) {
+            padding.masters.insert(m.clone(), *lr);
+        }
+    }
+}
+
 fn check(args: &[String]) -> ExitCode {
     let mut odb = None;
     let mut out = None;
+    // `set_placement_padding`, as `detailed-placement` takes it (sites).
+    let mut padding = vyges_dpl::negotiate::Padding::default();
+    // `-masters` patterns, in call order, resolved once the database is open.
+    let mut master_pads: Vec<(String, (i32, i32))> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -463,6 +482,18 @@ fn check(args: &[String]) -> ExitCode {
             "-o" => {
                 i += 1;
                 out = args.get(i).cloned();
+            }
+            "--padding-global" | "--padding-master" | "--padding-inst" => {
+                let flag = args[i].clone();
+                let key = if flag == "--padding-global" { None } else { i += 1; args.get(i).cloned() };
+                let side = |k: usize| args.get(k).and_then(|v| v.parse::<i32>().ok());
+                match (side(i + 1), side(i + 2), key) {
+                    (Some(l), Some(r), None) => padding.global = (l, r),
+                    (Some(l), Some(r), Some(k)) if flag == "--padding-master" => { master_pads.push((k, (l, r))); }
+                    (Some(l), Some(r), Some(k)) => { padding.insts.insert(k, (l, r)); }
+                    _ => { eprintln!("vyges-dpl: {flag} needs [NAME] LEFT RIGHT (sites)"); return ExitCode::from(2); }
+                }
+                i += 2;
             }
             a if a.starts_with('-') => {
                 eprintln!("vyges-dpl: unknown option `{a}`");
@@ -483,7 +514,8 @@ fn check(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let report = vyges_dpl::check::check_placement(&db);
+    resolve_master_pads(&db, &mut padding, &master_pads);
+    let report = vyges_dpl::check::check_placement_opts(&db, !db.has_one_site_master(), &padding);
     // ⛔ `vacuous` is reserved across this suite: a run that examined no cell must not report
     // clean. A design with no instances is not a legal placement, it is an absent one.
     let status = if report.cells_checked == 0 {

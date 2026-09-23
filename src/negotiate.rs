@@ -3313,7 +3313,7 @@ pub fn legalize_with(db: &Db, opts: Options) -> Result<Legalized, String> {
 /// CORE classes, antenna cells and well taps included; endcaps, spacers, blocks, pads and covers
 /// never). It lives in `Opendp`'s memory, not in the database, so a caller that set it must pass
 /// it here.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Padding {
     pub global: (i32, i32),
     pub masters: std::collections::BTreeMap<String, (i32, i32)>,
