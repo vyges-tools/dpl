@@ -331,16 +331,25 @@ impl Grid {
         let gx = ((cx as f64) / self.site_width as f64).round() as i64;
         let core_dy = self.core.3 - self.core.1;
         let cy = y.clamp(0, (core_dy - h).max(0));
-        // Nearest row boundary, which is `gridRoundY`.
-        let gy = self
-            .row_y
-            .iter()
-            .take(self.row_count.max(1))
-            .enumerate()
-            .min_by_key(|(_, ry)| (**ry - cy).abs())
-            .map(|(i, _)| i as i64)
-            .unwrap_or(0);
-        (gx.clamp(0, self.row_site_count as i64 - 1), gy)
+        (gx.clamp(0, self.row_site_count as i64 - 1), self.grid_round_y(cy) as i64)
+    }
+
+    /// `Grid::gridRoundY` — snap DOWN to a row boundary, then take the NEXT one when it is at least
+    /// as close: `|row_y[gy] - y| >= |row_y[gy + 1] - y|`.
+    ///
+    /// ⛔ **A tie rounds UP.** A nearest-boundary search that keeps the first minimum rounds it down.
+    /// Witnessed by `dpl-witness.py round_y_tie_diamond`: a cell exactly midway between two rows,
+    /// diamond-legalized on an empty design — the reference lands it on the UPPER row, and ours
+    /// took the lower until this was transcribed. ⚠️ The next boundary may be the TOP one, which has
+    /// no row: upstream allows it (`grid_y < size - 1`), and so does this.
+    pub fn grid_round_y(&self, y: i32) -> usize {
+        let gy = self.grid_snap_down_y(y).unwrap_or(0);
+        if gy + 1 < self.row_y.len()
+            && (self.row_y[gy] - y).abs() >= (self.row_y[gy + 1] - y).abs()
+        {
+            return gy + 1;
+        }
+        gy
     }
 
     /// The grid row index a core-relative Y sits in, if any.
@@ -568,6 +577,20 @@ impl Grid {
         }
     }
 
+    /// `Grid::isMultiHeight(master)` — `Master::isMultiRow`, which gates every power-rail test.
+    ///
+    /// ⚠️ **Not `grid_height > 1`.** The two agree everywhere but one corner: rows NOT uniform and a
+    /// site whose ROWPATTERN has ONE entry — `gridHeight` is the pattern's length, 1, while
+    /// `isMultiHeight` is `hasRowPattern()`, true. Measured 2026-09-22: no corpus design reaches
+    /// it (the only non-uniform ones, `hybrid_cells*`, use patterns of length 2), so this is a
+    /// transcription pinned by unit test, not a witnessed fix.
+    pub fn is_multi_height(&self, master_height: i32, row_pattern_len: usize) -> bool {
+        match self.uniform_row_height() {
+            Some(rh) => master_height > rh,
+            None => row_pattern_len > 0,
+        }
+    }
+
     /// `Grid::uniform_row_height_` — the row height the design reduces to, if it has one.
     ///
     /// ⛔ **NOT "every row is the same height".** Upstream folds the row SITE heights pairwise:
@@ -630,6 +653,36 @@ impl Grid {
     /// How many squares are usable — the number a legal placement has to fit into.
     pub fn valid_sites(&self) -> usize {
         self.pixels.iter().flatten().filter(|p| p.is_valid).count()
+    }
+}
+
+#[cfg(test)]
+mod round_y_tests {
+    /// Upstream `gridRoundY`: a tie between two row boundaries rounds UP; off the tie, the nearer.
+    #[test]
+    fn a_tie_rounds_up() {
+        let g = super::Grid::uniform_for_test((0, 0, 3800, 11200), 380, vec![0, 2800, 5600, 8400, 11200]);
+        assert_eq!(g.grid_round_y(1400), 1, "midway: the UPPER row, as the reference places it");
+        assert_eq!(g.grid_round_y(1399), 0);
+        assert_eq!(g.grid_round_y(1401), 1);
+        assert_eq!(g.grid_round_y(0), 0);
+        assert_eq!(g.grid_round_y(9800), 4, "past the last row's middle: the TOP boundary, as upstream");
+    }
+}
+
+#[cfg(test)]
+mod multi_height_tests {
+    /// Upstream `isMultiHeight`: uniform rows → taller than the row; otherwise → the site HAS a
+    /// row pattern, whatever its length — where `gridHeight` would say 1 for a one-entry pattern.
+    #[test]
+    fn a_one_entry_row_pattern_is_multi_height_on_non_uniform_rows() {
+        let mut g = super::Grid::uniform_for_test((0, 0, 3800, 6400), 380, vec![0, 2800, 6400]);
+        g.site_heights = vec![2800];
+        assert!(g.is_multi_height(5600, 0) && !g.is_multi_height(2800, 0), "uniform at 2800");
+        g.site_heights = vec![2800, 3600]; // 3600 % 2800 != 0: not uniform
+        assert!(!g.is_multi_height(6400, 0), "no pattern: single, however tall");
+        assert!(g.is_multi_height(3600, 1), "a ONE-entry pattern is multi-height");
+        assert_eq!(g.grid_height(3600, 1), 1, "…while gridHeight calls it one row");
     }
 }
 

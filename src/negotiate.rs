@@ -3377,6 +3377,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
     let mut cells: Vec<SweepCell> = Vec::new();
     let mut sites: Vec<String> = Vec::new();
     let mut masters: Vec<String> = Vec::new();
+    let mut multi: Vec<bool> = Vec::new();
     // `(SYMMETRY X, Y, R90)` from each movable cell's master, for `checkMasterSym`.
     let mut sym: Vec<(bool, bool, bool)> = Vec::new();
     // ⛔ **The occupancy map needs the fixed cells too.** They are not in the sweep — nothing
@@ -3490,6 +3491,9 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
         });
         sites.push(db.master_get_site(&master));
         masters.push(master.clone());
+        // `node->getMaster()->isMultiRow()`, set from `Grid::isMultiHeight` in `createNetwork`.
+        multi.push(grid.is_multi_height(h, db.row_pattern(&db.master_get_site(&master))
+                                             .map_or(0, |p| p.len())));
         init_orients.push(db.inst_get_orient(&name));
         cell_types.push(mtype.clone());
         cell_pads.push(padding.of(&name, &master, &mtype));
@@ -3657,7 +3661,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
         }
         // ⚠️ The power test is last: it is the expensive one, and upstream reaches it only for a
         // multi-row master.
-        ch <= 1 || power.compatible(&masters[i], y, ch)
+        !multi[i] || power.compatible(&masters[i], y, ch)
     };
 
     // `checkDRC`'s one-site-gap term, from OCCUPANCY alone.
@@ -4015,7 +4019,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             if !check_master_sym(sym[i].0, sym[i].1, sym[i].2, &orient) {
                 return false;
             }
-            if ch > 1 && !power.compatible(&masters[i], y, ch) {
+            if multi[i] && !power.compatible(&masters[i], y, ch) {
                 return false;
             }
             if !crate::drc::check_one_site_gap(

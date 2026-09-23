@@ -321,12 +321,9 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
             if !*blk {
                 let master = db.inst_master(name);
                 let site = db.master_get_site(&master);
-                // `Grid::isMultiHeight`: taller than the uniform row height, or — rows not
-                // uniform — a site with a row pattern.
-                let multi_row = match g.uniform_row_height() {
-                    Some(u) => bx.3 as i32 > u,
-                    None => db.row_pattern(&site).is_ok_and(|p| !p.is_empty()),
-                };
+                // `Grid::isMultiHeight`.
+                let multi_row = g.is_multi_height(
+                    bx.3 as i32, db.row_pattern(&site).map_or(0, |p| p.len()));
                 let power_ok = |row: i64, rows: i64| {
                     power.as_ref().map_or(true, |p| p.compatible(&master, row as i32, rows as i32))
                 };

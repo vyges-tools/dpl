@@ -24,6 +24,21 @@ pub struct Group {
     pub cells: Vec<String>,
 }
 
+impl Group {
+    /// `Group::getBBox` — the merge of its rects (`mergeInit` then `merge`), core-relative.
+    pub fn bbox(&self) -> Option<Box4> {
+        self.rects.iter().copied().reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
+    }
+}
+
+/// `Grid::gridWithin` — the grid squares a DBU rect (core-relative) wholly covers:
+/// `dbuToGridCeil`, `gridEndY`, `dbuToGridFloor`, `gridSnapDownY`. Half-open.
+pub fn grid_within(grid: &Grid, r: &Box4) -> (i64, i64, i64, i64) {
+    let sw = grid.site_width;
+    ((r.0 + sw - 1).div_euclid(sw) as i64, grid.grid_end_y_dbu(r.1) as i64,
+     r.2.div_euclid(sw) as i64, grid.grid_snap_down_y(r.3).unwrap_or(0) as i64)
+}
+
 /// `setUpPlacementGroups` — every `dbGroup` with a region, in `getGroups` order; its index here is
 /// upstream's `Group::id`. `network` is the network's cells (`network_->getNode` non-null).
 pub fn placement_groups(db: &Db, core: Box4, network: &[String]) -> Vec<Group> {
@@ -119,6 +134,27 @@ impl Regions {
         self.rtree.is_empty()
     }
 
+    /// `checkRegionOverlap(cell, x, y, x_end, y_end)` in GRID coordinates, for whichever case the
+    /// cell is in: with a region (assigned by `groupAssignCellRegions`) the query must hit exactly
+    /// one R-tree box and be covered by it; without one it must hit none.
+    pub fn overlap_ok(&self, inst: &str, gx: i32, gy: i32, gx_end: i32, gy_end: i32,
+                      site_width: i32, row_y: &[i32], core_y_max: i32) -> bool {
+        let row = |i: i32| match i.max(0) as usize {
+            n if n < row_y.len() => Some(row_y[n]),
+            n if n == row_y.len() => Some(core_y_max),
+            _ => None,
+        };
+        let (Some(y0), Some(y1)) = (row(gy), row(gy_end)) else { return false };
+        let q = (gx * site_width, y0, gx_end * site_width - 1, y1 - 1);
+        let hits: Vec<&Box4> = self.rtree.iter()
+            .filter(|b| b.0 <= q.2 && q.0 <= b.2 && b.1 <= q.3 && q.1 <= b.3).collect();
+        if self.assigned.contains_key(inst) {
+            hits.len() == 1 && q.0 >= hits[0].0 && q.1 >= hits[0].1 && q.2 <= hits[0].2 && q.3 <= hits[0].3
+        } else {
+            hits.is_empty()
+        }
+    }
+
     /// `checkRegionPlacement` — true for a cell with no region. Otherwise its region must CONTAIN
     /// its box, and `checkRegionOverlap` must find exactly one R-tree box, covering the query.
     ///
@@ -140,15 +176,8 @@ impl Regions {
         if site_width <= 0 || h <= 0 {
             return false;
         }
-        let row = |i: i32| match i.max(0) as usize {
-            n if n < row_y.len() => Some(row_y[n]),
-            n if n == row_y.len() => Some(core_y_max),
-            _ => None,
-        };
-        let (Some(y0), Some(y1)) = (row(y / h), row(y_end / h)) else { return false };
-        let q = ((x / site_width) * site_width, y0, (x_end / site_width) * site_width - 1, y1 - 1);
-        let hits: Vec<&Box4> = self.rtree.iter().filter(|b| b.0 <= q.2 && q.0 <= b.2 && b.1 <= q.3 && q.1 <= b.3).collect();
-        hits.len() == 1 && q.0 >= hits[0].0 && q.1 >= hits[0].1 && q.2 <= hits[0].2 && q.3 <= hits[0].3
+        self.overlap_ok(inst, x / site_width, y / h, x_end / site_width, y_end / h, site_width,
+                        row_y, core_y_max)
     }
 }
 
@@ -196,11 +225,7 @@ pub fn group_init_pixels(grid: &mut Grid, groups: &[Group]) {
         if g.cells.is_empty() {
             continue;
         }
-        // `gridWithin`: `dbuToGridCeil`, `gridEndY`, `dbuToGridFloor`, `gridSnapDownY`.
-        let within = |grid: &Grid, r: &Box4| -> (i64, i64, i64, i64) {
-            ((r.0 + sw - 1).div_euclid(sw) as i64, grid.grid_end_y_dbu(r.1) as i64,
-             r.2.div_euclid(sw) as i64, grid.grid_snap_down_y(r.3).unwrap_or(0) as i64)
-        };
+        let within = grid_within;
         for r in &g.rects {
             let (xlo, ylo, xhi, yhi) = within(grid, r);
             for k in ylo..yhi {
