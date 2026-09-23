@@ -914,15 +914,17 @@ pub fn used_layers(pin_layer_levels: impl Iterator<Item = i32>) -> u32 {
 /// M1 explicitly excluded — and ⛔ **only wires that are not HORIZONTAL**, because a horizontal
 /// strap runs along a row rather than across it.
 ///
-/// ⚠️ `odb::Rect::getDir()` is horizontal when the box is WIDER than it is tall; a square box is
-/// therefore not horizontal and does block. Transcribed as-is rather than tidied — the boundary
-/// case is upstream's.
+/// ⛔ `odb::Rect::getDir()` is `DX < DY ? vertical : horizontal` — so a SQUARE box is HORIZONTAL
+/// and does NOT block. This comment once said the opposite ("wider than tall is horizontal"), read
+/// from the rule's intent rather than from `geom.h`; the constructed witness
+/// `dpl-witness.py blocked_square_m2` showed the reference passing a cell under a square M2 box
+/// that this reported blocked.
 pub fn blocks_layer(routing_level: i32, w: i64, h: i64) -> bool {
     if routing_level <= 1 || routing_level > 3 {
         return false;
     }
-    // `getDir() == horizontal` ⟺ width > height.
-    w <= h
+    // `getDir() == vertical` ⟺ `dx < dy`; anything else, a square included, is horizontal.
+    w < h
 }
 
 #[cfg(test)]
@@ -980,10 +982,11 @@ mod binding_tests {
     }
 
     #[test]
-    fn a_square_wire_box_is_not_horizontal() {
-        // ⚠️ `getDir()` is horizontal only when WIDER than tall, so a square blocks. Upstream's
-        // boundary, kept rather than tidied.
-        assert!(blocks_layer(2, 500, 500));
+    fn a_square_wire_box_is_horizontal_and_does_not_block() {
+        // ⛔ `Rect::getDir`: `DX < DY ? vertical : horizontal` — a square is HORIZONTAL. Witnessed:
+        // the reference passes a cell under a square M2 box (`blocked_square_m2`).
+        assert!(!blocks_layer(2, 500, 500));
+        assert!(blocks_layer(2, 499, 500), "one DBU taller than wide: vertical, blocks");
     }
 }
 

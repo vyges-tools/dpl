@@ -227,8 +227,15 @@ impl Grid {
         if crate::drc::routing_level_sanity(&levels).is_err() {
             return;
         }
-        let Ok(boxes) = db.swire_boxes() else { return };
-        for (layer_no, x0, y0, x1, y1) in boxes {
+        // ⛔ `special_wire_boxes`, not `swire_boxes`: upstream walks `net->isSpecial()` nets only,
+        // skips `sbox->isVia()`, and skips `DRCFILL` ("TODO: handle patches"). The fill-oriented
+        // list keeps all three, so a DRCFILL strap blocked here and not upstream — witnessed by
+        // `dpl-witness.py blocked_vertical_m2_drcfill`.
+        let Ok(boxes) = db.special_wire_boxes() else { return };
+        for (layer_no, x0, y0, x1, y1, shape) in boxes {
+            if shape == "DRCFILL" {
+                continue;
+            }
             let name = db.layer_name_by_number(layer_no);
             let Some(&level) = levels.get(&name) else { continue };
             if !crate::drc::blocks_layer(level, (x1 - x0) as i64, (y1 - y0) as i64) {
