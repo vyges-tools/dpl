@@ -78,6 +78,26 @@ pub struct FillReport {
     pub unmatched_patterns: Vec<String>,
 }
 
+/// `Opendp::isFiller` — a `CORE_SPACER` instance that is not `LOCKED` ("Filter spacer cells used
+/// as tapcells").
+pub fn is_filler(master_type: &str, placement_status: &str) -> bool {
+    crate::drc::is_core_spacer(master_type) && placement_status != "LOCKED"
+}
+
+/// `Opendp::removeFillers` — destroy every [`is_filler`] instance, in block order. Returns the
+/// names removed.
+pub fn remove_fillers(db: &mut Db) -> Result<Vec<String>, FillError> {
+    let doomed: Vec<String> = (0..db.num_insts())
+        .map(|i| db.nth_inst_name(i))
+        .filter(|n| is_filler(&db.master_get_type(&db.inst_master(n)).unwrap_or_default(),
+                              &db.inst_get_placement_status(n)))
+        .collect();
+    for n in &doomed {
+        db.destroy_inst(n).map_err(|e| FillError::Db(e.to_string()))?;
+    }
+    Ok(doomed)
+}
+
 /// `filler_placement` — the reference's call sequence and nothing else.
 pub fn filler_placement(db: &mut Db, patterns: &[String], prefix: &str) -> Result<FillReport, FillError> {
     let (masters, unmatched) = get_masters_arg(db, patterns)?;
@@ -413,6 +433,16 @@ pub fn tcl_string_match(pattern: &str, s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream `isFiller`: CORE_SPACER, in either spelling, and not LOCKED — a LOCKED spacer is a
+    /// tapcell stand-in and survives `remove_fillers`.
+    #[test]
+    fn a_filler_is_an_unlocked_core_spacer() {
+        assert!(is_filler("CORE SPACER", "PLACED"));
+        assert!(is_filler("CORE_SPACER", "FIRM"));
+        assert!(!is_filler("CORE SPACER", "LOCKED"), "a LOCKED spacer is kept");
+        assert!(!is_filler("CORE", "PLACED"));
+    }
 
     fn m(name: &str, sites: i32, height: i32) -> FillerMaster {
         FillerMaster { name: name.into(), width: sites * 10, height, implant: None }

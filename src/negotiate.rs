@@ -3696,7 +3696,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             let bbox = if b.len() == 4 { (b[0], b[1], b[2], b[3]) } else { (0, 0, 0, 0) };
             let rows = grid.grid_height(db.master_get_height(m) as i32,
                                         db.row_pattern(&db.master_get_site(m)).map_or(0, |p| p.len())) as i32;
-            let spacer = db.master_get_type(m).unwrap_or_default() == "CORE_SPACER";
+            let spacer = crate::drc::is_core_spacer(&db.master_get_type(m).unwrap_or_default());
             let lef = db.master_edge_types(m).unwrap_or_default();
             master_edge_list.insert(m.clone(), (bbox, crate::drc::master_edges(bbox, &lef, rows, &edge_table, spacer)));
         }

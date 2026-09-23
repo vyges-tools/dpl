@@ -255,7 +255,7 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
             let bbox = if b.len() == 4 { (b[0], b[1], b[2], b[3]) } else { (0, 0, 0, 0) };
             let rows = g.grid_height(db.master_get_height(&m) as i32,
                                      db.row_pattern(&db.master_get_site(&m)).map_or(0, |p| p.len()));
-            let spacer = db.master_get_type(&m).unwrap_or_default() == "CORE_SPACER";
+            let spacer = crate::drc::is_core_spacer(&db.master_get_type(&m).unwrap_or_default());
             let lef = db.master_edge_types(&m).unwrap_or_default();
             let edges = crate::drc::master_edges(bbox, &lef, rows, &edge_table, spacer);
             master_edges.insert(m, (bbox, edges));

@@ -51,6 +51,16 @@ pub fn canonical_master_type(master_type: &str) -> String {
     master_type.trim().replace(' ', "_").to_ascii_uppercase()
 }
 
+/// `dbMasterType::CORE_SPACER`, in either spelling odb may hand back (`CORE SPACER` from LEF,
+/// `CORE_SPACER` from the enum).
+///
+/// ⛔ Compare master types through this or [`canonical_master_type`], never as raw strings: two
+/// sites compared `== "CORE_SPACER"` and so would have given a LEF-spelled filler its LEF58 edges,
+/// which upstream's `addMaster` withholds from every spacer.
+pub fn is_core_spacer(master_type: &str) -> bool {
+    canonical_master_type(master_type) == "CORE_SPACER"
+}
+
 /// Classify a master type string as the placer does.
 ///
 /// ⚠️ Upstream uses a `switch` over the enum *"so if new types are added we get a compiler
@@ -614,6 +624,8 @@ mod tests {
         assert_eq!(classify("CORE_WELLTAP"), Class::Wt, "a well tap is NOT plain core");
         assert_eq!(classify("BLOCK_SOFT"), Class::Bl);
         assert_eq!(classify("CORE_SPACER"), Class::Sp);
+        assert!(is_core_spacer("CORE SPACER") && is_core_spacer("CORE_SPACER"), "both spellings");
+        assert!(!is_core_spacer("CORE") && !is_core_spacer("CORE WELLTAP"));
         assert_eq!(classify("ENDCAP_LEF58_RIGHTEDGE"), Class::Sp, "every ENDCAP variant");
         assert_eq!(classify("PAD_INPUT"), Class::Ignored);
         assert_eq!(classify("SOMETHING_NEW"), Class::Ignored, "unknown falls through as ignored");
