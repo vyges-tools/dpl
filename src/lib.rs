@@ -27,6 +27,7 @@ pub mod drc;
 pub mod edges;
 pub mod fillers;
 pub mod grid;
+pub mod improve;
 pub mod mirror;
 pub mod negotiate;
 pub mod network;

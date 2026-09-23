@@ -3910,7 +3910,6 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
 
     // 5. Run it. ⚠️ The window is rebuilt per candidate anchor, as upstream does — hoisting it
     //    out of the loop would freeze the reach at the cell's start position.
-    let index: Vec<usize> = (0..cells.len()).collect();
     let outcome = if active.is_empty() {
         Outcome::Converged { phase: 1, iter: 0 }
     } else {
@@ -4352,6 +4351,16 @@ impl PowerModel {
             rails_of(db, &m);
         }
         PowerModel { master, rows, known }
+    }
+
+    /// A master's `(top, bottom)` rails, `Unknown` for one never read.
+    pub fn master_rails(&self, master: &str) -> (crate::drc::Power, crate::drc::Power) {
+        *self.master.get(master).unwrap_or(&(crate::drc::Power::Unknown, crate::drc::Power::Unknown))
+    }
+
+    /// A grid row's `(bottom, top)` rails, `Unknown` off the grid or when nothing settled them.
+    pub fn row_rails(&self, row: usize) -> (crate::drc::Power, crate::drc::Power) {
+        self.rows.get(row).copied().unwrap_or((crate::drc::Power::Unknown, crate::drc::Power::Unknown))
     }
 
     /// `Opendp::checkRowPowerCompatible` — may this master start in this grid row?

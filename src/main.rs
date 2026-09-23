@@ -126,6 +126,15 @@ const DESCRIBE: &str = r#"{
         { "arg": "out_odb", "flag": "--out-odb", "description": "write the database here" }
       ],
       "assertion": { "id": "mirroring-optimized", "field": "status", "pass_when": { "eq": "optimized" } }
+    },
+    {
+      "name": "improve-placement",
+      "summary": "detailed placement improvement (IN PROGRESS: only its setup is built)",
+      "args_template": ["improve-placement", "{odb}"],
+      "optional": [
+        { "arg": "dump_setup", "flag": "--dump-setup", "description": "print the manager state after the shift legalizer" }
+      ],
+      "assertion": { "id": "placement-improved", "field": "status", "pass_when": { "eq": "improved" } }
     }
   ],
   "inputs": {
@@ -159,6 +168,7 @@ USAGE:
   vyges physical dpl filler-placement   <design.odb> PATTERN... [--prefix P] [--out-odb FILE]
   vyges physical dpl remove-fillers     <design.odb> [--out-odb FILE]
   vyges physical dpl optimize-mirroring <design.odb> [--out-odb FILE]
+  vyges physical dpl improve-placement  <design.odb> [--dump-setup]   (in progress: setup only)
   vyges physical dpl --describe | --help | --version
 
 OPTIONS:
@@ -216,6 +226,7 @@ fn main() -> ExitCode {
         Some("filler-placement") => fill(&args[1..]),
         Some("remove-fillers") => remove_fillers(&args[1..]),
         Some("optimize-mirroring") => optimize_mirroring(&args[1..]),
+        Some("improve-placement") => improve_placement(&args[1..]),
         // A diagnostic, not a command anyone should need in a flow.
         Some("grid-facts") => {
             let Some(p) = args.get(1) else { eprintln!("need <design.odb>"); return ExitCode::from(2) };
@@ -378,6 +389,49 @@ fn optimize_mirroring(args: &[String]) -> ExitCode {
         "edge_spacing_rejected": rep.edge_spacing_rejected,
     })).expect("valid JSON"));
     ExitCode::SUCCESS
+}
+
+/// `improve_placement` — ⬜ in progress: the setup (`ShiftLegalizer::legalize`) is built; the
+/// optimizers are not, so no database is written and the status says so.
+fn improve_placement(args: &[String]) -> ExitCode {
+    let (mut odb, mut dump) = (None, false);
+    for a in args {
+        match a.as_str() {
+            "--dump-setup" => dump = true,
+            a if odb.is_none() => odb = Some(a.to_string()),
+            a => {
+                eprintln!("vyges-dpl: improve-placement: unexpected argument {a}\n\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(path) = odb else {
+        eprintln!("vyges-dpl: improve-placement needs <design.odb>\n\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let db = match Db::open(&path) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
+    };
+    let setup = match vyges_dpl::improve::setup(&db, &vyges_dpl::negotiate::Padding::default()) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("vyges-dpl: {e}"); return ExitCode::from(1); }
+    };
+    for l in &setup.log {
+        eprintln!("{l}");
+    }
+    if dump {
+        for l in setup.dump() {
+            println!("{l}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "tool": "vyges-dpl", "command": "improve-placement", "status": "not_implemented",
+        "not_done": ["mis", "global swap", "vertical swap", "reorder", "random improver", "flipping"],
+        "checks": setup.checks,
+    })).expect("valid JSON"));
+    ExitCode::from(1)
 }
 
 fn legalize(args: &[String]) -> ExitCode {
