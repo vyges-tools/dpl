@@ -2458,6 +2458,20 @@ mod tests {
     }
 
     #[test]
+    fn the_active_list_is_left_in_negotiation_order() {
+        // ⛔ `sortByNegotiationOrder(activeCells)` sorts the RUN's vector: most overused first,
+        // then shorter, then narrower, then index. Whoever reads the list next — a stall's
+        // `diamondRecovery` — visits cells in that order, not in index order.
+        let mut g = NegGrid::build(10, 1, &|_, _| true);
+        let cells = vec![sweep_cell("a", 0, 1), sweep_cell("b", 3, 2), sweep_cell("c", 6, 1)];
+        g.add_usage(3, 0, 2, 1, 2); // b's squares at usage 2: overuse 1 each
+        g.add_usage(6, 0, 1, 1, 2); // c's square: overuse 1
+        let mut active = vec![0, 1, 2];
+        order_active(&mut active, &cells, &g);
+        assert_eq!(active, vec![1, 2, 0]); // overuse b 2, c 1, a 0 — not index order
+    }
+
+    #[test]
     fn padding_is_reserved_beside_the_footprint_and_erased_with_it() {
         // `paintPixel` = the footprint, then `paintCellPadding`: `left` squares before and
         // `right` after, over the cell's rows. `erasePixel` clears over the PADDED span, but only
@@ -2837,26 +2851,10 @@ pub type FixedPaint = (usize, i32, i32, i32, i32);
 pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: i32,
                         ctx: &mut SweepCtx) -> i32
 {
-    // 1. Order the sweep.
-    let mut keys: Vec<SortKey> = active
-        .iter()
-        .map(|&i| {
-            let c = &cells[i];
-            let mut ov = 0;
-            for dy in 0..c.height {
-                for dx in 0..c.width {
-                    if let (Ok(gx), Ok(gy)) = (usize::try_from(c.x + dx), usize::try_from(c.y + dy))
-                    {
-                        if gx < ctx.grid.width && gy < ctx.grid.height {
-                            ov += ctx.grid.at(gx, gy).overuse();
-                        }
-                    }
-                }
-            }
-            SortKey { overuse: ov, height: c.height, width: c.width, idx: i }
-        })
-        .collect();
-    sort_by_negotiation_order(&mut keys);
+    // 1. Order the sweep — `sortByNegotiationOrder(activeCells)`, IN PLACE.
+    order_active(active, cells, &ctx.grid);
+    // The sweep walks that order; cells pulled in below join the list, not this pass.
+    let order: Vec<usize> = active.clone();
 
     let drc_penalty = ctx.drc_penalty * (1.0 + iter as f64);
     // ⚠️ **The sweep TRACE, and it is the only instrument that can settle an assignment.** Which
@@ -2882,8 +2880,7 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
     // a buffer whose contents are discarded each time.
     let mut cands: Vec<Candidate> = Vec::new();
 
-    for key in &keys {
-        let i = key.idx;
+    for &i in &order {
         if cells[i].fixed {
             continue;
         }
@@ -3099,8 +3096,40 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
             })
             .collect();
         update_drc_history_costs(&mut ctx.grid.pixels, &drc_footprints);
+        // `sortByNegotiationOrder(activeCells)` again, on the costs just bumped: the order the
+        // run's active list is LEFT in — which is the order a stall's `diamondRecovery` visits.
+        order_active(active, cells, &ctx.grid);
     }
     violations
+}
+
+/// `sortByNegotiationOrder(activeCells)` — the run's active list, sorted IN PLACE.
+///
+/// ⛔ **In place is behaviour.** Upstream sorts the `activeCells` vector itself, at the head of
+/// `negotiationIter` and again after the history update, and whatever reads that vector next sees
+/// that order — a stall's `diamondRecovery` among them, whose placements depend on who goes
+/// first. Sorting a private copy for the sweep and leaving `active` in index order made
+/// `obstruction2`'s recovery visit `_439_` first where upstream visits `_858_`.
+pub fn order_active(active: &mut Vec<usize>, cells: &[SweepCell], grid: &NegGrid) {
+    let mut keys: Vec<SortKey> = active
+        .iter()
+        .map(|&i| {
+            let c = &cells[i];
+            let mut ov = 0;
+            for dy in 0..c.height {
+                for dx in 0..c.width {
+                    if let (Ok(gx), Ok(gy)) = (usize::try_from(c.x + dx), usize::try_from(c.y + dy)) {
+                        if gx < grid.width && gy < grid.height {
+                            ov += grid.at(gx, gy).overuse();
+                        }
+                    }
+                }
+            }
+            SortKey { overuse: ov, height: c.height, width: c.width, idx: i }
+        })
+        .collect();
+    sort_by_negotiation_order(&mut keys);
+    *active = keys.into_iter().map(|k| k.idx).collect();
 }
 
 /// The squares a cell at `(x, y)` would cover, as `(usage, capacity, hist_cost)` — `None` for a
@@ -3828,7 +3857,16 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
                 for dx in 0..cw {
                     let (gx, gy) = ((x + dx) as usize, (y + dy) as usize);
                     // `!pixel->is_valid` and `pixel->cell` — both refuse.
-                    if g.at(gx, gy).capacity == 0 || g.occupant(x + dx, y + dy).is_some() {
+                    //
+                    // ⛔ **`is_valid` is the DPL grid's, NOT negotiation capacity.** The two agree
+                    // except under a FIXED cell that `initFromDb` clamped: every cell's grid x is
+                    // `min(x, grid_w − width)`, so a macro hanging past the row's end is blockaded
+                    // in the negotiation grid from the clamped x — while `canBePlaced` reads the
+                    // DPL pixels, where `paintPixel` stamps the macro at its REAL position. On
+                    // `obstruction2` the 142-site RAM at site 165 blocks capacity from 90 on;
+                    // upstream's diamond recovery then places cells at 148 (free, valid DPL
+                    // pixels), where reading capacity refused every candidate: 0/31 recovered.
+                    if !valid(gx, gy) || g.occupant(x + dx, y + dy).is_some() {
                         return false;
                     }
                     // ⛔ **`first_row && !getSiteOrientation(x1, y1, site)`, per COLUMN.**

@@ -71,19 +71,22 @@ order to be useful — and upstream's own suite leans on it harder: **77 of 92 `
 ## Status
 
 At pin `da9f29f18b6487825aa880597176e0fa97110b31` (2026-09-22), with padding modelled:
-**34 of 35 comparable cases match** the reference component for component, the padding cases
-`pad01`, `pad04`, `pad05` and `pad06` among them, and `cell_on_block2` (11,904 components; its
-sweep trace identical for all 16,176 lines). The one that does not:
+**35 of 35 comparable cases match** the reference component for component — every one the harness
+can compare — with the sweep trace (upstream's `negotiationIter` debug line) identical for the
+whole run on `cell_on_block2` (16,176 lines) and `obstruction2` (248), among others.
 
-- `obstruction2`: an error-path case (`catch { detailed_placement }`), now seen by the harness;
-  it uses no padding, and this change leaves an unpadded run's grid bit for bit as it was.
+The last three defects, each found by printing every candidate of the first diverging
+`findBestLocation` call on both sides (`VYGES_DPL_CELL` / `VYGES_DPL_ITER`, and the reference
+patch `dpl-candidate-trace.py`):
 
-`cell_on_block2` was a search-WINDOW defect, not a cost one: the window was built with the raw base
-site window where upstream uses `effectiveSiteWindow(cell)` = `max(base, cell width)`, so a cell
-wider than the base (21 sites against 20) walked with a budget two positions short. Found by
-printing every candidate of the first diverging `findBestLocation` call on both sides
-(`VYGES_DPL_CELL` / `VYGES_DPL_ITER`, and the reference patch `dpl-candidate-trace.py`): the two
-traces split at their second line, the window.
+- the search window was built from the raw base site window, not `effectiveSiteWindow(cell)` =
+  `max(base, cell width)` (`cell_on_block2`);
+- the stall recovery's `canBePlaced` read negotiation CAPACITY where upstream reads the DPL
+  grid's `is_valid` — they differ under a fixed cell `initFromDb` clamped, where the negotiation
+  grid is blockaded from the clamped x but the DPL pixels carry the macro at its real position
+  (`obstruction2`: 0 of 31 stuck cells recovered, upstream 31);
+- `sortByNegotiationOrder` sorts the run's active list IN PLACE, and the recovery visits cells in
+  that order; ours sorted a private copy (`obstruction2`).
 
 The earlier statement, kept for its history:
 
