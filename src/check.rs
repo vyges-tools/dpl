@@ -179,7 +179,11 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool) -> Report {
     let ys = row_ys(db);
     let sw = site_width(db);
     let x0 = core_x_min(db);
-    let insts: Vec<String> = (0..db.num_insts()).map(|i| db.nth_inst_name(i)).collect();
+    // `createNetwork`'s cells, in its ORDER — name-sorted, less the non-core-auto-placeable
+    // masters and the fixed instances outside the rows' outer shell. ⛔ The order decides which
+    // of two overlapping cells is painted first, and the filter decides what is checked at all:
+    // `obstruction1`'s four corner endcaps sit outside the core and upstream never sees them.
+    let insts: Vec<String> = crate::network::network_insts(db);
 
     // Cells to consider: upstream skips anything that is not `Node::CELL`, and applies the
     // site-alignment and in-rows checks only to STD CELLS. A block (macro) is neither.
@@ -308,12 +312,14 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool) -> Report {
             out.failures.push(Failure { family: "placed".into(), cell: name.clone(), with: None });
         }
 
-        // BLOCK/BLOCK overlaps are allowed, so a pair is only a failure when at least one is a cell.
-        if let Some((other, _, _)) = boxes.iter().enumerate().find(|(j, (_, ob, oblk))| {
-            *j != idx && !misaligned.contains(j) && !(*blk && *oblk) && rects_overlap(*bx, *ob)
-        }).map(|(_, t)| t) {
-            out.failures.push(Failure { family: "overlap".into(), cell: name.clone(),
-                                        with: Some(other.clone()) });
+        // `checkOverlap` without a grid (none could be built): the cells visited BEFORE this one.
+        if drc_grid.is_none() {
+            if let Some((other, _, _)) = boxes[..idx].iter().enumerate().find(|(j, (_, ob, oblk))| {
+                !misaligned.contains(j) && !(*blk && *oblk) && rects_overlap(*bx, *ob)
+            }).map(|(_, t)| t) {
+                out.failures.push(Failure { family: "overlap".into(), cell: name.clone(),
+                                            with: Some(other.clone()) });
+            }
         }
 
         // ── PlacementDRC, in upstream's order ────────────────────────────────────────────────
@@ -326,8 +332,26 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool) -> Report {
             let (gx0, gy0, gx1, gy1) = g.covering(cx, cy, bx.2 as i32, bx.3 as i32);
             let me = idx as u32;
 
-            // `checkOverlap` is what paints `pixel->cell` upstream; the rectangle sweep above
-            // gives the same answer set but paints nothing, so the paint happens here.
+            // `checkOverlap`: over the cell's squares, a square ALREADY holding another cell that
+            // genuinely overlaps this one (`overlap`: strict, BLOCK/BLOCK exempt) makes this cell
+            // fail; an empty square is claimed. ⛔ So only the LATER cell of a pair fails — the
+            // first painted its squares before the second arrived. A rectangle sweep over all
+            // cells reported BOTH: `check2`, 2 failures where upstream reports 1.
+            let mut overlap_with: Option<usize> = None;
+            for gx in gx0..gx1 {
+                for gy in gy0..gy1 {
+                    if let Some(o) = g.pixel(gx, gy).and_then(|p| p.cell) {
+                        let o = o as usize;
+                        if o != idx && !(*blk && boxes[o].2) && rects_overlap(*bx, boxes[o].1) {
+                            overlap_with = Some(o);
+                        }
+                    }
+                }
+            }
+            if let Some(o) = overlap_with {
+                out.failures.push(Failure { family: "overlap".into(), cell: name.clone(),
+                                            with: Some(boxes[o].0.clone()) });
+            }
             g.paint_cell(cx, cy, bx.2 as i32, bx.3 as i32, Some(me));
 
             let cls = classes[idx];

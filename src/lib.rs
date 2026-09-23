@@ -27,6 +27,7 @@ pub mod drc;
 pub mod fillers;
 pub mod grid;
 pub mod negotiate;
+pub mod network;
 pub mod place;
 
 /// This crate's version, as Cargo knows it — the single number the whole suite is released on.
