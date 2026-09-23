@@ -399,6 +399,16 @@ impl Setup {
         if xp < xl || xp > xr { None } else { Some(xp) }
     }
 
+    /// [`Setup::align_pos`] for the optimizers.
+    pub(crate) fn align_pos_pub(&self, nd: usize, xi: i32, xl: i32, xr: i32) -> Option<i32> {
+        self.align_pos(nd, xi, xl, xr)
+    }
+
+    /// `DetailedMgr::eraseFromGrid`.
+    pub(crate) fn erase_cell(&mut self, nd: usize) {
+        self.erase_from_grid(nd);
+    }
+
     /// `checkSiteOrientation` — the row at `gridSnapDownY(y)` offers the cell's site at `gridX(x)`.
     fn check_site_orientation(&self, nd: usize, x: i32, y: i32) -> bool {
         let g = &self.rt.grid;

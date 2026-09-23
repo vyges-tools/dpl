@@ -22,10 +22,15 @@ pub struct Options {
     pub rng_skip: Option<u64>,
     /// Print a `VYGS|stage|…` line at every stage boundary, the reference trace's format.
     pub trace_stages: bool,
-    /// ⬜ **A correlation aid, like `rng_skip`.** A reference `VYGS|stage|default|begin` record:
-    /// every movable cell is put where it says (and oriented) before `default` runs, so the random
-    /// improver and flipping can be compared on designs where the unbuilt stages MOVE cells.
-    pub inject: Option<String>,
+    /// ⬜ **A correlation aid, like `rng_skip`.** A file of reference `VYGS|stage` records: at
+    /// [`Options::start_stage`]'s `begin`, every movable cell is put where that record says (and
+    /// oriented), so one stage can be compared on its own whatever the others do.
+    pub inject_file: Option<String>,
+    /// Run from this stage (the stages before it are skipped; `rng_skip` and `inject_file` apply
+    /// at its `begin`). `None` runs the whole script.
+    pub start_stage: Option<String>,
+    /// Stop after this stage's `end` (no `orient`, no checks).
+    pub stop_stage: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -46,7 +51,26 @@ pub fn improve(s: &mut Setup, opts: &Options) -> Result<Report, String> {
         &["ro", "-p", "10", "-t", "0.005"],
         &["default", "-p", "5", "-f", "20", "-gen", "rng", "-obj", "hpwl", "-cost", "(hpwl)"],
     ];
+    let mut started = opts.start_stage.is_none();
     for args in script {
+        if !started {
+            if opts.start_stage.as_deref() != Some(args[0]) {
+                rep.not_done.push(format!("{} (skipped)", args[0]));
+                continue;
+            }
+            started = true;
+            if let Some(n) = opts.rng_skip {
+                for _ in 0..n {
+                    s.rt.rng.next_u32();
+                }
+            }
+            if let Some(f) = &opts.inject_file {
+                let text = std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?;
+                let key = format!("VYGS|stage|{}|begin|", args[0]);
+                let rec = text.lines().find(|l| l.starts_with(&key)).ok_or(format!("no {key} record"))?;
+                s.inject_cells(rec)?;
+            }
+        }
         let name = match args[0] {
             "mis" => "independent set matching",
             "gs" => "global swaps",
@@ -55,29 +79,25 @@ pub fn improve(s: &mut Setup, opts: &Options) -> Result<Report, String> {
             _ => "random improvement",
         };
         s.log.push(format!("[INFO DPL-0303] Running algorithm for {name}."));
-        if args[0] == "default" {
-            if let Some(n) = opts.rng_skip {
-                for _ in 0..n {
-                    s.rt.rng.next_u32();
-                }
-            }
-            if let Some(rec) = &opts.inject {
-                s.inject_cells(rec)?;
-            }
-        }
         stage_line(s, opts, &mut rep, args[0], "begin");
         match args[0] {
-            "default" => {
-                random_improver(s, args);
-            }
-            other => {
-                if opts.rng_skip.is_none() {
-                    return Err(format!("improve_placement stage '{other}' is not implemented"));
-                }
-                rep.not_done.push(other.to_string());
-            }
+            "default" => random_improver(s, args),
+            "gs" => global_swap(s, args),
+            "ro" => reorder(s, args),
+            other => return Err(format!("improve_placement stage '{other}' is not implemented")),
         }
         stage_line(s, opts, &mut rep, args[0], "end");
+        if opts.stop_stage.as_deref() == Some(args[0]) {
+            rep.hpwl_after = s.total_hpwl();
+            return Ok(rep);
+        }
+    }
+    // `disallow_one_site_gaps;` is appended to the script when the technology has no one-site
+    // master: `doDetailedCommand` announces it, prints the stage's begin, and runs NOTHING — the
+    // command falls through to `else { return; }` before any end.
+    if s.rt.disallow_gaps && opts.stop_stage.is_none() {
+        s.log.push("[INFO DPL-0303] Running algorithm for disallow_one_site_gaps.".into());
+        stage_line(s, opts, &mut rep, "disallow_one_site_gaps", "begin");
     }
     stage_line(s, opts, &mut rep, "orient", "begin");
     orient(s, true);
@@ -299,6 +319,421 @@ fn generate(s: &mut Setup, candidates: &[usize], gen: &mut (u64, u64, u64)) -> b
         if trace { eprintln!("VYGR|try|{}|{}|{}|{}|fail", s.nodes[ndi].name, tx, ty, sj); }
     }
     false
+}
+
+// ── global swap (legacy) ─────────────────────────────────────────────────────────────────────
+
+/// `-p N -t T` with `tol = max(tol, 0.01)`, `passes = max(passes, 1)`.
+fn passes_tol(args: &[&str]) -> (i32, f64) {
+    let (mut passes, mut tol) = (1i32, 0.01f64);
+    let mut i = 1;
+    while i < args.len() {
+        match args[i] {
+            "-p" if i + 1 < args.len() => { i += 1; passes = args[i].parse().unwrap_or(1); }
+            "-t" if i + 1 < args.len() => { i += 1; tol = args[i].parse().unwrap_or(0.01); }
+            _ => {}
+        }
+        i += 1;
+    }
+    (passes.max(1), tol.max(0.01))
+}
+
+/// `legacy::DetailedGlobalSwap::run` — passes of [`global_swap_pass`] until the HPWL change is
+/// within `tol`.
+fn global_swap(s: &mut Setup, args: &[&str]) {
+    let (passes, tol) = passes_tol(args);
+    let mut curr = s.total_hpwl_xy() as i64;
+    let init = curr;
+    if init == 0 {
+        return;
+    }
+    for p in 1..=passes {
+        let last = curr;
+        global_swap_pass(s);
+        curr = s.total_hpwl_xy() as i64;
+        s.log.push(format!("[INFO DPL-0306] Pass {p:3} of global swaps; hpwl is {}.", sci(curr as f64)));
+        if last == 0 || (curr - last).abs() as f64 / last as f64 <= tol {
+            break;
+        }
+    }
+    let imp = (init - curr) as f64 / init as f64 * 100.0;
+    s.log.push(format!("[INFO DPL-0307] End of global swaps; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
+}
+
+/// `globalSwap` — every single-height cell once, in shuffled order, toward its nets' median box.
+fn global_swap_pass(s: &mut Setup) {
+    s.resort_segments();
+    let mut candidates = s.single.clone();
+    s.rt.rng.shuffle(&mut candidates);
+    let mut obj = Hpwl { edge: vec![0; s.rt.edges.len()], pending: Vec::new() };
+    let mut curr = obj.curr(s);
+    for ndi in candidates {
+        if !gs_generate(s, ndi) {
+            continue;
+        }
+        let next = curr - obj.delta(s);
+        if next <= curr {
+            obj.accept(s);
+            s.accept_move();
+            curr = next;
+        } else {
+            s.reject_move();
+        }
+    }
+}
+
+/// `getRange` — the median box of the cell's nets (each net's box without this cell, turned into
+/// a range for the cell centre and clamped to the chip). ⚠️ Nets of MORE than 100 pins are
+/// skipped here (`>`), where the HPWL objective skips 100 or more (`>=`).
+fn gs_range(s: &Setup, nd: usize) -> Option<(i32, i32, i32, i32)> {
+    let a = &s.arch;
+    let (xmin, xmax, ymin, ymax) = (a.min_x, a.max_x, a.min_y, a.max_y);
+    let (mut xs, mut ys) = (Vec::new(), Vec::new());
+    for &p in &s.rt.node_pins[nd] {
+        let e = s.rt.pins[p].edge;
+        let np = s.rt.edges[e].len();
+        if np <= 1 || np > 100 {
+            continue;
+        }
+        // `calculateEdgeBB(ed, nd)`: every pin but those on `nd`.
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        let mut count = 0;
+        for &q in &s.rt.edges[e] {
+            let pin = &s.rt.pins[q];
+            if pin.node == nd {
+                continue;
+            }
+            let n = &s.nodes[pin.node];
+            let (cx, cy) = (n.left + n.width / 2 + pin.ox, n.bottom + n.height / 2 + pin.oy);
+            x0 = x0.min(cx);
+            x1 = x1.max(cx);
+            y0 = y0.min(cy);
+            y1 = y1.max(cy);
+            count += 1;
+        }
+        if count == 0 {
+            continue;
+        }
+        let (ox, oy) = (s.rt.pins[p].ox, s.rt.pins[p].oy);
+        xs.push(xmin.max(x0 - ox).min(xmax));
+        xs.push(xmax.min(x1 - ox).max(xmin));
+        ys.push(ymin.max(y0 - oy).min(ymax));
+        ys.push(ymax.min(y1 - oy).max(ymin));
+    }
+    let t = xs.len();
+    if t <= 1 {
+        return None;
+    }
+    let mid = t >> 1;
+    xs.sort();
+    ys.sort();
+    Some((xs[mid - 1], ys[mid - 1], xs[mid], ys[mid]))
+}
+
+/// `legacy::DetailedGlobalSwap::generate(ndi)`.
+fn gs_generate(s: &mut Setup, ndi: usize) -> bool {
+    let n = &s.nodes[ndi];
+    let yi = n.bottom as f64 + 0.5 * n.height as f64;
+    let xi = n.left as f64 + 0.5 * n.width as f64;
+    let Some((mut bx0, mut by0, mut bx1, mut by1)) = gs_range(s, ndi) else { return false };
+    if xi >= bx0 as f64 && xi <= bx1 as f64 && yi >= by0 as f64 && yi <= by1 as f64 {
+        return false;
+    }
+    let (dx, dy) = s.rt.max_disp;
+    let (lx0, ly0, lx1, ly1) = (n.left - dx, n.bottom - dy, n.left + dx, n.bottom + dy);
+    if lx1 <= bx0 {
+        bx0 = n.left;
+        bx1 = lx1;
+    } else if lx0 >= bx1 {
+        bx0 = lx0;
+        bx1 = n.left;
+    } else {
+        bx0 = bx0.max(lx0);
+        bx1 = bx1.min(lx1);
+    }
+    if ly1 <= by0 {
+        by0 = n.bottom;
+        by1 = ly1;
+    } else if ly0 >= by1 {
+        by0 = ly0;
+        by1 = n.bottom;
+    } else {
+        by0 = by0.max(ly0);
+        by1 = by1.min(ly1);
+    }
+    if s.cell_segs[ndi].len() != 1 {
+        return false;
+    }
+    let si = s.cell_segs[ndi][0];
+    let xj = (0.5 * (bx0 + bx1) as f64 - 0.5 * n.width as f64).floor() as i32;
+    let yj = (0.5 * (by0 + by1) as f64 - 0.5 * n.height as f64).floor() as i32;
+    let rj = s.arch.find_closest_row(yj);
+    let yj = s.arch.rows[rj].bottom;
+    let Some(sj) = s.segs_in_row[rj].iter().copied()
+        .find(|&sg| xj >= s.segments[sg].min_x && xj <= s.segments[sg].max_x) else { return false };
+    if s.nodes[ndi].group != s.segments[sj].reg {
+        return false;
+    }
+    let (x0, y0) = (s.nodes[ndi].left, s.nodes[ndi].bottom);
+    s.try_move(ndi, x0, y0, si, xj, yj, sj) || s.try_swap(ndi, x0, y0, si, xj, yj, sj)
+}
+
+// ── reorder ──────────────────────────────────────────────────────────────────────────────────
+
+/// `std::next_permutation`.
+fn next_permutation(v: &mut [usize]) -> bool {
+    let n = v.len();
+    if n < 2 {
+        return false;
+    }
+    let mut i = n - 1;
+    while i > 0 && v[i - 1] >= v[i] {
+        i -= 1;
+    }
+    if i == 0 {
+        v.reverse();
+        return false;
+    }
+    let mut j = n - 1;
+    while v[j] <= v[i - 1] {
+        j -= 1;
+    }
+    v.swap(i - 1, j);
+    v[i..].reverse();
+    true
+}
+
+/// `DetailedReorderer::run` — windows of 3 single-height cells, every permutation tried.
+fn reorder(s: &mut Setup, args: &[&str]) {
+    let (passes, tol) = passes_tol(args);
+    let window = 3usize.clamp(2, 4); // `-w` absent: 3, then `min(4, max(2, w))`.
+    s.resort_segments();
+    let mut curr = s.total_hpwl_xy() as i64;
+    let init = curr;
+    if init == 0 {
+        return;
+    }
+    for p in 1..=passes {
+        let last = curr;
+        reorder_pass(s, window);
+        curr = s.total_hpwl_xy() as i64;
+        s.log.push(format!("[INFO DPL-0304] Pass {p:3} of reordering; objective is {}.", sci(curr as f64)));
+        if last == 0 || (curr - last).abs() as f64 / last as f64 <= tol {
+            break;
+        }
+    }
+    s.resort_segments();
+    let imp = (init - curr) as f64 / init as f64 * 100.0;
+    s.log.push(format!("[INFO DPL-0305] End of reordering; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
+}
+
+/// `reorder()` — per segment, over each run of single-height cells. ⛔ The window loop runs while
+/// `i + window <= jstop`, so the run's LAST cell is never in a window — transcribed.
+fn reorder_pass(s: &mut Setup, window: usize) {
+    let mut mask = vec![0u64; s.rt.edges.len()];
+    let mut traversal = 0u64;
+    for sg in 0..s.segments.len() {
+        if s.cells_in_seg[sg].len() < 2 {
+            continue;
+        }
+        sort_cells_in_seg(s, sg, 0, s.cells_in_seg[sg].len());
+        let n = s.cells_in_seg[sg].len() as i64;
+        let mut j = 0i64;
+        while j < n {
+            while j < n && s.arch.height_in_rows(&s.nodes[s.cells_in_seg[sg][j as usize]]) != 1 {
+                j += 1;
+            }
+            let jstrt = j;
+            while j < n && s.arch.height_in_rows(&s.nodes[s.cells_in_seg[sg][j as usize]]) == 1 {
+                j += 1;
+            }
+            let jstop = j - 1;
+            let mut i = jstrt;
+            while i + window as i64 <= jstop {
+                let mut istrt = i;
+                let istop = jstop.min(istrt + window as i64 - 1);
+                if istop == jstop {
+                    istrt = jstrt.max(istop - window as i64 + 1);
+                }
+                let nodes = &s.cells_in_seg[sg];
+                let seg = &s.segments[sg];
+                let mut right_limit = seg.max_x;
+                if istop != n - 1 {
+                    let next = nodes[(istop + 1) as usize];
+                    right_limit = (s.nodes[next].left - s.rt.pads[next].0).min(right_limit);
+                }
+                let mut left_limit = seg.min_x;
+                if istrt != 0 {
+                    let prev = nodes[(istrt - 1) as usize];
+                    left_limit = (s.nodes[prev].right() + s.rt.pads[prev].1).max(left_limit);
+                }
+                reorder_window(s, sg, istrt as usize, istop as usize, left_limit, right_limit, &mut mask, &mut traversal);
+                i += 1;
+            }
+        }
+    }
+}
+
+/// `sortCellsInSeg(seg, start, end)` — by centre (ties cannot occur between legally placed cells).
+fn sort_cells_in_seg(s: &mut Setup, sg: usize, a: usize, b: usize) {
+    let nodes = &s.nodes;
+    s.cells_in_seg[sg][a..b].sort_by_key(|&c| nodes[c].center_x());
+}
+
+/// `DetailedReorderer::cost` — the X-extent of every net on the window's cells, each once; `MAX`
+/// if any cell has a placement violation where it now sits.
+fn reorder_cost(s: &Setup, cells: &[usize], mask: &mut [u64], traversal: &mut u64) -> f64 {
+    *traversal += 1;
+    let mut cost = 0.0;
+    for &nd in cells {
+        if s.has_placement_violation(nd) {
+            return f64::MAX;
+        }
+        for &p in &s.rt.node_pins[nd] {
+            let e = s.rt.pins[p].edge;
+            let np = s.rt.edges[e].len();
+            if np <= 1 || np >= SKIP_NETS_LARGER_THAN || mask[e] == *traversal {
+                continue;
+            }
+            mask[e] = *traversal;
+            let (mut x0, mut x1) = (i32::MAX, i32::MIN);
+            for &q in &s.rt.edges[e] {
+                let pin = &s.rt.pins[q];
+                let n = &s.nodes[pin.node];
+                let x = n.left + n.width / 2 + pin.ox;
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+            }
+            cost += (x1 - x0) as f64;
+        }
+    }
+    cost
+}
+
+/// Move `nd` to `x` in place: `eraseFromGrid`, `setLeft`, `paintInGrid`.
+fn repaint_at(s: &mut Setup, nd: usize, x: i32) {
+    s.erase_cell(nd);
+    s.nodes[nd].left = x;
+    s.paint_in_grid(nd);
+}
+
+/// `DetailedReorderer::reorder(nodes, jstrt, jstop, …)` — spread the window's cells over
+/// `[left, right]`, try every order, keep the cheapest, re-align, and restore on any failure.
+#[allow(clippy::too_many_arguments)]
+fn reorder_window(s: &mut Setup, sg: usize, jstrt: usize, jstop: usize, left_limit: i32, right_limit: i32,
+                  mask: &mut [u64], traversal: &mut u64) {
+    let size = jstop + 1 - jstrt;
+    let cells: Vec<usize> = s.cells_in_seg[sg][jstrt..=jstop].to_vec();
+    let orig: Vec<i32> = cells.iter().map(|&c| s.nodes[c].left).collect();
+    let (mut left, mut right, mut width) = (vec![0i32; size], vec![0i32; size], vec![0i32; size]);
+    let (mut total_pad, mut total_w) = (0i32, 0i32);
+    for i in 0..size {
+        let c = cells[i];
+        left[i] = s.rt.pads[c].0;
+        right[i] = s.rt.pads[c].1;
+        width[i] = s.nodes[c].width;
+        total_pad += left[i] + right[i];
+        total_w += width[i];
+    }
+    let span = right_limit - left_limit;
+    if span < total_w + total_pad {
+        return;
+    }
+    let space_per_cell = (span - (total_w + total_pad)) / size as i32;
+    let site_w = s.arch.rows[0].site_width;
+    let per_total = space_per_cell / site_w;
+    let per_right = per_total >> 1;
+    let per_left = per_total - per_right;
+    for i in 0..size {
+        if total_w + total_pad + per_right * site_w < span {
+            total_pad += per_right * site_w;
+            right[i] += per_right * site_w;
+        }
+        if total_w + total_pad + per_left * site_w < span {
+            total_pad += per_left * site_w;
+            left[i] += per_left * site_w;
+        }
+    }
+    if span < total_w + total_pad {
+        return;
+    }
+    let mut best_cost = reorder_cost(s, &cells, mask, traversal);
+    let orig_cost = best_cost;
+    let (mut best_pos, mut curr_pos) = (vec![0i32; size], vec![0i32; size]);
+    let mut order: Vec<usize> = (0..size).collect();
+    let mut found = false;
+    loop {
+        let mut disp_ok = true;
+        let mut x = left_limit;
+        for i in 0..size {
+            let ix = order[i];
+            let nd = cells[ix];
+            x += left[ix];
+            curr_pos[ix] = x;
+            repaint_at(s, nd, curr_pos[ix]);
+            x += width[ix];
+            x += right[ix];
+            if (s.nodes[nd].left - s.rt.orig[nd].0).abs() > s.rt.max_disp.0 {
+                disp_ok = false;
+            }
+        }
+        if disp_ok {
+            let c = reorder_cost(s, &cells, mask, traversal);
+            if c < best_cost {
+                best_pos = curr_pos.clone();
+                best_cost = c;
+                found = true;
+            }
+        }
+        if !next_permutation(&mut order) {
+            break;
+        }
+    }
+    if !found {
+        for i in 0..size {
+            repaint_at(s, cells[i], orig[i]);
+        }
+        return;
+    }
+    for i in 0..size {
+        repaint_at(s, cells[i], best_pos[i]);
+    }
+    sort_cells_in_seg(s, sg, jstrt, jstop + 1);
+    // Re-align, reading the window from the (re-sorted) segment list, as upstream's `nodes` alias.
+    let (mut shifted, mut failed) = (false, false);
+    let mut left_edge = left_limit;
+    for i in 0..size {
+        let nd = s.cells_in_seg[sg][jstrt + i];
+        let x0 = s.nodes[nd].left;
+        let Some(x) = s.align_pos_pub(nd, x0, left_edge, right_limit) else {
+            failed = true;
+            break;
+        };
+        if x != x0 {
+            shifted = true;
+        }
+        repaint_at(s, nd, x);
+        left_edge = s.nodes[nd].right();
+        if (s.nodes[nd].left - s.rt.orig[nd].0).abs() > s.rt.max_disp.0 {
+            failed = true;
+            break;
+        }
+    }
+    let window: Vec<usize> = s.cells_in_seg[sg][jstrt..=jstop].to_vec();
+    if !failed && shifted && reorder_cost(s, &window, mask, traversal) >= orig_cost {
+        failed = true;
+    }
+    if !failed && window.iter().any(|&nd| s.has_placement_violation(nd)) {
+        failed = true;
+    }
+    if failed {
+        // `origLeft[ndi]` — by cell, whatever the list order now is.
+        for &nd in &window {
+            let k = cells.iter().position(|&c| c == nd).unwrap();
+            repaint_at(s, nd, orig[k]);
+        }
+        sort_cells_in_seg(s, sg, jstrt, jstop + 1);
+    }
 }
 
 // ── orient -f ────────────────────────────────────────────────────────────────────────────────

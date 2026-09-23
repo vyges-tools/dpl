@@ -137,7 +137,9 @@ const DESCRIBE: &str = r#"{
         { "arg": "random_seed", "flag": "--random-seed", "description": "the optimizers' random seed (default 1)" },
         { "arg": "max_displacement", "flag": "--max-displacement", "description": "move cap in ROW HEIGHTS, 'X' or 'X,Y' (upstream's -max_displacement)" },
         { "arg": "trace_stages", "flag": "--trace-stages", "description": "print each stage's generator state and cell positions" },
-        { "arg": "inject_stage", "flag": "--inject-stage", "description": "correlation aid: start the random improver from a reference VYGS default|begin record in FILE" },
+        { "arg": "inject_stage", "flag": "--inject-stage", "description": "correlation aid: place the cells as FILE's VYGS begin record for the start stage says" },
+        { "arg": "start_stage", "flag": "--start-stage", "description": "correlation aid: skip the stages before this one" },
+        { "arg": "stop_stage", "flag": "--stop-stage", "description": "correlation aid: stop after this stage" },
         { "arg": "rng_skip", "flag": "--rng-skip", "description": "correlation aid: treat the unbuilt stages as no-ops and discard N draws" }
       ],
       "assertion": { "id": "placement-improved", "field": "status", "pass_when": { "eq": "improved" } }
@@ -419,11 +421,9 @@ fn improve_placement(args: &[String]) -> ExitCode {
                 max_disp = match v.as_slice() { [x] => (*x, *x), [x, y] => (*x, *y), _ => (0, 0) };
             }
             "--out-odb" => { i += 1; out_odb = args.get(i).cloned(); }
-            "--inject-stage" => {
-                i += 1;
-                opts.inject = args.get(i).and_then(|f| std::fs::read_to_string(f).ok())
-                    .and_then(|t| t.lines().find(|l| l.starts_with("VYGS|stage|default|begin|")).map(str::to_string));
-            }
+            "--inject-stage" => { i += 1; opts.inject_file = args.get(i).cloned(); }
+            "--start-stage" => { i += 1; opts.start_stage = args.get(i).cloned(); }
+            "--stop-stage" => { i += 1; opts.stop_stage = args.get(i).cloned(); }
             "--rng-skip" => {
                 i += 1;
                 opts.rng_skip = args.get(i).and_then(|v| v.parse().ok());
