@@ -3164,10 +3164,17 @@ fn footprint_of<'a>(c: &SweepCell, x: i32, y: i32, grid: &'a NegGrid)
 }
 
 fn cell_is_legal(c: &SweepCell, ctx: &SweepCtx) -> bool {
-    if !(ctx.placeable)(c, c.x, c.y) || (ctx.drc_violations)(c, c.x, c.y, ctx.grid) > 0 {
+    is_legal_with(c, ctx.placeable, ctx.drc_violations, ctx.grid)
+}
+
+/// `isCellLegal` at the cell's current square: `inDie → isValidRow → respectsFence` (`placeable`),
+/// then `checkDRC` (no violation counted), then the footprint's capacity and overuse.
+fn is_legal_with(c: &SweepCell, placeable: &dyn Fn(&SweepCell, i32, i32) -> bool,
+                 drc: &dyn Fn(&SweepCell, i32, i32, &NegGrid) -> i32, grid: &NegGrid) -> bool {
+    if !placeable(c, c.x, c.y) || drc(c, c.x, c.y, grid) > 0 {
         return false;
     }
-    footprint_is_legal(c, c.x, c.y, ctx.grid)
+    footprint_is_legal(c, c.x, c.y, grid)
 }
 
 /// `isCellLegal`'s FINAL loop: every square of the footprint must have capacity and no overuse.
@@ -3209,10 +3216,6 @@ pub const NOT_DONE: &[&str] = &[
     // filter and `isCellLegal`, and `groupInitPixels` before capacity is built — all five
     // negotiation region cases exact. ⬜ `canBePlaced`'s group and region tests are transcribed
     // but golden-blind: no case's negotiation reaches `diamondRecovery`.
-    // ⚠️ THREE of `countDRCViolations`' four terms are evaluated (edge spacing, padding/overlap,
-    // one-site gaps). Blocked layers needs each master's layer set, so the DRC penalty is still
-    // an UNDER-count — it never over-reports, but it may prefer a location upstream would not.
-    "drc: blocked_layers is not evaluated by the legalizer",
     // ⬜ `-incremental`: upstream clears `setPlaced(false)` on every movable cell unless it is
     // given. This engine has no per-cell `placed` flag, so the flag would be inert.
     "incremental placement (-incremental)",
@@ -3674,9 +3677,8 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
     // that of `pixel->cell`, not of usage, and the two disagree on a shared square. See
     // [`NegPixel::cell`].
     //
-    // ⬜ Three of `PlacementDRC`'s four rules are wired: this one, `checkPadding` and
-    // `checkEdgeSpacing` (below). Blocked layers needs each occupant's layer set and stays in
-    // `NOT_DONE`.
+    // ✅ All four of `PlacementDRC`'s rules are wired: this one, `checkPadding`, `checkEdgeSpacing`
+    // and `checkBlockedLayers` (below).
     let one_site_gaps_disallowed = !db.has_one_site_master();
 
     // `checkEdgeSpacing` — LEF58 cell-edge spacing (`makeCellEdgeSpacingTable` + `addMaster`'s edge
@@ -3740,6 +3742,18 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             &|o| placed_edges(o, g),
         )
     };
+    // `checkBlockedLayers` — the DPL grid's `blocked_layers` (vertical M2/M3 special straps) under
+    // the cell's DPL footprint, against `Node::getUsedLayers` (each pin level and the one above).
+    // It reads the STATIC mask, not occupancy, so it needs no `NegGrid`.
+    let used_layers: Vec<u32> = masters.iter().map(|m| {
+        crate::drc::used_layers(db.master_pin_boxes(m).unwrap_or_default().into_iter()
+            .filter_map(|(ln, ..)| levels.get(&db.layer_name_by_number(ln)).copied()))
+    }).collect();
+    let blocked_ok = |i: usize, x: i32, y: i32| -> bool {
+        let (cw, ch) = dpl_dims[i];
+        crate::drc::check_blocked_layers(x, x + cw, y, y + ch, used_layers[i],
+            &|px, py| grid.pixel(px as i64, py as i64).map(|p| p.blocked_layers))
+    };
     let gap_ok = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
         // `checkOneSiteGap` measures the cell with `grid_->gridWidth(cell)`.
         let (cw, ch) = dpl_dims[i];
@@ -3789,6 +3803,41 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             })
     };
 
+    // ── `isCellLegal`'s parts, defined ONCE ─────────────────────────────────────────────────
+    //
+    // ⛔ The seeding scan below and the sweep's `cell_is_legal` both evaluate them through
+    // [`is_legal_with`]. The seeding used to be a hand-copy of the test, and went stale twice: the
+    // fence and blocked-layer clauses reached the sweep and not the seeding.
+    let names: Vec<String> = cells.iter().map(|c| c.name.clone()).collect();
+    let by_name: std::collections::HashMap<&str, usize> =
+        names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    // `inDie → isValidRow → respectsFence`, the filter `tryLocation` and `isCellLegal` share.
+    let placeable = |c: &SweepCell, x: i32, y: i32| {
+        site_ok(by_name[c.name.as_str()], x, y) && fences.respects(&c.name, x, y, c.width, c.height)
+    };
+    // `countDRCViolations` — all four of upstream's terms. ⚠️ A cost function missing a term
+    // does not fail; it quietly prefers different locations, which is why blocked layers
+    // (wired 2026-09-22, once the mask was built as `markBlocked` builds it) mattered.
+    let drc = |c: &SweepCell, x: i32, y: i32, g: &NegGrid| -> i32 {
+        let i = by_name[c.name.as_str()];
+        let mut count = 0;
+        // `countDRCViolations`, in upstream's order: edge spacing, padding, blocked layers,
+        // one-site gaps.
+        if !edge_ok(i, x, y, g) {
+            count += 1;
+        }
+        if !pad_ok(i, x, y, g) {
+            count += 1;
+        }
+        if !blocked_ok(i, x, y) {
+            count += 1;
+        }
+        if !gap_ok(i, x, y, g) {
+            count += 1;
+        }
+        count
+    };
+
     // 4. Who starts illegal.
     //
     // ⛔ Upstream's seeding scan is `isCellLegal`, which CALLS `checkDRC`. Leaving the DRC out
@@ -3799,12 +3848,11 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
         let c = &cells[i];
         // ⛔ The SAME footprint test the sweep's isolation skip uses — capacity AND overuse.
         // Testing overuse alone here let a cell inside a hard blockage seed as legal.
-        if !footprint_is_legal(c, c.x, c.y, &ngrid)
-            || !site_ok(i, c.x, c.y)
-            || !pad_ok(i, c.x, c.y, &ngrid)
-            || !gap_ok(i, c.x, c.y, &ngrid)
-            || !edge_ok(i, c.x, c.y, &ngrid)
-        {
+        //
+        // ⛔ `isCellLegal` itself, through the SAME parts the sweep uses. A cell whose only fault
+        // was a power strap over it once seeded as legal here and was never moved
+        // (`dpl-witness.py legalize_off_m2_strap`: the reference moves it one site).
+        if !is_legal_with(c, &placeable, &drc, &ngrid) {
             illegal.push(i);
         }
     }
@@ -3866,9 +3914,6 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
     let outcome = if active.is_empty() {
         Outcome::Converged { phase: 1, iter: 0 }
     } else {
-        let names: Vec<String> = cells.iter().map(|c| c.name.clone()).collect();
-        let by_name: std::collections::HashMap<&str, usize> =
-            index.iter().map(|&i| (names[i].as_str(), i)).collect();
         let window = |c: &SweepCell, x: i32, y: i32, g: &NegGrid| -> (i32, i32, Vec<i32>) {
             let i = by_name[c.name.as_str()];
             let (cw, ch) = (c.width, c.height);
@@ -3913,39 +3958,9 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             );
             (w.dx_lo, w.dx_hi, w.rows)
         };
-        // `inDie → isValidRow → respectsFence`, the filter `tryLocation` and `isCellLegal` share.
-        let placeable = |c: &SweepCell, x: i32, y: i32| {
-            site_ok(by_name[c.name.as_str()], x, y) && fences.respects(&c.name, x, y, c.width, c.height)
-        };
-        // `countDRCViolations`, as far as this engine can evaluate it.
-        //
-        // ⚠️ **Three of upstream's four terms** — edge spacing, padding and one-site gaps; blocked
-        // layers contributes 0 and is named in `not_done`. A cost function missing a term does not
-        // fail — it quietly prefers different locations.
-        let idx_of: std::collections::HashMap<&str, usize> =
-            index.iter().map(|&i| (names[i].as_str(), i)).collect();
-        let drc = |c: &SweepCell, x: i32, y: i32, g: &NegGrid| -> i32 {
-            let i = idx_of[c.name.as_str()];
-            let mut count = 0;
-            // `countDRCViolations`, in upstream's order: edge spacing, padding, (blocked layers),
-            // one-site gaps.
-            if !edge_ok(i, x, y, g) {
-                count += 1;
-            }
-            if !pad_ok(i, x, y, g) {
-                count += 1;
-            }
-            if !gap_ok(i, x, y, g) {
-                count += 1;
-            }
-            count
-        };
-
-        // `Opendp::canBePlaced` — `diamondSearch`'s acceptance test, and a DIFFERENT question
-        // from `isCellLegal`.
-        //
-        // ⛔ **It demands an EMPTY square, not merely an un-overused one.** Negotiation tolerates
-        // overlap and prices it; the diamond search does not tolerate it at all. A recovery that
+        // `countDRCViolations` — all four of upstream's terms. ⚠️ A cost function missing a term
+        // does not fail; it quietly prefers different locations, which is why blocked layers
+        // (wired 2026-09-22, once the mask was built as `markBlocked` builds it) diamond search does not tolerate it at all. A recovery that
         // reused `isCellLegal` would hand a stuck cell a square another cell already holds.
         //
         // ⚠️ **The one-site-gap term here uses `Place.cpp`'s edge reading**, where an off-grid
@@ -4035,8 +4050,9 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             {
                 return false;
             }
-            // The trailing `drc_engine_->checkDRC(...)`.
-            pad_ok(i, x, y, g) && gap_ok(i, x, y, g) && edge_ok(i, x, y, g)
+            // The trailing `drc_engine_->checkDRC(...)`: blocked layers, one-site gap, padding,
+            // edge spacing.
+            blocked_ok(i, x, y) && gap_ok(i, x, y, g) && pad_ok(i, x, y, g) && edge_ok(i, x, y, g)
         };
 
         // ⚠️ **`calcDist` is in DBU, not in grid steps** — `|dx| * site_width` plus the DBU
