@@ -3205,7 +3205,10 @@ use vyges_opendb::Db;
 /// ⛔ Reported on every run for the same reason `place::NOT_DONE` is: a legalizer that quietly
 /// omits a check reports fewer violations than it earned.
 pub const NOT_DONE: &[&str] = &[
-    "groups_and_regions (respectsFence / initFenceRegions)",
+    // ✅ Regions are implemented: `initFenceRegions` + `respectsFence` in the snap, the candidate
+    // filter and `isCellLegal`, and `groupInitPixels` before capacity is built — all five
+    // negotiation region cases exact. ⬜ `canBePlaced`'s group and region tests are transcribed
+    // but golden-blind: no case's negotiation reaches `diamondRecovery`.
     // ⚠️ THREE of `countDRCViolations`' four terms are evaluated (edge spacing, padding/overlap,
     // one-site gaps). Blocked layers needs each master's layer set, so the DRC penalty is still
     // an UNDER-count — it never over-reports, but it may prefer a location upstream would not.
@@ -3337,10 +3340,20 @@ pub fn is_padded_type(master_type: &str) -> bool {
 
 /// [`legalize_with`] with `set_placement_padding` in force.
 pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Legalized, String> {
-    let grid = Grid::build(db)?;
+    let mut grid = Grid::build(db)?;
     let core = grid.core;
     let (gw, gh) = (grid.row_site_count as i32, grid.row_count as i32);
     let sw = grid.site_width;
+
+    // `setUpPlacementGroups`, then — "Populate pixel->group for each fence region so
+    // diamondRecovery's underlying diamondSearch correctly enforces region constraints" —
+    // `groupInitPixels2` + `groupInitPixels`, BEFORE `buildGrid` reads `is_valid` into capacity.
+    // ⛔ So a square they invalidate is a BLOCKAGE to negotiation too, not only to recovery.
+    let groups = crate::regions::placement_groups(db, core, &crate::network::network_insts(db));
+    if !groups.is_empty() {
+        crate::regions::group_init_pixels(&mut grid, &groups);
+    }
+    let grid = grid;
 
     let mut out = Legalized {
         not_done: NOT_DONE.iter().map(|s| s.to_string()).collect(),
@@ -3522,9 +3535,15 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
     //
     // ℹ️ It deliberately ignores row legality, movable overlap and padding: negotiation handles
     // all three. And it does not read usage — which is why the seeding below comes after.
+    // `initFenceRegions` — after `buildGrid`, before `initialSnap`, as `legalize` orders them.
+    let fences = {
+        let names: Vec<String> = cells.iter().map(|c| c.name.clone()).collect();
+        crate::regions::Fences::build(db, &grid, &names)
+    };
     let trace_snap = std::env::var_os("DPL_TRACE_SNAP").is_some();
     for c in cells.iter_mut() {
         let (cw, ch) = (c.width, c.height);
+        let name = c.name.clone();
         let snapped = snap_to_valid_site(
             c.init_x, c.init_y, cw, ch, gw, gh, sw as i64, &grid.row_y,
             &|x, y| {
@@ -3533,7 +3552,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
                 }
                 (0..ch).all(|dy| (0..cw).all(|dx| {
                     ngrid.capacity_at(x + dx, y + dy) != 0
-                }))
+                })) && fences.respects(&name, x, y, cw, ch)
             },
         );
         if let Some((nx, ny)) = snapped {
@@ -3890,7 +3909,10 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             );
             (w.dx_lo, w.dx_hi, w.rows)
         };
-        let placeable = |c: &SweepCell, x: i32, y: i32| site_ok(by_name[c.name.as_str()], x, y);
+        // `inDie → isValidRow → respectsFence`, the filter `tryLocation` and `isCellLegal` share.
+        let placeable = |c: &SweepCell, x: i32, y: i32| {
+            site_ok(by_name[c.name.as_str()], x, y) && fences.respects(&c.name, x, y, c.width, c.height)
+        };
         // `countDRCViolations`, as far as this engine can evaluate it.
         //
         // ⚠️ **Three of upstream's four terms** — edge spacing, padding and one-site gaps; blocked
@@ -3925,6 +3947,11 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
         // ⚠️ **The one-site-gap term here uses `Place.cpp`'s edge reading**, where an off-grid
         // square holds NO cell — the opposite of `PlacementDRC`'s. A cell one empty site from the
         // core edge is clean here and a violation there. See [`crate::drc::EdgeReading`].
+        // `Node::getGroup` per cell: set by `setUpPlacementGroups` for a group's network cells.
+        let cell_group: Vec<Option<usize>> = cells.iter().map(|c| {
+            groups.iter().position(|g| g.cells.iter().any(|n| *n == c.name))
+        }).collect();
+        let region_rtree = crate::regions::Regions::from_groups(&groups, &|_| None);
         let can_be_placed = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
             // `checkPixels`' bounds are `x_end = x + gridWidth(cell)` and
             // `y_end = gridEndY(gridYToDbu(y) + height)` — the DPL footprint, not the model's.
@@ -3933,10 +3960,21 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             if x < 0 || y < 0 || y >= gh || x + cw > gw || y + ch > gh {
                 return false;
             }
+            // `checkRegionOverlap`, with no region — see [`crate::regions::Regions::no_region_overlap`].
+            if !region_rtree.no_region_overlap(x, y, x + cw, y + ch, sw, &grid.row_y, core.3) {
+                return false;
+            }
             for dy in 0..ch {
                 let first_row = dy == 0;
                 for dx in 0..cw {
                     let (gx, gy) = ((x + dx) as usize, (y + dy) as usize);
+                    // `cell->inGroup() && pixel->group != cell->getGroup()` and
+                    // `!cell->inGroup() && pixel->group`: one test, the square's group must be
+                    // the cell's, `None` for both when ungrouped. ⬜ No golden: no case's
+                    // negotiation reaches `diamondRecovery`.
+                    if grid.pixel(gx as i64, gy as i64).and_then(|p| p.group) != cell_group[i] {
+                        return false;
+                    }
                     // `!pixel->is_valid` and `pixel->cell` — both refuse.
                     //
                     // ⛔ **`is_valid` is the DPL grid's, NOT negotiation capacity.** The two agree

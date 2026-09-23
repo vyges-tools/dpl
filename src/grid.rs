@@ -56,6 +56,11 @@ pub struct Pixel {
     pub padding_reserved_by: Option<u32>,
     /// Bitmask of routing levels blocked here, `1 << level`.
     pub blocked_layers: u32,
+    /// `pixel->group` — the placement group whose region owns this square, set by
+    /// [`crate::regions::group_init_pixels`]. An index into [`crate::regions::placement_groups`].
+    pub group: Option<usize>,
+    /// `pixel->util` — scratch for `groupInitPixels`, which it alone reads and writes.
+    pub util: f64,
 }
 
 /// The placement grid.
@@ -265,6 +270,37 @@ impl Grid {
             return None;
         }
         Some(&self.pixels[y as usize][x as usize])
+    }
+
+    /// A grid of `sites` columns over the rows `row_y` bounds, every square valid — for tests of
+    /// what is built ON a grid, where the grid itself is not the subject.
+    #[cfg(test)]
+    pub fn uniform_for_test(core: (i32, i32, i32, i32), site_width: i32, row_y: Vec<i32>) -> Grid {
+        let sites = ((core.2 - core.0) / site_width) as usize;
+        let rows = row_y.len() - 1;
+        Grid {
+            core, site_width, row_count: rows, row_site_count: sites,
+            pixels: vec![vec![Pixel { is_valid: true, ..Default::default() }; sites]; rows],
+            row_sites: vec![vec![(0, sites, "S".to_string(), "R0".to_string())]; rows],
+            row_orient: vec!["R0".to_string(); rows],
+            blocked_layers_populated: false,
+            site_heights: vec![row_y[1] - row_y[0]],
+            row_y,
+        }
+    }
+
+    /// `Grid::gridPixel`, for writing. `None` outside the grid.
+    pub fn pixel_mut(&mut self, x: i64, y: i64) -> Option<&mut Pixel> {
+        if x < 0 || y < 0 || y as usize >= self.row_count || x as usize >= self.row_site_count {
+            return None;
+        }
+        Some(&mut self.pixels[y as usize][x as usize])
+    }
+
+    /// `Grid::gridEndY(DbuY)` — `lower_bound` over EVERY row boundary: the first at or above `y`,
+    /// and ⚠️ one past the LAST boundary (`row_y.len()`, not `row_count`) when `y` is above them all.
+    pub fn grid_end_y_dbu(&self, y: i32) -> usize {
+        self.row_y.iter().position(|&ry| ry >= y).unwrap_or(self.row_y.len())
     }
 
     /// `Grid::getSiteOrientation` — is `site` one of the sites valid at this square?

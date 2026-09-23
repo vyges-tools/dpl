@@ -29,6 +29,7 @@ pub mod grid;
 pub mod negotiate;
 pub mod network;
 pub mod place;
+pub mod regions;
 
 /// This crate's version, as Cargo knows it — the single number the whole suite is released on.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

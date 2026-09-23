@@ -15,7 +15,7 @@
 //! | placed | `dbInst::isPlaced()` | ✅ |
 //! | overlap | `checkOverlap` via grid pixels | ✅ **rule transcribed, acceleration differs** |
 //! | in rows | `checkInRows` — pixel validity + site orientation | ⬜ needs `Grid` |
-//! | region placement | `checkRegionPlacement` | ⬜ needs regions |
+//! | region placement | `checkRegionPlacement` + `checkRegionOverlap` | ✅ [`crate::regions`] |
 //! | padding · edge spacing · blocked layers | `PlacementDRC` | ⬜ |
 //! | one-site gaps | separate pass after overlap | ⬜ needs `Grid` |
 //!
@@ -74,8 +74,6 @@ impl Report {
 /// ⛔ **"Implemented but not wired" is not "checked".** `edge_spacing` stays because its rule has
 /// no data to run on, not because it is unwritten.
 pub const NOT_CHECKED: &[&str] = &[
-    // Needs regions, which nothing in this crate models yet.
-    "region_placement",
     // ⛔ Needs each master's LEF58 CELLEDGESPACINGTABLE edge list, which the bindings do not
     // expose. The RULE is built and tested in `crate::drc`; what is missing is the data.
     "edge_spacing",
@@ -138,7 +136,14 @@ fn site_width(db: &Db) -> i64 {
 /// ⚠️ **The site check applies to the FIRST ROW ONLY** (`first_row = (y == grid_rect.ylo)`), not
 /// to every row a multi-height cell spans. Applying it to all of them rejects legal multi-row
 /// cells whose upper rows offer a different site.
-fn check_in_rows(g: &crate::grid::Grid, x: i32, y: i32, w: i32, h: i32, site: &str) -> bool {
+///
+/// ⛔ **And a multi-row cell must be power-compatible with the row it starts in** — the function's
+/// last line, `!isMultiRow || checkRowPowerCompatible(cell, ylo)`. `power_ok(ylo, rows)` answers
+/// it; the caller passes `None` for a master that is not multi-row. Missed at first: measured on
+/// `multi_height_power_align`'s INPUT (`dpl-check-gate.py --raw`), a double-height cell on an FS
+/// row — VDD pin on a VSS rail — which the reference fails in-rows and we passed.
+fn check_in_rows(g: &crate::grid::Grid, x: i32, y: i32, w: i32, h: i32, site: &str,
+                 power_ok: Option<&dyn Fn(i64, i64) -> bool>) -> bool {
     let (xlo, ylo, xhi, yhi) = g.covering(x, y, w, h);
     if ylo < 0 {
         return false;
@@ -155,7 +160,7 @@ fn check_in_rows(g: &crate::grid::Grid, x: i32, y: i32, w: i32, h: i32, site: &s
             }
         }
     }
-    true
+    power_ok.map_or(true, |ok| ok(ylo, yhi - ylo))
 }
 
 /// Run the legality check.
@@ -202,6 +207,19 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
     }
     let mut out = Report { not_checked, ..Default::default() };
 
+    // `setUpPlacementGroups` + `groupAssignCellRegions`: each grouped cell's region, from its
+    // placed location (the checker's `initialLocation` IS where the cell sits).
+    let regions = match grid {
+        Ok(ref g) => {
+            let loc = |i: &str| -> Option<crate::regions::Box4> {
+                let b = boxes.iter().find(|(n, _, _)| n == i)?.1;
+                Some((b.0 as i32 - g.core.0, b.1 as i32 - g.core.1, b.2 as i32, b.3 as i32))
+            };
+            crate::regions::Regions::build(db, g.core, &insts, &loc)
+        }
+        Err(_) => crate::regions::Regions::default(),
+    };
+
     // ── the pixel state the DRC rules read ────────────────────────────────────────────────────
     //
     // ⛔ **A SECOND grid, painted in the loop below rather than up front.** Upstream's
@@ -225,6 +243,8 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
             .collect();
         crate::drc::routing_levels(&types)
     };
+    // `checkRowPowerCompatible`'s model, as the legalizer builds it.
+    let power = grid.as_ref().ok().map(|g| crate::negotiate::PowerModel::build(db, g, &levels));
     let mut used_layers_cache: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
     let mut used_layers_of = |db: &Db, inst: &str| -> u32 {
@@ -299,11 +319,28 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
 
         if let Ok(ref g) = grid {
             if !*blk {
-                let site = db.master_get_site(&db.inst_master(name));
+                let master = db.inst_master(name);
+                let site = db.master_get_site(&master);
+                // `Grid::isMultiHeight`: taller than the uniform row height, or — rows not
+                // uniform — a site with a row pattern.
+                let multi_row = match g.uniform_row_height() {
+                    Some(u) => bx.3 as i32 > u,
+                    None => db.row_pattern(&site).is_ok_and(|p| !p.is_empty()),
+                };
+                let power_ok = |row: i64, rows: i64| {
+                    power.as_ref().map_or(true, |p| p.compatible(&master, row as i32, rows as i32))
+                };
                 if !check_in_rows(g, bx.0 as i32 - g.core.0, bx.1 as i32 - g.core.1,
-                                  bx.2 as i32, bx.3 as i32, &site) {
+                                  bx.2 as i32, bx.3 as i32, &site,
+                                  if multi_row { Some(&power_ok) } else { None }) {
                     out.failures.push(Failure { family: "in_rows".into(), cell: name.clone(),
                                                 with: None });
+                }
+                // `checkRegionPlacement`, std cells only, after in-rows.
+                if !regions.check(name, bx.0 as i32 - g.core.0, bx.1 as i32 - g.core.1,
+                                  bx.2 as i32, bx.3 as i32, g.site_width, &g.row_y, g.core.3) {
+                    out.failures.push(Failure { family: "region_placement".into(),
+                                                cell: name.clone(), with: None });
                 }
             }
         }
@@ -431,6 +468,20 @@ pub fn check_one_site_gaps(
 
 #[cfg(test)]
 mod tests {
+    /// Upstream `checkInRows` ends `!isMultiRow || checkRowPowerCompatible(cell, ylo)`: a
+    /// multi-row cell on valid squares still fails in-rows when its start row's rails do not
+    /// match, and the test is asked at the FIRST row with the number of rows spanned.
+    #[test]
+    fn a_multi_row_cell_must_be_power_compatible_with_its_start_row() {
+        let g = crate::grid::Grid::uniform_for_test((0, 0, 100, 20), 10, vec![0, 10, 20]);
+        assert!(super::check_in_rows(&g, 0, 0, 20, 20, "S", None), "not multi-row: no power test");
+        let asked = std::cell::Cell::new((-1, -1));
+        let reject = |row: i64, rows: i64| { asked.set((row, rows)); false };
+        assert!(!super::check_in_rows(&g, 0, 0, 20, 20, "S", Some(&reject)));
+        assert_eq!(asked.get(), (0, 2), "asked at the start row, over both rows");
+        assert!(super::check_in_rows(&g, 0, 0, 20, 20, "S", Some(&|_, _| true)));
+    }
+
     #[test]
     fn a_gap_is_seen_on_both_sides_and_a_later_edge_can_clear_it() {
         use super::check_one_site_gaps;
