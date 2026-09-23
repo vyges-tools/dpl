@@ -1144,12 +1144,19 @@ pub struct SearchWindow {
 /// within that span.** The order is not cosmetic: `verticalWindowRows` judges a row usable by
 /// looking for a hostable column inside `[anchor_x + dx_lo, anchor_x + dx_hi]`, so a horizontal
 /// reach computed afterwards — or a wider one — would change which rows qualify.
+///
+/// ⛔ **It takes the BASE windows and the cell, and derives the effective ones itself** —
+/// `effectiveSiteWindow(cell)` for the horizontal walk, `effectiveRowCap(cell)` for the vertical —
+/// as upstream's does. When the caller passed them in, the CLI passed the raw base site window:
+/// a cell wider than it (21 sites against 20 on `cell_on_block2`) got a walk budget two positions
+/// short, a window of −61..20 where upstream's is −63..21, and a different best location 12,984
+/// sweep lines in.
 pub fn build_search_window(
     anchor_x: i32,
     anchor_y: i32,
-    site_window: i32,
+    base_site_window: i32,
     row_window: i32,
-    row_cap: i32,
+    cell_width: i32,
     max_disp_x: i32,
     max_disp_y: i32,
     allow_extension: bool,
@@ -1160,6 +1167,8 @@ pub fn build_search_window(
     row_has_sites: &dyn Fn(i32) -> bool,
     row_usable_in: &dyn Fn(i32, i32, i32) -> bool,
 ) -> SearchWindow {
+    let site_window = effective_site_window(base_site_window, cell_width, max_disp_x, allow_extension);
+    let row_cap = effective_row_cap(row_window, cell_height, max_disp_y, allow_extension);
     let (dx_lo, dx_hi) =
         horizontal_window_bounds(anchor_x, site_window, max_disp_x, allow_extension,
                                  off_die, open_at);
@@ -2007,16 +2016,31 @@ mod tests {
         // 🔑 The horizontal reach is computed first and bounds the vertical probe. Here only
         // columns 48..52 can host, so a narrow window finds rows and a shifted one does not.
         let hostable = |_r: i32, x_lo: i32, x_hi: i32| x_lo <= 52 && x_hi >= 48;
-        let w = build_search_window(50, 5, 2, 2, 4, 500, 500, false,
+        let w = build_search_window(50, 5, 2, 2, 1, 500, 500, false,
                                     &|_| false, &|_| true, 1, 20,
                                     &|_| true, &hostable);
         assert_eq!((w.dx_lo, w.dx_hi), (-2, 2));
         assert!(!w.rows.is_empty(), "rows inside the span are found");
 
-        let away = build_search_window(200, 5, 2, 2, 4, 500, 500, false,
+        let away = build_search_window(200, 5, 2, 2, 1, 500, 500, false,
                                        &|_| false, &|_| true, 1, 20,
                                        &|_| true, &hostable);
         assert!(away.rows.is_empty(), "no column in the span can host, so no row qualifies");
+    }
+
+    #[test]
+    fn a_cell_wider_than_the_base_window_walks_its_own_width() {
+        // ⛔ `buildSearchWindow` walks with `effectiveSiteWindow(cell)` = max(base, width): a
+        // 5-site cell against a base of 2 shares a budget of 10 open positions, not 4, and the
+        // window is never narrower than ±5. Everything open, nothing off the die.
+        let w = build_search_window(50, 5, 2, 2, 5, 500, 500, true,
+                                    &|_| false, &|_| true, 1, 20,
+                                    &|_| true, &|_, _, _| true);
+        assert_eq!((w.dx_lo, w.dx_hi), (-5, 5));
+        let narrow = build_search_window(50, 5, 2, 2, 1, 500, 500, true,
+                                         &|_| false, &|_| true, 1, 20,
+                                         &|_| true, &|_, _, _| true);
+        assert_eq!((narrow.dx_lo, narrow.dx_hi), (-2, 2));
     }
 
     fn px(usage: i32) -> NegPixel {
@@ -2848,6 +2872,10 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
     // `moves` counts cells actually swept (fixed and isolation-skipped cells do not increment
     // it), which is upstream's `moves_count`.
     let tracing = std::env::var_os("DPL_TRACE_NEGOTIATION").is_some();
+    // One call's candidates, in `dpl-candidate-trace.py`'s `VYGN|` format (the reference's patched
+    // `tryLocation`): `VYGES_DPL_CELL=<inst> VYGES_DPL_ITER=<iter>`.
+    let probe_cell = std::env::var("VYGES_DPL_CELL").ok();
+    let probe_iter: Option<usize> = std::env::var("VYGES_DPL_ITER").ok().and_then(|v| v.parse().ok());
     let mut moves_count = 0;
     // ⚠️ Hoisted and reused across cells. It held one allocation per cell per iteration, which on
     // a design with thousands of active cells and hundreds of iterations is millions of them for
@@ -2882,6 +2910,20 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
         let congestion_floor = c.width as f64 * c.height as f64;
         let mut best = (INF_COST, ScanRank { window: 0, row_pos: usize::MAX, dx: i32::MAX },
                         c.x, c.y);
+        let probe = probe_cell.as_deref() == Some(c.name.as_str()) && probe_iter == Some(iter as usize);
+        let rows_of = |r: &[i32]| r.iter().map(|y| format!("{y},")).collect::<String>();
+        if probe {
+            eprintln!("VYGN|cell|{}|{}|init={},{}|cur={},{}|w={}|h={}", c.name, iter, c.init_x, c.init_y, c.x, c.y, c.width, c.height);
+            eprintln!("VYGN|window|init|lo={ilo}|hi={ihi}|rows={}", rows_of(&irows));
+            if (c.x, c.y) != (c.init_x, c.init_y) {
+                eprintln!("VYGN|window|curr|lo={clo}|hi={chi}|rows={}", rows_of(&crows));
+            }
+        }
+        let say = |cand: &Candidate, verdict: &str, cost: f64, drc: i64| {
+            if probe {
+                eprintln!("VYGN|try|{},{}|{},{},{}|{verdict}|cost={}|drc={drc}", cand.x, cand.y, cand.rank.window, cand.rank.row_pos, cand.rank.dx, g17(cost));
+            }
+        };
         cands.clear();
         enumerate_candidates(
             ctx.row_y, ctx.site_width,
@@ -2894,21 +2936,37 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
             &mut cands,
         );
         for &cand in &cands {
-            if !(ctx.placeable)(&c, cand.x, cand.y) {
-                continue;
-            }
             let target = target_cost(ctx.row_y, ctx.site_width,
                                      cand.x, cand.y, c.init_x, c.init_y,
                                      ctx.max_disp_multiplier, ctx.max_disp_threshold);
+            // `tryLocation`'s lower-bound prune, FIRST, as upstream orders it: every footprint
+            // pixel adds at least 1, so a candidate whose displacement plus that floor already
+            // exceeds the incumbent can neither win nor tie.
+            if target + congestion_floor > best.0 {
+                say(&cand, "prune", target, 0);
+                continue;
+            }
+            if !(ctx.placeable)(&c, cand.x, cand.y) {
+                say(&cand, "place", 0.0, 0);
+                continue;
+            }
             let mut cost = negotiation_cost(
                 footprint_of(&c, cand.x, cand.y, ctx.grid), target, best.0);
             if cost > best.0 || (cost == best.0 && cand.rank >= best.1) {
+                say(&cand, "lose", cost, 0);
                 continue; // loses, or ties with a losing rank — skip the costly DRC term
             }
-            cost += drc_penalty * (ctx.drc_violations)(&c, cand.x, cand.y, ctx.grid) as f64;
-            if cost < best.0 || (cost == best.0 && cand.rank < best.1) {
+            let drc = (ctx.drc_violations)(&c, cand.x, cand.y, ctx.grid);
+            cost += drc_penalty * drc as f64;
+            say(&cand, "drc", cost, drc as i64);
+            let wins = cost < best.0 || (cost == best.0 && cand.rank < best.1);
+            say(&cand, if wins { "best" } else { "drc-lose" }, cost, -1);
+            if wins {
                 best = (cost, cand.rank, cand.x, cand.y);
             }
+        }
+        if probe {
+            eprintln!("VYGN|best|{},{}|cost={}", best.2, best.3, g17(best.0));
         }
 
         // 5. Place — even if nothing better was found, which restores the cell where it was.
@@ -3708,8 +3766,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             let w = build_search_window(
                 x, y,
                 opts.site_search_window, opts.row_search_window,
-                effective_row_cap(opts.row_search_window, c.height, opts.max_displacement_y,
-                                  !opts.disable_window_extension),
+                c.width,
                 opts.max_displacement_x, opts.max_displacement_y,
                 !opts.disable_window_extension,
                 &off_die,
@@ -4136,4 +4193,21 @@ impl PowerModel {
             &|r| self.rows.get(r).map_or(crate::drc::Power::Unknown, |p| p.1),
         ).0
     }
+}
+
+/// `%.17g`, as the reference's candidate trace prints a cost.
+fn g17(v: f64) -> String {
+    if v == 0.0 {
+        return "0".into();
+    }
+    let e = v.abs().log10().floor() as i32;
+    if !(-5..17).contains(&e) {
+        let t = format!("{v:.16e}");
+        let (m, x) = t.split_once('e').unwrap();
+        let m = if m.contains('.') { m.trim_end_matches('0').trim_end_matches('.') } else { m };
+        let x: i32 = x.parse().unwrap();
+        return format!("{m}e{}{:02}", if x < 0 { '-' } else { '+' }, x.abs());
+    }
+    let t = format!("{:.*}", (16 - e).max(0) as usize, v);
+    if t.contains('.') { t.trim_end_matches('0').trim_end_matches('.').to_string() } else { t }
 }

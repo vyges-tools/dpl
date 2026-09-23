@@ -71,14 +71,19 @@ order to be useful — and upstream's own suite leans on it harder: **77 of 92 `
 ## Status
 
 At pin `da9f29f18b6487825aa880597176e0fa97110b31` (2026-09-22), with padding modelled:
-**33 of 35 comparable cases match** the reference component for component, the padding cases
-`pad01`, `pad04`, `pad05` and `pad06` among them. The two that do not:
+**34 of 35 comparable cases match** the reference component for component, the padding cases
+`pad01`, `pad04`, `pad05` and `pad06` among them, and `cell_on_block2` (11,904 components; its
+sweep trace identical for all 16,176 lines). The one that does not:
 
-- `cell_on_block2` (padding `-right 4` over a macro with site-less channels): the sweep trace
-  agrees for **12,984 lines — 19 iterations** — and first differs on `_3757_`'s best location.
-  ⬜ Next: the reference's candidate costs for that one call.
 - `obstruction2`: an error-path case (`catch { detailed_placement }`), now seen by the harness;
   it uses no padding, and this change leaves an unpadded run's grid bit for bit as it was.
+
+`cell_on_block2` was a search-WINDOW defect, not a cost one: the window was built with the raw base
+site window where upstream uses `effectiveSiteWindow(cell)` = `max(base, cell width)`, so a cell
+wider than the base (21 sites against 20) walked with a budget two positions short. Found by
+printing every candidate of the first diverging `findBestLocation` call on both sides
+(`VYGES_DPL_CELL` / `VYGES_DPL_ITER`, and the reference patch `dpl-candidate-trace.py`): the two
+traces split at their second line, the window.
 
 The earlier statement, kept for its history:
 
