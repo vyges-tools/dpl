@@ -28,6 +28,8 @@ pub mod edges;
 pub mod fillers;
 pub mod grid;
 pub mod improve;
+pub mod improve_opt;
+pub mod improve_run;
 pub mod mirror;
 pub mod negotiate;
 pub mod network;

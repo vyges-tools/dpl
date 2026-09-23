@@ -41,17 +41,19 @@ pub struct Node {
     /// `Node::group_id_`, `-1` when in no placement group.
     pub group: i32,
     pub orient: String,
+    /// `dbInst::isPlaced` — for an instance node; true for terminals and fillers.
+    pub placed: bool,
 }
 
 impl Node {
-    fn right(&self) -> i32 {
+    pub(crate) fn right(&self) -> i32 {
         self.left + self.width
     }
-    fn top(&self) -> i32 {
+    pub(crate) fn top(&self) -> i32 {
         self.bottom + self.height
     }
     /// `getCenterX` — `left + width / 2`, integer division.
-    fn center_x(&self) -> i32 {
+    pub(crate) fn center_x(&self) -> i32 {
         self.left + self.width / 2
     }
 }
@@ -75,7 +77,10 @@ fn create_network(db: &Db, core: (i32, i32, i32, i32)) -> Vec<Node> {
             id: nodes.len(), kind: Kind::Cell, name: name.clone(), master: master.clone(),
             left: x - core.0, bottom: y - core.1,
             width: db.master_get_width(&master) as i32, height: db.master_get_height(&master) as i32,
-            fixed, group: -1, orient: db.inst_get_orient(&name),
+            // `Network::addNode` makes every node R0; `improvePlacement` then turns placed ones to
+            // their instance's orient (`improve_run::adopt_inst_orients`), moving their pins.
+            fixed, group: -1, orient: "R0".into(),
+            placed: !matches!(db.inst_get_placement_status(&name).as_str(), "NONE" | "UNPLACED"),
         });
     }
     for bt in db.block_get_b_terms() {
@@ -95,7 +100,7 @@ fn create_network(db: &Db, core: (i32, i32, i32, i32)) -> Vec<Node> {
         nodes.push(Node {
             id: nodes.len(), kind: Kind::Terminal, name: bt.clone(), master: String::new(),
             left: x0 - core.0, bottom: y0 - core.1, width: x1 - x0, height: 0,
-            fixed: true, group: -1, orient: "R0".into(),
+            fixed: true, group: -1, orient: "R0".into(), placed: true,
         });
     }
     nodes
@@ -110,13 +115,15 @@ pub struct Row {
     pub num_sites: i32,
     pub site_spacing: i32,
     pub site_width: i32,
+    /// The site's `SYMMETRY Y` — `DetailedOrient::flipCells` flips only in such rows.
+    pub sym_y: bool,
     pub bottom: i32,
     pub height: i32,
     pub orient: String,
 }
 
 impl Row {
-    fn right(&self) -> i32 {
+    pub(crate) fn right(&self) -> i32 {
         self.left + self.num_sites * self.site_spacing
     }
     fn top(&self) -> i32 {
@@ -142,7 +149,7 @@ impl Arch {
     }
 
     /// `Architecture::find_closest_row`.
-    fn find_closest_row(&self, y: i32) -> usize {
+    pub(crate) fn find_closest_row(&self, y: i32) -> usize {
         let mut r = 0;
         if y > self.rows[0].bottom {
             // `lower_bound` on bottom, then step back if past `y`.
@@ -161,7 +168,7 @@ impl Arch {
     }
 
     /// `getCellHeightInRows` — `lround(height / rows[0].height)`.
-    fn height_in_rows(&self, nd: &Node) -> i32 {
+    pub(crate) fn height_in_rows(&self, nd: &Node) -> i32 {
         (nd.height as f64 / self.rows[0].height as f64).round() as i32
     }
 }
@@ -194,6 +201,7 @@ fn create_architecture(db: &Db, core: (i32, i32, i32, i32), nodes: &mut Vec<Node
             site_spacing: db.row_get_spacing(&name),
             num_sites: db.row_get_site_count(&name),
             site_width: db.site_get_width(&site),
+            sym_y: db.site_get_symmetry_y(&site),
             height: db.site_get_height(&site),
             orient,
         });
@@ -258,7 +266,7 @@ fn post_process(arch: &mut Arch, nodes: &mut Vec<Node>) {
             nodes.push(Node {
                 id: nodes.len(), kind: Kind::Filler, name: "-".into(), master: String::new(),
                 left: lx, bottom: yb, width: rx - lx, height: h, fixed: true, group: -1,
-                orient: "R0".into(),
+                orient: "R0".into(), placed: true,
             });
         };
         if xmin < intervals[0].0 {
@@ -281,13 +289,13 @@ fn post_process(arch: &mut Arch, nodes: &mut Vec<Node>) {
 // ── the detailed manager ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlockageType {
+pub(crate) enum BlockageType {
     Placement,
     FixedInstance,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Blockage {
+pub(crate) struct Blockage {
     x_min: i32,
     x_max: i32,
     pad_left: i32,
@@ -336,9 +344,9 @@ pub struct Setup {
     /// `multiHeightCells_[rows]`.
     pub multi: Vec<Vec<usize>>,
     pub wide: Vec<usize>,
-    blockages: Vec<Vec<Blockage>>,
+    pub(crate) blockages: Vec<Vec<Blockage>>,
     pub segments: Vec<Segment>,
-    segs_in_row: Vec<Vec<usize>>,
+    pub(crate) segs_in_row: Vec<Vec<usize>>,
     pub cells_in_seg: Vec<Vec<usize>>,
     /// `reverseCellToSegs_`.
     pub cell_segs: Vec<Vec<usize>>,
@@ -347,18 +355,27 @@ pub struct Setup {
     pub movement: (i64, i64),
     pub displaced: bool,
     pub log: Vec<String>,
+    pub rt: crate::improve_run::Runtime,
 }
 
 /// `DetailedMgr`'s constructor, `ShiftLegalizer::legalize`, in upstream's call order.
 pub fn setup(db: &Db, padding: &crate::negotiate::Padding) -> Result<Setup, String> {
+    setup_with(db, padding, 1, (0, 0))
+}
+
+/// [`setup`] with `improve_placement`'s `-random_seed` and `-max_displacement {x y}`.
+pub fn setup_with(db: &Db, padding: &crate::negotiate::Padding, seed: u32, max_disp: (i32, i32))
+    -> Result<Setup, String> {
+    // `importDb`: `createNetwork` (nodes at R0, then edges and pins), `createArchitecture`,
+    // `setUpPlacementGroups`.
     let grid = Grid::build(db)?;
     let core = grid.core;
     let mut nodes = create_network(db, core);
+    let pins = crate::improve_run::build_pins(db, &nodes);
     let arch = create_architecture(db, core, &mut nodes);
     if arch.rows.is_empty() {
         return Err("no rows".into());
     }
-    // `setUpPlacementGroups`: a grouped network cell takes its group's index as `group_id`.
     let groups = crate::regions::placement_groups(db, core, &crate::network::network_insts(db));
     let index: HashMap<String, usize> = nodes.iter().filter(|n| n.kind == Kind::Cell)
         .map(|n| (n.name.clone(), n.id)).collect();
@@ -369,33 +386,42 @@ pub fn setup(db: &Db, padding: &crate::negotiate::Padding) -> Result<Setup, Stri
             }
         }
     }
+    let mut node_pins = pins.1.clone();
+    node_pins.resize(nodes.len(), Vec::new());
+    let levels = routing_levels(db);
+    let rt = crate::improve_run::Runtime::new(db, grid, &nodes, (pins.0, node_pins, pins.2), padding, &levels);
     let mut s = Setup {
         arch, nodes, fixed: Vec::new(), single: Vec::new(), multi: Vec::new(), wide: Vec::new(),
         blockages: Vec::new(), segments: Vec::new(), segs_in_row: Vec::new(),
         cells_in_seg: Vec::new(), cell_segs: Vec::new(), checks: Checks::default(),
-        movement: (0, 0), displaced: false, log: Vec::new(),
+        movement: (0, 0), displaced: false, log: Vec::new(), rt,
     };
     s.cell_segs = vec![Vec::new(); s.nodes.len()];
-    let pads: Vec<(i32, i32)> = s.nodes.iter().map(|n| {
-        if n.kind != Kind::Cell {
-            return (0, 0);
-        }
-        let (l, r) = padding.of(&n.name, &n.master, &db.master_get_type(&n.master).unwrap_or_default());
-        (l * grid.site_width, r * grid.site_width)
-    }).collect();
-    let sym: Vec<bool> = s.nodes.iter()
-        .map(|n| n.kind == Kind::Cell && db.master_get_symmetry_x(&n.master)).collect();
-    let power = crate::negotiate::PowerModel::build(db, &grid, &routing_levels(db));
+    // The node orients, then `initGrid` + `setFixedGridCells`, then the manager's constructor.
+    crate::improve_run::adopt_inst_orients(&mut s, db);
+    s.paint_fixed();
+    // The manager's constructor (`limit` both ways), `setSeed`, `setMaxDisplacement`: a non-zero
+    // request is in ROW-0 HEIGHTS on BOTH axes — upstream multiplies x by the row height too.
+    let limit = (s.arch.max_x - s.arch.min_x).max(s.arch.max_y - s.arch.min_y) << 1;
+    s.log.push(format!("[INFO DPL-0401] Setting random seed to {seed}."));
+    s.rt.rng = crate::improve_run::Mt19937::new(seed);
+    let h = s.arch.rows[0].height;
+    let dx = if max_disp.0 != 0 { max_disp.0 * h } else { limit }.min(limit);
+    let dy = if max_disp.1 != 0 { max_disp.1 * h } else { limit }.min(limit);
+    s.rt.max_disp = (dx, dy);
+    s.log.push(format!("[INFO DPL-0402] Setting maximum displacement {} {} to {dx} {dy} units.",
+                       max_disp.0, max_disp.1));
 
+    // `ShiftLegalizer::legalize`.
     s.collect_fixed_cells();
     s.collect_single_height_cells();
     s.collect_multi_height_cells();
     s.collect_wide_cells();
-    s.find_blockages(db, core, &pads);
+    s.find_blockages(db, core);
     s.find_segments(&groups, core);
-    s.snap(&sym, &power, &grid);
+    s.snap();
     s.shift();
-    s.run_checks(db, &grid, &pads);
+    s.run_checks();
     Ok(s)
 }
 
@@ -459,7 +485,8 @@ impl Setup {
 
     /// `findBlockages(false)` — fixed non-terminal nodes (padded by `getCellSpacing` with no
     /// neighbour) and the network's hard blockages, per row, sorted and merged.
-    fn find_blockages(&mut self, db: &Db, core: (i32, i32, i32, i32), pads: &[(i32, i32)]) {
+    fn find_blockages(&mut self, db: &Db, core: (i32, i32, i32, i32)) {
+        let pads = self.rt.pads.clone();
         let a = &self.arch;
         let mut bl: Vec<Vec<Blockage>> = vec![Vec::new(); a.rows.len()];
         for &f in &self.fixed {
@@ -611,6 +638,7 @@ impl Setup {
             seg.max_x = origin + ix * sp;
         }
         self.cells_in_seg = vec![Vec::new(); segs.len()];
+        self.rt.seg_util = vec![0; segs.len()];
         self.segments = segs;
         self.segs_in_row = in_row;
     }
@@ -665,7 +693,7 @@ impl Setup {
 
     /// `checkMasterSymmetry(arch, nd, row)`: R0/MY rows take anything; MX/R180 rows need the
     /// master's X symmetry; any other orient refuses.
-    fn master_symmetry_ok(&self, sym_x: bool, row: usize) -> bool {
+    pub(crate) fn master_symmetry_ok(&self, sym_x: bool, row: usize) -> bool {
         match self.arch.rows[row].orient.as_str() {
             "R0" | "MY" => true,
             "MX" | "R180" => sym_x,
@@ -801,7 +829,7 @@ impl Setup {
 
     /// `addCellToSegment` — into the segment's list SORTED by centre X (`lower_bound`: before the
     /// first cell whose centre is not less).
-    fn add_cell_to_segment(&mut self, nd: usize, seg: usize) {
+    pub(crate) fn add_cell_to_segment(&mut self, nd: usize, seg: usize) {
         let x = self.nodes[nd].center_x();
         let nodes = &self.nodes;
         let at = self.cells_in_seg[seg].partition_point(|&c| nodes[c].center_x() < x);
@@ -811,7 +839,7 @@ impl Setup {
 
     /// `assignCellsToSegments` for the single-height cells, then each multi-height bucket from 2
     /// rows up — ShiftLegalizer's "Snap". Positions are clamped into the chosen segment(s).
-    fn snap(&mut self, sym: &[bool], power: &crate::negotiate::PowerModel, grid: &Grid) {
+    fn snap(&mut self) {
         let mut orig: Vec<(i32, i32)> = self.nodes.iter().map(|n| (n.left, n.bottom)).collect();
         let mut lists: Vec<Vec<usize>> = Vec::new();
         if !self.single.is_empty() {
@@ -827,8 +855,8 @@ impl Setup {
             for nd in list {
                 let node = self.nodes[nd].clone();
                 if self.arch.height_in_rows(&node) == 1 {
-                    let Some(sid) = self.find_closest_segment(&node, sym[nd]) else { continue };
-                    self.add_cell_to_segment(nd, sid);
+                    let Some(sid) = self.find_closest_segment(&node, self.rt.sym[nd].0) else { continue };
+                    self.add_cell_to_segment_util(nd, sid);
                     n_assigned += 1;
                     let seg = &self.segments[sid];
                     let xx = seg.min_x.max((seg.max_x - node.width).min(node.left));
@@ -837,13 +865,14 @@ impl Setup {
                     my += (node.bottom - yy).abs() as i64;
                     self.nodes[nd].left = xx;
                     self.nodes[nd].bottom = yy;
+                    self.paint_in_grid(nd);
                 } else {
-                    let Some(span) = self.find_closest_span(&node, sym[nd], power, grid) else { continue };
+                    let Some(span) = self.find_closest_span(&node, self.rt.sym[nd].0, &self.rt.power, &self.rt.grid) else { continue };
                     let (mut xmin, mut xmax) = (self.segments[span[0]].min_x, self.segments[span[0]].max_x);
                     for &sid in &span {
                         xmin = xmin.max(self.segments[sid].min_x);
                         xmax = xmax.min(self.segments[sid].max_x);
-                        self.add_cell_to_segment(nd, sid);
+                        self.add_cell_to_segment_util(nd, sid);
                     }
                     n_assigned += 1;
                     let xx = xmin.max((xmax - node.width).min(node.left));
@@ -852,6 +881,7 @@ impl Setup {
                     my += (node.bottom - yy).abs() as i64;
                     self.nodes[nd].left = xx;
                     self.nodes[nd].bottom = yy;
+                    self.paint_in_grid(nd);
                 }
             }
             self.log.push(format!(
@@ -987,7 +1017,8 @@ impl Setup {
 
     /// The five checks, in `legalize`'s order: region (313), row (315), site (314), overlap (311),
     /// edge spacing + padding (312).
-    fn run_checks(&mut self, db: &Db, grid: &Grid, pads: &[(i32, i32)]) {
+    pub(crate) fn run_checks(&mut self) {
+        let pads = self.rt.pads.clone();
         let a = &self.arch;
         let srh = a.rows[0].height;
         let movable = |n: &Node| n.kind != Kind::Terminal && !n.fixed;
@@ -1058,7 +1089,8 @@ impl Setup {
 
         // `checkEdgeSpacingInSegments` — `checkDRC` on the LEFT cell of every adjacent pair (the
         // last cell of a segment is never checked), and the padding gap.
-        let drc_bad = self.placement_violations(db, grid, pads);
+        let drc_bad: Vec<bool> = (0..self.nodes.len())
+            .map(|i| self.nodes[i].kind == Kind::Cell && self.has_placement_violation(i)).collect();
         let (mut err_n, mut err_p) = (0, 0);
         for s in 0..self.segments.len() {
             let mut t = self.cells_in_seg[s].clone();
@@ -1078,51 +1110,6 @@ impl Setup {
 
         self.checks = Checks { wrong_region: wrong, row_alignment: row_err, site_alignment: site_err,
                                overlaps, edge_spacing: err_n, padding: err_p };
-    }
-
-    /// `PlacementDRC::checkDRC(node)` for every node — blocked layers, one-site gap, padding, edge
-    /// spacing — on the grid `setFixedGridCells` + `paintInGrid` leave: every network cell painted.
-    fn placement_violations(&self, db: &Db, _grid: &Grid, pads: &[(i32, i32)]) -> Vec<bool> {
-        // A fresh grid: the checks paint every cell, and `setup`'s grid stays unpainted.
-        let Ok(mut g) = Grid::build(db) else { return vec![false; self.nodes.len()] };
-        let cells: Vec<usize> = self.nodes.iter().filter(|n| n.kind == Kind::Cell).map(|n| n.id).collect();
-        for &c in &cells {
-            let n = &self.nodes[c];
-            g.paint_cell(n.left, n.bottom, n.width, n.height, Some(c as u32));
-        }
-        let classes: Vec<crate::drc::Class> = self.nodes.iter()
-            .map(|n| crate::drc::classify(&db.master_get_type(&n.master).unwrap_or_default())).collect();
-        let edges = crate::edges::EdgeModel::build(db, &g,
-            cells.iter().map(|&c| self.nodes[c].master.as_str()));
-        let levels = routing_levels(db);
-        let disallow = !db.has_one_site_master();
-        let mut bad = vec![false; self.nodes.len()];
-        for &c in &cells {
-            let n = &self.nodes[c];
-            let (gx0, gy0, gx1, gy1) = g.covering(n.left, n.bottom, n.width, n.height);
-            let (x0, x1, y0, y1) = (gx0 as i32, gx1 as i32, gy0 as i32, gy1 as i32);
-            let used = crate::drc::used_layers(db.master_pin_boxes(&n.master).unwrap_or_default()
-                .into_iter().filter_map(|(ln, ..)| levels.get(&db.layer_name_by_number(ln)).copied()));
-            let blocked = crate::drc::check_blocked_layers(x0, x1, y0, y1, used,
-                &|px, py| g.pixel(px as i64, py as i64).map(|p| p.blocked_layers));
-            let gap = crate::drc::check_one_site_gap(disallow, x0, x1, y0, y1,
-                crate::drc::EdgeReading::OffGridIsOccupied,
-                &|px, py| g.pixel(px as i64, py as i64).map(|p| p.cell.is_some()));
-            let me = c as u32;
-            let at = |px: i32, py: i32| {
-                let p = g.pixel(px as i64, py as i64)?;
-                Some((p.cell.map(|o| (classes[o as usize], o == me)),
-                      p.padding_reserved_by.map(|o| (classes[o as usize], o == me))))
-            };
-            let pad_ok = crate::drc::check_padding(x0, x1, y0, y1, pads[c].0 / g.site_width.max(1),
-                                                   pads[c].1 / g.site_width.max(1), classes[c], &at);
-            let edge_ok = edges.check(&g, c, &n.master, &n.orient, n.left, n.bottom,
-                &|px, py| g.pixel(px as i64, py as i64).and_then(|p| p.cell).map(|o| o as usize),
-                &|o| edges.edges_at(&self.nodes[o].master, &self.nodes[o].orient,
-                                    self.nodes[o].left, self.nodes[o].bottom));
-            bad[c] = !(blocked && gap && pad_ok && edge_ok);
-        }
-        bad
     }
 
     /// The `VYGI|` records `dpl-improve-trace.py` prints, for a structure-for-structure compare.
@@ -1163,7 +1150,7 @@ mod tests {
     use super::*;
 
     fn row(bottom: i32) -> Row {
-        Row { left: 0, num_sites: 10, site_spacing: 100, site_width: 100, bottom, height: 1000,
+        Row { left: 0, num_sites: 10, site_spacing: 100, site_width: 100, sym_y: true, bottom, height: 1000,
               orient: "R0".into() }
     }
 

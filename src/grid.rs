@@ -487,6 +487,42 @@ impl Grid {
         }
     }
 
+    /// `Grid::paintPixel(cell, grid_x, grid_y)` — the body `[x, x + cells_wide) × [y,
+    /// gridEndY(gridYToDbu(y) + h))` takes `occupant`, OVERWRITING whoever was there, then the
+    /// padding spans are reserved. ⚠️ Not [`Grid::paint_cell`], whose FIRST writer wins: that is the
+    /// checker's pixel walk; this is the placer's paint.
+    pub fn paint_pixel(&mut self, x: i64, y: i64, cells_wide: i64, h: i32, left_pad: i64,
+                       right_pad: i64, occupant: u32) {
+        let y_end = self.grid_end_y(y, h);
+        for gx in x..x + cells_wide {
+            for gy in y..y_end {
+                if let Some(p) = self.pixel_mut(gx, gy) {
+                    p.cell = Some(occupant);
+                    p.occupied = true;
+                }
+            }
+        }
+        self.paint_cell_padding(x, y, cells_wide, h, left_pad, right_pad, occupant);
+    }
+
+    /// `Grid::erasePixel(cell)` — over the cell's PADDED covering, clear the squares it occupies
+    /// and the reservations it made; another cell's claims are left alone.
+    pub fn erase_pixel(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, occupant: u32) {
+        for gx in x0..x1 {
+            for gy in y0..y1 {
+                if let Some(p) = self.pixel_mut(gx, gy) {
+                    if p.cell == Some(occupant) {
+                        p.cell = None;
+                        p.occupied = false;
+                    }
+                    if p.padding_reserved_by == Some(occupant) {
+                        p.padding_reserved_by = None;
+                    }
+                }
+            }
+        }
+    }
+
     /// `Grid::paintCellPadding` — reserve the sites a cell's padding claims either side of it.
     ///
     /// ⛔ **The TWO PAD SPANS ONLY — `[x - left_pad, x)` and `[x_end, x_end + right_pad)`. The

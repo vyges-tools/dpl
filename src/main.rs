@@ -129,10 +129,16 @@ const DESCRIBE: &str = r#"{
     },
     {
       "name": "improve-placement",
-      "summary": "detailed placement improvement (IN PROGRESS: only its setup is built)",
+      "summary": "detailed placement improvement (IN PROGRESS: mis/gs/vs/ro not built)",
       "args_template": ["improve-placement", "{odb}"],
       "optional": [
-        { "arg": "dump_setup", "flag": "--dump-setup", "description": "print the manager state after the shift legalizer" }
+        { "arg": "dump_setup", "flag": "--dump-setup", "description": "print the manager state after the shift legalizer" },
+        { "arg": "out_odb", "flag": "--out-odb", "description": "write the improved database here" },
+        { "arg": "random_seed", "flag": "--random-seed", "description": "the optimizers' random seed (default 1)" },
+        { "arg": "max_displacement", "flag": "--max-displacement", "description": "move cap in ROW HEIGHTS, 'X' or 'X,Y' (upstream's -max_displacement)" },
+        { "arg": "trace_stages", "flag": "--trace-stages", "description": "print each stage's generator state and cell positions" },
+        { "arg": "inject_stage", "flag": "--inject-stage", "description": "correlation aid: start the random improver from a reference VYGS default|begin record in FILE" },
+        { "arg": "rng_skip", "flag": "--rng-skip", "description": "correlation aid: treat the unbuilt stages as no-ops and discard N draws" }
       ],
       "assertion": { "id": "placement-improved", "field": "status", "pass_when": { "eq": "improved" } }
     }
@@ -168,7 +174,8 @@ USAGE:
   vyges physical dpl filler-placement   <design.odb> PATTERN... [--prefix P] [--out-odb FILE]
   vyges physical dpl remove-fillers     <design.odb> [--out-odb FILE]
   vyges physical dpl optimize-mirroring <design.odb> [--out-odb FILE]
-  vyges physical dpl improve-placement  <design.odb> [--dump-setup]   (in progress: setup only)
+  vyges physical dpl improve-placement  <design.odb> [--out-odb FILE] [--random-seed N] [--max-displacement X[,Y]]
+                                        (in progress: mis/gs/vs/ro not built; --rng-skip N stands in)
   vyges physical dpl --describe | --help | --version
 
 OPTIONS:
@@ -391,47 +398,98 @@ fn optimize_mirroring(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `improve_placement` — ⬜ in progress: the setup (`ShiftLegalizer::legalize`) is built; the
-/// optimizers are not, so no database is written and the status says so.
+/// `improve_placement` — ⬜ in progress: the setup, the random improver and flipping are built;
+/// `mis`, `gs`, `vs`, `ro` are not, so a full run refuses unless `--rng-skip` stands in for them.
 fn improve_placement(args: &[String]) -> ExitCode {
-    let (mut odb, mut dump) = (None, false);
-    for a in args {
-        match a.as_str() {
+    let (mut odb, mut out_odb, mut dump, mut opts) = (None, None, false, vyges_dpl::improve_opt::Options::default());
+    let (mut seed, mut max_disp) = (1u32, (0i32, 0i32));
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--dump-setup" => dump = true,
+            "--trace-stages" => opts.trace_stages = true,
+            "--random-seed" => {
+                i += 1;
+                seed = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(1);
+            }
+            // `-max_displacement disp|{disp_x disp_y}`, as `X` or `X,Y`.
+            "--max-displacement" => {
+                i += 1;
+                let v: Vec<i32> = args.get(i).map(|v| v.split(',').filter_map(|p| p.trim().parse().ok()).collect()).unwrap_or_default();
+                max_disp = match v.as_slice() { [x] => (*x, *x), [x, y] => (*x, *y), _ => (0, 0) };
+            }
+            "--out-odb" => { i += 1; out_odb = args.get(i).cloned(); }
+            "--inject-stage" => {
+                i += 1;
+                opts.inject = args.get(i).and_then(|f| std::fs::read_to_string(f).ok())
+                    .and_then(|t| t.lines().find(|l| l.starts_with("VYGS|stage|default|begin|")).map(str::to_string));
+            }
+            "--rng-skip" => {
+                i += 1;
+                opts.rng_skip = args.get(i).and_then(|v| v.parse().ok());
+            }
             a if odb.is_none() => odb = Some(a.to_string()),
             a => {
                 eprintln!("vyges-dpl: improve-placement: unexpected argument {a}\n\n{USAGE}");
                 return ExitCode::from(2);
             }
         }
+        i += 1;
     }
     let Some(path) = odb else {
         eprintln!("vyges-dpl: improve-placement needs <design.odb>\n\n{USAGE}");
         return ExitCode::from(2);
     };
-    let db = match Db::open(&path) {
+    let mut db = match Db::open(&path) {
         Ok(d) => d,
         Err(e) => { eprintln!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
     };
-    let setup = match vyges_dpl::improve::setup(&db, &vyges_dpl::negotiate::Padding::default()) {
+    let mut setup = match vyges_dpl::improve::setup_with(&db, &vyges_dpl::negotiate::Padding::default(), seed, max_disp) {
         Ok(s) => s,
         Err(e) => { eprintln!("vyges-dpl: {e}"); return ExitCode::from(1); }
     };
-    for l in &setup.log {
-        eprintln!("{l}");
-    }
     if dump {
+        for l in &setup.log {
+            eprintln!("{l}");
+        }
         for l in setup.dump() {
             println!("{l}");
         }
         return ExitCode::SUCCESS;
     }
+    let rep = vyges_dpl::improve_opt::improve(&mut setup, &opts);
+    for l in &setup.log {
+        eprintln!("{l}");
+    }
+    let rep = match rep {
+        Ok(r) => r,
+        Err(e) => {
+            println!("{}", serde_json::json!({ "tool": "vyges-dpl", "command": "improve-placement",
+                                               "status": "not_implemented", "error": e }));
+            return ExitCode::from(1);
+        }
+    };
+    for l in &rep.stage_lines {
+        println!("{l}");
+    }
+    // ⚠️ `set_inst_location` also stamps PLACED; only movable (already placed) cells are written.
+    let moved = match vyges_dpl::improve_opt::write_back(&setup, &mut db) {
+        Ok(m) => m,
+        Err(e) => { eprintln!("vyges-dpl: {e}"); return ExitCode::from(2); }
+    };
+    if let Some(o) = out_odb.as_deref() {
+        if let Err(e) = db.write(o) {
+            eprintln!("vyges-dpl: cannot write {o}: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    let status = if rep.not_done.is_empty() { "improved" } else { "partial" };
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-        "tool": "vyges-dpl", "command": "improve-placement", "status": "not_implemented",
-        "not_done": ["mis", "global swap", "vertical swap", "reorder", "random improver", "flipping"],
-        "checks": setup.checks,
+        "tool": "vyges-dpl", "command": "improve-placement", "status": status,
+        "hpwl_before": rep.hpwl_before, "hpwl_after": rep.hpwl_after, "moved": moved,
+        "not_done": rep.not_done, "checks": setup.checks,
     })).expect("valid JSON"));
-    ExitCode::from(1)
+    if rep.not_done.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) }
 }
 
 fn legalize(args: &[String]) -> ExitCode {
