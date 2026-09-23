@@ -63,7 +63,7 @@ const DESCRIBE: &str = r#"{
     "One of `countDRCViolations` four terms is NOT evaluated by the legalizer -- `checkBlockedLayers`. `checkEdgeSpacing` IS: each master's LEF58 cell edges and the technology's cell-edge spacing table are read from the database, and upstream's edge_spacing case matches component for component, its sweep trace identical. Nothing in the comparable corpus exercises blocked layers, so that absence is invisible to the score rather than proven harmless.",
     "Every instance the model filter excluded is named and counted in `filtered_out` on every run. A filter that drops instances silently is indistinguishable from a design that has none of them.",
     "`-disallow_one_site_gaps` is NOT accepted: upstream deprecated it (DPL-3/DPL-4) and derives the setting from `hasOneSiteMaster()`, so the flag cannot change the result. `-incremental` is not implemented and is named in `not_done`.",
-    "EIGHT of upstream's NINE check families are evaluated: site alignment, placed, overlap, in_rows, region_placement, padding, blocked_layers and one_site_gap. What is NOT evaluated is named in the report's `not_checked` field on every run -- edge_spacing is not yet wired into the checker -- because a clean verdict from a partial checker must not read as a complete one. Families that ran under a restriction are named in `limitations` rather than left to be inferred.",
+    "All NINE of upstream's check families are evaluated: site alignment, placed, overlap, in_rows, region_placement, padding, edge_spacing, blocked_layers and one_site_gap. A family that cannot run on a design is named in the report's `not_checked` field, because a clean verdict from a partial checker must not read as a complete one. Families that ran under a restriction are named in `limitations` rather than left to be inferred.",
     "Site alignment is CORE-RELATIVE: upstream compares `cell->getLeft() % siteWidth` where getLeft() is relative to core_.xMin(). Measured on aes.defok, reading it as an absolute coordinate reports every one of 21340 cells misaligned on a design the reference calls clean.",
     "A site-alignment failure removes the cell from the overlap comparison entirely. That is a side effect of upstream's `continue`, not a separate rule: checkOverlap is what paints a cell into its pixels, so a cell that was skipped is never there for a later cell to collide with.",
     "OVERLAP is upstream's pixel walk, in upstream's visit order (instances sorted by NAME): a cell fails only when a square it covers already holds an EARLIER cell it genuinely overlaps, so only the later cell of a pair is reported. An earlier rectangle sweep reported both, and its claim that the failing set matched was wrong -- the checker gate measured it on check2.",
@@ -166,8 +166,8 @@ EXIT STATUS:
    runs, what it does NOT implement is named in `not_done` on every run rather than omitted,
    and every instance the model filter excluded is named in `filtered_out`.
 
-⚠️ Eight of upstream's nine check families are evaluated. `edge_spacing` is reported in
-   `not_checked` rather than passed over in silence, and a family that ran under
+⚠️ All nine of upstream's check families are evaluated. A family that cannot run on a design
+   is reported in `not_checked` rather than passed over in silence, and a family that ran under
    a restriction says so in `limitations`.
 
 ℹ️ `-disallow_one_site_gaps` has no equivalent here ON PURPOSE: upstream deprecated it and

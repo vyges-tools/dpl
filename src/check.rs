@@ -5,19 +5,19 @@
 //!
 //! ## What is here, and what is deliberately not
 //!
-//! Upstream runs **nine** check families. This implements the three that need only geometry and
-//! the row grid; the rest need `Grid`/`Pixel`, `Padding` or `PlacementDRC`, and are declared
-//! rather than silently omitted so a clean report cannot be mistaken for a complete one.
+//! Upstream runs **nine** check families, and all nine are evaluated here. A family that runs
+//! under a restriction says so in `limitations`, and one that cannot run on a design (no grid) is
+//! named in `not_checked`, so a clean report cannot be mistaken for a complete one.
 //!
 //! | family | upstream | here |
 //! | --- | --- | --- |
 //! | site alignment | `left % siteWidth`, bottom on a row Y | ✅ |
 //! | placed | `dbInst::isPlaced()` | ✅ |
 //! | overlap | `checkOverlap` via grid pixels | ✅ **rule transcribed, acceleration differs** |
-//! | in rows | `checkInRows` — pixel validity + site orientation | ⬜ needs `Grid` |
+//! | in rows | `checkInRows` — pixel validity, site, multi-row power | ✅ |
 //! | region placement | `checkRegionPlacement` + `checkRegionOverlap` | ✅ [`crate::regions`] |
-//! | padding · edge spacing · blocked layers | `PlacementDRC` | ⬜ |
-//! | one-site gaps | separate pass after overlap | ⬜ needs `Grid` |
+//! | padding · edge spacing · blocked layers | `PlacementDRC`, in upstream's loop order | ✅ |
+//! | one-site gaps | `checkOneSiteGaps`, a separate pass after the loop | ✅ |
 //!
 //! ⚠️ **The overlap ACCELERATION differs and the answer set does not.** Upstream finds candidate
 //! neighbours by walking the pixels a cell covers; this compares rectangles directly. The
@@ -71,13 +71,9 @@ impl Report {
 /// — when `check_placement` gained the pixel grid they need. What each of them can and cannot see
 /// is stated in `limitations` rather than implied by their absence here.
 ///
-/// ⛔ **"Implemented but not wired" is not "checked".** `edge_spacing` stays because its rule has
-/// no data to run on, not because it is unwritten.
-pub const NOT_CHECKED: &[&str] = &[
-    // ⛔ Needs each master's LEF58 CELLEDGESPACINGTABLE edge list, which the bindings do not
-    // expose. The RULE is built and tested in `crate::drc`; what is missing is the data.
-    "edge_spacing",
-];
+/// ✅ **Empty as of 2026-09-22**: `edge_spacing` was the last, wired once the bindings exposed
+/// each master's LEF58 edges. Kept, so a family that cannot run is named here rather than dropped.
+pub const NOT_CHECKED: &[&str] = &[];
 
 /// The rectangle a cell occupies, in DBU: `(x, y, w, h)`.
 fn cell_box(db: &Db, inst: &str) -> (i64, i64, i64, i64) {
@@ -243,6 +239,40 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
             .collect();
         crate::drc::routing_levels(&types)
     };
+    // `checkEdgeSpacing`'s table and each master's edges (`makeCellEdgeSpacingTable`, `addMaster`).
+    // ⛔ An EMPTY table skips the check, as `hasCellEdgeSpacingTable` does.
+    let edge_table =
+        crate::drc::EdgeSpacingTable::build(&db.tech_cell_edge_spacing().unwrap_or_default());
+    let mut master_edges: std::collections::HashMap<String, (crate::drc::EdgeBox, Vec<(usize, crate::drc::EdgeBox)>)> =
+        std::collections::HashMap::new();
+    if let (false, Ok(g)) = (edge_table.is_empty(), grid.as_ref()) {
+        for (n, _, _) in &boxes {
+            let m = db.inst_master(n);
+            if master_edges.contains_key(&m) {
+                continue;
+            }
+            let b = db.master_placement_boundary(&m).unwrap_or_default();
+            let bbox = if b.len() == 4 { (b[0], b[1], b[2], b[3]) } else { (0, 0, 0, 0) };
+            let rows = g.grid_height(db.master_get_height(&m) as i32,
+                                     db.row_pattern(&db.master_get_site(&m)).map_or(0, |p| p.len()));
+            let spacer = db.master_get_type(&m).unwrap_or_default() == "CORE_SPACER";
+            let lef = db.master_edge_types(&m).unwrap_or_default();
+            let edges = crate::drc::master_edges(bbox, &lef, rows, &edge_table, spacer);
+            master_edges.insert(m, (bbox, edges));
+        }
+    }
+    // A cell's edges placed where it sits, in its own orientation — `adjustNodesOrient` gives every
+    // node its instance's orient, and a neighbour's edges are taken at `getLeft/getBottom`.
+    let orients: Vec<String> = boxes.iter().map(|(n, _, _)| db.inst_get_orient(n)).collect();
+    let edges_at = |o: usize, x: i32, y: i32| -> Vec<(usize, crate::drc::EdgeBox)> {
+        let Some((bbox, edges)) = master_edges.get(&db.inst_master(&boxes[o].0)) else {
+            return Vec::new();
+        };
+        edges.iter()
+            .map(|&(t, e)| (t, crate::drc::transform_edge_rect(e, *bbox, &orients[o], x, y)))
+            .collect()
+    };
+
     // `checkRowPowerCompatible`'s model, as the legalizer builds it.
     let power = grid.as_ref().ok().map(|g| crate::negotiate::PowerModel::build(db, g, &levels));
     let mut used_layers_cache: std::collections::HashMap<String, u32> =
@@ -404,6 +434,30 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
                                             with: None });
             }
 
+            g.paint_cell_padding(gx0, gy0, gx1 - gx0, bx.3 as i32, left_pad as i64, right_pad as i64, me);
+
+            // `checkEdgeSpacing(cell)` — at `gridX(cell)`, `gridRoundY(cell)`, the cell's orient;
+            // against the cells painted BEFORE it. ⛔ After `paintCellPadding`, as upstream.
+            if !edge_table.is_empty() {
+                let (gx, gy) = (cx.div_euclid(g.site_width), g.grid_round_y(cy));
+                let (xr, yr) = (gx * g.site_width, g.row_y.get(gy).copied().unwrap_or(0));
+                let mine = edges_at(idx, xr, yr);
+                let sw = g.site_width;
+                let row_y = &g.row_y;
+                let ok = crate::drc::check_edge_spacing(
+                    &edge_table, idx, &mine,
+                    &|v| v.div_euclid(sw),
+                    &|v| (f64::from(v) / f64::from(sw)).ceil() as i32,
+                    &|v| row_y.iter().position(|&ry| ry >= v).unwrap_or(row_y.len()) as i32,
+                    &|px, py| g.pixel(px as i64, py as i64).and_then(|p| p.cell).map(|c| c as usize),
+                    &|o| edges_at(o, boxes[o].1.0 as i32 - g.core.0, boxes[o].1.1 as i32 - g.core.1),
+                );
+                if !ok {
+                    out.failures.push(Failure { family: "edge_spacing".into(), cell: name.clone(),
+                                                with: None });
+                }
+            }
+
             let used = used_layers_of(db, name);
             if !crate::drc::check_blocked_layers(
                 gx0 as i32, gx1 as i32, gy0 as i32, gy1 as i32, used,
@@ -412,8 +466,6 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
                 out.failures.push(Failure { family: "blocked_layers".into(), cell: name.clone(),
                                             with: None });
             }
-
-            g.paint_cell_padding(gx0, gy0, gx1 - gx0, bx.3 as i32, left_pad as i64, right_pad as i64, me);
         }
     }
     // `checkOneSiteGaps` — ⛔ a SECOND loop, after every cell is painted, as upstream runs it ("it
