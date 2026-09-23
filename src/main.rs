@@ -129,7 +129,7 @@ const DESCRIBE: &str = r#"{
     },
     {
       "name": "improve-placement",
-      "summary": "detailed placement improvement (IN PROGRESS: mis/gs/vs/ro not built)",
+      "summary": "detailed placement improvement (mis, global/vertical swap, reorder, random moves, orient)",
       "args_template": ["improve-placement", "{odb}"],
       "optional": [
         { "arg": "dump_setup", "flag": "--dump-setup", "description": "print the manager state after the shift legalizer" },
@@ -137,10 +137,11 @@ const DESCRIBE: &str = r#"{
         { "arg": "random_seed", "flag": "--random-seed", "description": "the optimizers' random seed (default 1)" },
         { "arg": "max_displacement", "flag": "--max-displacement", "description": "move cap in ROW HEIGHTS, 'X' or 'X,Y' (upstream's -max_displacement)" },
         { "arg": "trace_stages", "flag": "--trace-stages", "description": "print each stage's generator state and cell positions" },
+        { "arg": "report_one_site_gaps", "flag": "--report-one-site-gaps", "description": "print the cells the one-site-gap check would record, on any design" },
         { "arg": "inject_stage", "flag": "--inject-stage", "description": "correlation aid: place the cells as FILE's VYGS begin record for the start stage says" },
         { "arg": "start_stage", "flag": "--start-stage", "description": "correlation aid: skip the stages before this one" },
         { "arg": "stop_stage", "flag": "--stop-stage", "description": "correlation aid: stop after this stage" },
-        { "arg": "rng_skip", "flag": "--rng-skip", "description": "correlation aid: treat the unbuilt stages as no-ops and discard N draws" }
+        { "arg": "rng_skip", "flag": "--rng-skip", "description": "correlation aid: discard N draws before the start stage" }
       ],
       "assertion": { "id": "placement-improved", "field": "status", "pass_when": { "eq": "improved" } }
     }
@@ -400,8 +401,8 @@ fn optimize_mirroring(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `improve_placement` — ⬜ in progress: the setup, the random improver and flipping are built;
-/// `mis`, `gs`, `vs`, `ro` are not, so a full run refuses unless `--rng-skip` stands in for them.
+/// `improve_placement` — the whole script (`mis`, `gs`, `vs`, `ro`, the random improver, `orient`).
+/// ⬜ The one-site-gap REPAIR is not built; a design that needs it is reported in `not_done`.
 fn improve_placement(args: &[String]) -> ExitCode {
     let (mut odb, mut out_odb, mut dump, mut opts) = (None, None, false, vyges_dpl::improve_opt::Options::default());
     let (mut seed, mut max_disp) = (1u32, (0i32, 0i32));
@@ -410,6 +411,7 @@ fn improve_placement(args: &[String]) -> ExitCode {
         match args[i].as_str() {
             "--dump-setup" => dump = true,
             "--trace-stages" => opts.trace_stages = true,
+            "--report-one-site-gaps" => opts.report_gaps = true,
             "--random-seed" => {
                 i += 1;
                 seed = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(1);

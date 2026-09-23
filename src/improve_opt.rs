@@ -32,6 +32,11 @@ pub struct Options {
     pub start_stage: Option<String>,
     /// Stop after this stage's `end` (no `orient`, no checks).
     pub stop_stage: Option<String>,
+    /// After `orient`, run the one-site-gap DETECTION on any design (not only those that disallow
+    /// the gaps) and print `VYGG|<segment>|<node id>` per cell it records, then `VYGG|done` — the
+    /// reference trace's format, and the only witness the detection has: no upstream case has a
+    /// gap for it to find with the option that turns it on.
+    pub report_gaps: bool,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -105,12 +110,97 @@ pub fn improve(s: &mut Setup, opts: &Options) -> Result<Report, String> {
     stage_line(s, opts, &mut rep, "orient", "begin");
     orient(s, true);
     stage_line(s, opts, &mut rep, "orient", "end");
+    if opts.report_gaps {
+        for (seg, id) in one_site_gap_violations(s) {
+            rep.stage_lines.push(format!("VYGG|{seg}|{id}"));
+        }
+        rep.stage_lines.push("VYGG|done".into());
+    }
     s.run_checks();
     if s.rt.disallow_gaps {
-        rep.not_done.push("one-site-gap repair (getOneSiteGapViolationsPerSegment)".into());
+        // ⬜ The REPAIR (`fixOneSiteGapViolations`) is not built: it moves nothing on the only
+        // upstream case that reaches it (`gcd_no_one_site_gaps-opt`, final DEF identical without
+        // it), so a transcription would have no witness. What IS built is the detection, so the
+        // repair is named as not done exactly when a design has a gap it would have acted on.
+        let v = one_site_gap_violations(s).len();
+        if v > 0 {
+            rep.not_done.push(format!(
+                "one-site-gap repair (fixOneSiteGapViolations): {v} violation(s) left unrepaired"));
+        }
     }
     rep.hpwl_after = s.total_hpwl();
     Ok(rep)
+}
+
+/// `getOneSiteGapViolationsPerSegment(v, false)` — `(segment, node id)` per cell it would record
+/// (or, with `fix_violations`, try to fix).
+///
+/// Per segment of two or more cells (re-sorted by centre, as `resortSegment` leaves it): a cell
+/// whose left edge is exactly one site (ROW 0's site width) from the previous distinct right edge,
+/// and whose Y span overlaps a cell at that edge — spans CLOSED at both ends, so abutting rows
+/// overlap; or a cell with a blockage one site beyond either edge and none at the edge itself.
+/// ⚠️ `lastNode` starts as the segment's first cell, so the first cell never compares.
+pub(crate) fn one_site_gap_violations(s: &mut Setup) -> Vec<(usize, usize)> {
+    s.resort_segments();
+    let one_site = s.arch.rows[0].site_width;
+    let overlap = |b1: i32, t1: i32, b2: i32, t2: i32| (b2 <= b1 && b1 <= t2) || (b1 <= b2 && b2 <= t1);
+    let mut out = Vec::new();
+    for seg in 0..s.segments.len() {
+        let cells = &s.cells_in_seg[seg];
+        if cells.len() < 2 {
+            continue;
+        }
+        let mut last = cells[0];
+        let mut at_last_x = vec![cells[0]];
+        for &nd in cells {
+            let n = &s.nodes[nd];
+            if n.right() != s.nodes[last].right() {
+                if (n.left - s.nodes[last].right()).abs() == one_site {
+                    for &c in &at_last_x {
+                        if !overlap(s.nodes[c].bottom, s.nodes[c].top(), n.bottom, n.top()) {
+                            continue;
+                        }
+                        out.push((seg, n.id));
+                        // A fixed/terminal cell (DPL-0339) or a multi-height one (DPL-0340) is
+                        // recorded and the scan CONTINUES — once per overlapping cell; the fix
+                        // is tried on the first overlap only.
+                        if !(n.kind == Kind::Terminal || n.fixed || s.arch.height_in_rows(n) != 1) {
+                            break;
+                        }
+                    }
+                }
+                at_last_x.clear();
+            }
+            let blocked = |x| is_inside_a_blockage(s, nd, x);
+            if (blocked(n.left - one_site) && !blocked(n.left))
+                || (blocked(n.right() + one_site) && !blocked(n.right()))
+            {
+                out.push((seg, n.id));
+            }
+            at_last_x.push(nd);
+            last = nd;
+        }
+    }
+    out
+}
+
+/// `isInsideABlockage` — a blockage covering `x` (ends inclusive) in the rows the cell spans.
+/// ⚠️ The row range is `[bottom row, top row)` with the top clamped to `rows - 1`, so a cell in
+/// the LAST row checks no row at all.
+///
+/// ⚠️ **That clamp is UNWITNESSED**: a mutant without it still matches all 9 upstream cases' 8,571
+/// detections — none has a blockage one site from a last-row cell. The blockage branch itself IS
+/// witnessed (without it aes, gcd and ibex differ), as is the closed-interval overlap.
+fn is_inside_a_blockage(s: &Setup, nd: usize, x: i32) -> bool {
+    let r0 = &s.arch.rows[0];
+    let n = &s.nodes[nd];
+    let start = ((n.bottom - r0.bottom) / r0.height).max(0);
+    let end = ((n.top() - r0.bottom) / r0.height).min(s.arch.rows.len() as i32 - 1);
+    (start..end).any(|r| {
+        let row = &s.blockages[r as usize];
+        let i = row.partition_point(|b| b.x_max() < x);
+        i < row.len() && row[i].blocks() && x >= row[i].x_min() && x <= row[i].x_max()
+    })
 }
 
 /// `VYGS|stage|<cmd>|<when>|rng=<next draw of a copy>|<id>:<left>:<bottom>:<orient>;…`

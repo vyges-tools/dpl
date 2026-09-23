@@ -300,7 +300,6 @@ pub(crate) struct Blockage {
     x_max: i32,
     pad_left: i32,
     pad_right: i32,
-    #[allow(dead_code)]
     kind: BlockageType,
 }
 
@@ -310,6 +309,16 @@ impl Blockage {
     }
     fn padded_max(&self) -> i32 {
         self.x_max + self.pad_right
+    }
+    pub(crate) fn x_min(&self) -> i32 {
+        self.x_min
+    }
+    pub(crate) fn x_max(&self) -> i32 {
+        self.x_max
+    }
+    /// `isFixedInstance() || isPlacement()` — every blockage `findBlockages` records.
+    pub(crate) fn blocks(&self) -> bool {
+        matches!(self.kind, BlockageType::FixedInstance | BlockageType::Placement)
     }
 }
 
