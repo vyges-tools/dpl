@@ -416,6 +416,10 @@ pub struct NegGrid {
     row_has_sites: Vec<bool>,
     /// Each occupant's padding in sites, `(left, right)`, by occupant index. Missing is `(0, 0)`.
     pub pads: Vec<(i32, i32)>,
+    /// Where each occupant was last painted, `(x, y)` in squares — the node position
+    /// `syncCellToDplGrid` gives a cell (`left = x·site`, `bottom = gridYToDbu(y)`), which
+    /// `checkEdgeSpacing` reads for every NEIGHBOUR it finds through `pixel->cell`.
+    pub at: Vec<Option<(i32, i32)>>,
 }
 
 impl NegGrid {
@@ -430,7 +434,7 @@ impl NegGrid {
                 p.hist_cost = 1.0;
             }
         }
-        let mut g = NegGrid { width, height, pixels, row_has_sites: vec![false; height], pads: Vec::new() };
+        let mut g = NegGrid { width, height, pixels, row_has_sites: vec![false; height], pads: Vec::new(), at: Vec::new() };
         g.recompute_rows();
         g
     }
@@ -501,6 +505,10 @@ impl NegGrid {
     /// ⛔ **Then `paintCellPadding`: the `left` squares before the footprint and the `right` squares
     /// after it, over the same rows, are RESERVED by this cell** — again unconditionally.
     pub fn paint_cell(&mut self, idx: usize, x: i32, y: i32, w: i32, h: i32) {
+        if self.at.len() <= idx {
+            self.at.resize(idx + 1, None);
+        }
+        self.at[idx] = Some((x, y));
         for dy in 0..h {
             for dx in 0..w {
                 let (gx, gy) = (x + dx, y + dy);
@@ -3198,11 +3206,10 @@ use vyges_opendb::Db;
 /// omits a check reports fewer violations than it earned.
 pub const NOT_DONE: &[&str] = &[
     "groups_and_regions (respectsFence / initFenceRegions)",
-    // ⚠️ TWO of `countDRCViolations`' four terms are evaluated (padding/overlap and one-site
-    // gaps). The other two need the master's edge list or its blocked layers, so the DRC penalty
-    // is still an UNDER-count — it never over-reports, but it will prefer a location upstream
-    // would not.
-    "drc: edge_spacing and blocked_layers are not evaluated by the legalizer",
+    // ⚠️ THREE of `countDRCViolations`' four terms are evaluated (edge spacing, padding/overlap,
+    // one-site gaps). Blocked layers needs each master's layer set, so the DRC penalty is still
+    // an UNDER-count — it never over-reports, but it may prefer a location upstream would not.
+    "drc: blocked_layers is not evaluated by the legalizer",
     // ⬜ `-incremental`: upstream clears `setPlaced(false)` on every movable cell unless it is
     // given. This engine has no per-cell `placed` flag, so the flag would be inert.
     "incremental placement (-incremental)",
@@ -3370,6 +3377,10 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
     // Each occupant's padding, movable first and fixed after — the same index space as the classes.
     let mut cell_pads: Vec<(i32, i32)> = Vec::new();
     let mut fixed_pads: Vec<(i32, i32)> = Vec::new();
+    // For `checkEdgeSpacing`: each movable cell's own orientation (the node's, kept where no row
+    // site gives one), and each FIXED cell's master and DEF placement, core-relative.
+    let mut init_orients: Vec<String> = Vec::new();
+    let mut fixed_edge_at: Vec<(String, i32, i32, String)> = Vec::new();
     for i in 0..db.num_insts() {
         let name = db.nth_inst_name(i);
         let master = db.inst_master(&name);
@@ -3430,6 +3441,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             fixed_boxes.push((x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32));
             fixed_types.push(mtype.clone());
             fixed_pads.push(padding.of(&name, &master, &mtype));
+            fixed_edge_at.push((master.clone(), x - core.0, y - core.1, db.inst_get_orient(&name)));
             continue;
         }
         // ⛔ **`init_position` wants the footprint in GRID UNITS, not DBU**, because its clamp is
@@ -3465,6 +3477,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
         });
         sites.push(db.master_get_site(&master));
         masters.push(master.clone());
+        init_orients.push(db.inst_get_orient(&name));
         cell_types.push(mtype.clone());
         cell_pads.push(padding.of(&name, &master, &mtype));
         sym.push((
@@ -3638,10 +3651,72 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
     // that of `pixel->cell`, not of usage, and the two disagree on a shared square. See
     // [`NegPixel::cell`].
     //
-    // ⬜ Two of `PlacementDRC`'s four rules are wired: this one and `checkPadding`. Edge spacing
-    // and blocked layers need the occupant's master edge list and layer set, which this grid
-    // does not carry. They stay in `NOT_DONE`.
+    // ⬜ Three of `PlacementDRC`'s four rules are wired: this one, `checkPadding` and
+    // `checkEdgeSpacing` (below). Blocked layers needs each occupant's layer set and stays in
+    // `NOT_DONE`.
     let one_site_gaps_disallowed = !db.has_one_site_master();
+
+    // `checkEdgeSpacing` — LEF58 cell-edge spacing (`makeCellEdgeSpacingTable` + `addMaster`'s edge
+    // list). ⛔ An EMPTY table skips the check outright, as upstream's `hasCellEdgeSpacingTable`
+    // does, so a technology without the rules is untouched by it.
+    let edge_table = crate::drc::EdgeSpacingTable::build(&db.tech_cell_edge_spacing().unwrap_or_default());
+    let mut master_edge_list: std::collections::HashMap<String, (crate::drc::EdgeBox, Vec<(usize, crate::drc::EdgeBox)>)> =
+        std::collections::HashMap::new();
+    if !edge_table.is_empty() {
+        for m in masters.iter().chain(fixed_edge_at.iter().map(|f| &f.0)) {
+            if master_edge_list.contains_key(m) {
+                continue;
+            }
+            let b = db.master_placement_boundary(m).unwrap_or_default();
+            let bbox = if b.len() == 4 { (b[0], b[1], b[2], b[3]) } else { (0, 0, 0, 0) };
+            let rows = grid.grid_height(db.master_get_height(m) as i32,
+                                        db.row_pattern(&db.master_get_site(m)).map_or(0, |p| p.len())) as i32;
+            let spacer = db.master_get_type(m).unwrap_or_default() == "CORE_SPACER";
+            let lef = db.master_edge_types(m).unwrap_or_default();
+            master_edge_list.insert(m.clone(), (bbox, crate::drc::master_edges(bbox, &lef, rows, &edge_table, spacer)));
+        }
+    }
+    let n_movable = masters.len();
+    // An occupant's edges where it now sits: a movable cell at its painted square, oriented by the
+    // row's site there (`syncCellToDplGrid`), else by its own; a fixed cell where the DEF put it.
+    let placed_edges = |o: usize, g: &NegGrid| -> Vec<(usize, crate::drc::EdgeBox)> {
+        let (master, x, y, orient) = if o < n_movable {
+            let Some(Some((gx, gy))) = g.at.get(o).copied() else { return Vec::new() };
+            let orient = grid.site_orient_at(gx as i64, gy as i64, &sites[o]).unwrap_or_else(|| init_orients[o].clone());
+            (&masters[o], gx * sw, grid.row_y.get(gy as usize).copied().unwrap_or(0), orient)
+        } else {
+            let Some(f) = fixed_edge_at.get(o - n_movable) else { return Vec::new() };
+            (&f.0, f.1, f.2, f.3.clone())
+        };
+        let Some((bbox, edges)) = master_edge_list.get(master) else { return Vec::new() };
+        edges.iter().map(|&(t, e)| (t, crate::drc::transform_edge_rect(e, *bbox, &orient, x, y))).collect()
+    };
+    let edge_ok = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
+        if edge_table.is_empty() {
+            return true;
+        }
+        let Some((bbox, edges)) = master_edge_list.get(&masters[i]) else { return true };
+        // `targetOrient` — the row's site orientation there, else the cell's own.
+        let orient = grid.site_orient_at(x as i64, y as i64, &sites[i]).unwrap_or_else(|| init_orients[i].clone());
+        let (xr, yr) = (x * sw, grid.row_y.get(y as usize).copied().unwrap_or(0));
+        let mine: Vec<(usize, crate::drc::EdgeBox)> =
+            edges.iter().map(|&(t, e)| (t, crate::drc::transform_edge_rect(e, *bbox, &orient, xr, yr))).collect();
+        let row_y = &grid.row_y;
+        crate::drc::check_edge_spacing(
+            &edge_table, i, &mine,
+            &|v| v / sw,
+            &|v| (f64::from(v) / f64::from(sw)).ceil() as i32,
+            &|v| row_y.iter().position(|&ry| ry >= v).unwrap_or(row_y.len()) as i32,
+            &|px, py| {
+                if px < 0 || py < 0 || px as usize >= g.width || py as usize >= g.height {
+                    None
+                } else {
+                    g.occupant(px, py)
+                }
+            },
+            &|o| placed_edges(o, g),
+        )
+    };
     let gap_ok = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
         // `checkOneSiteGap` measures the cell with `grid_->gridWidth(cell)`.
         let (cw, ch) = dpl_dims[i];
@@ -3705,6 +3780,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             || !site_ok(i, c.x, c.y)
             || !pad_ok(i, c.x, c.y, &ngrid)
             || !gap_ok(i, c.x, c.y, &ngrid)
+            || !edge_ok(i, c.x, c.y, &ngrid)
         {
             illegal.push(i);
         }
@@ -3817,14 +3893,19 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
         let placeable = |c: &SweepCell, x: i32, y: i32| site_ok(by_name[c.name.as_str()], x, y);
         // `countDRCViolations`, as far as this engine can evaluate it.
         //
-        // ⚠️ **One of upstream's four terms**, so the penalty is an UNDER-count: padding, edge
-        // spacing and blocked layers contribute 0 here and are named in `not_done`. A cost
-        // function missing a term does not fail — it quietly prefers different locations.
+        // ⚠️ **Three of upstream's four terms** — edge spacing, padding and one-site gaps; blocked
+        // layers contributes 0 and is named in `not_done`. A cost function missing a term does not
+        // fail — it quietly prefers different locations.
         let idx_of: std::collections::HashMap<&str, usize> =
             index.iter().map(|&i| (names[i].as_str(), i)).collect();
         let drc = |c: &SweepCell, x: i32, y: i32, g: &NegGrid| -> i32 {
             let i = idx_of[c.name.as_str()];
             let mut count = 0;
+            // `countDRCViolations`, in upstream's order: edge spacing, padding, (blocked layers),
+            // one-site gaps.
+            if !edge_ok(i, x, y, g) {
+                count += 1;
+            }
             if !pad_ok(i, x, y, g) {
                 count += 1;
             }
@@ -3913,7 +3994,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
                 return false;
             }
             // The trailing `drc_engine_->checkDRC(...)`.
-            pad_ok(i, x, y, g) && gap_ok(i, x, y, g)
+            pad_ok(i, x, y, g) && gap_ok(i, x, y, g) && edge_ok(i, x, y, g)
         };
 
         // ⚠️ **`calcDist` is in DBU, not in grid steps** — `|dx| * site_width` plus the DBU

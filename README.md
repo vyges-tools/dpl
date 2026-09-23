@@ -71,12 +71,14 @@ order to be useful — and upstream's own suite leans on it harder: **77 of 92 `
 ## Status
 
 At pin `da9f29f18b6487825aa880597176e0fa97110b31` (2026-09-22), with padding modelled:
-**43 of 44 comparable cases match** the reference component for component, with filler
+**44 of 44 comparable cases match** the reference component for component, with filler
 placement (`filler-placement`) scored on eight of them — `obstruction1` alone is 19,768 components —
 and the sweep trace (upstream's `negotiationIter` debug line) identical for the whole run on
-`cell_on_block2` (16,176 lines) and `obstruction2` (248), among others. The one that does not is
-`edge_spacing`, where the LEGALIZATION differs: its DRC term does not evaluate LEF58 cell-edge
-spacing yet (named in `--describe`), and the fillers then fill different gaps.
+`cell_on_block2` (16,176 lines), `obstruction2` (248) and `edge_spacing`, among others.
+`edge_spacing` needed LEF58 cell-edge spacing in the legalizer's DRC term: each master's edges
+(`Network::addMaster`) and the technology's table, read through new `vyges-opendb` accessors, and
+`checkEdgeSpacing` transcribed — with `Rect::overlaps` STRICT, as odb defines it, so edges that
+meet only at a corner are not compared.
 
 The last three defects, each found by printing every candidate of the first diverging
 `findBestLocation` call on both sides (`VYGES_DPL_CELL` / `VYGES_DPL_ITER`, and the reference

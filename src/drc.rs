@@ -358,9 +358,228 @@ pub fn edge_distance(
     if is_vertical { xhi - xlo } else { yhi - ylo }
 }
 
+/// A box `(x_min, y_min, x_max, y_max)`; a cell edge is one with zero width or height.
+pub type EdgeBox = (i32, i32, i32, i32);
+
+/// `dbMasterEdgeType::EdgeDir` — the enum's order, which the DEFAULT pass walks.
+pub const EDGE_TOP: i32 = 0;
+pub const EDGE_RIGHT: i32 = 1;
+pub const EDGE_LEFT: i32 = 2;
+pub const EDGE_BOTTOM: i32 = 3;
+
+/// `getBoundarySegment` — one side of the placement boundary, as a zero-thickness box.
+pub fn boundary_segment(b: EdgeBox, dir: i32) -> EdgeBox {
+    match dir {
+        EDGE_RIGHT => (b.2, b.1, b.2, b.3),
+        EDGE_LEFT => (b.0, b.1, b.0, b.3),
+        EDGE_TOP => (b.0, b.3, b.2, b.3),
+        _ => (b.0, b.1, b.2, b.1),
+    }
+}
+
+/// `difference(parent, segs)` — the parts of a side NOT covered by the typed segments on it.
+///
+/// ⚠️ Transcribed as written: segments sorted by start, merged where they INTERSECT (touching
+/// counts, `Rect::intersects` is inclusive), then the gaps between them from the side's start.
+pub fn segment_difference(parent: EdgeBox, segs: &[EdgeBox]) -> Vec<EdgeBox> {
+    if segs.is_empty() {
+        return vec![parent];
+    }
+    let horizontal = parent.1 == parent.3;
+    let start = |r: &EdgeBox| if horizontal { r.0 } else { r.1 };
+    let end = |r: &EdgeBox| if horizontal { r.2 } else { r.3 };
+    let mut sorted = segs.to_vec();
+    sorted.sort_by_key(|r| start(r));
+    let mut merged: Vec<EdgeBox> = Vec::new();
+    for r in sorted {
+        match merged.last_mut() {
+            Some(p) if r.0 <= p.2 && p.0 <= r.2 && r.1 <= p.3 && p.1 <= r.3 => {
+                *p = (p.0.min(r.0), p.1.min(r.1), p.2.max(r.2), p.3.max(r.3));
+            }
+            _ => merged.push(r),
+        }
+    }
+    let (lo, hi) = (start(&parent), end(&parent));
+    let mut cur = lo;
+    let mut out = Vec::new();
+    let piece = |a: i32, b: i32| if horizontal { (a, parent.1, b, parent.3) } else { (parent.0, a, parent.2, b) };
+    for r in &merged {
+        if start(r) > cur {
+            out.push(piece(cur, start(r)));
+        }
+        cur = end(r);
+    }
+    if cur < hi {
+        out.push(piece(cur, hi));
+    }
+    out
+}
+
+/// `Network::addMaster`'s edge list — `(edge-type index, box in master coordinates)`.
+///
+/// Each LEF58 edge is its side of the placement boundary, narrowed: a TOP/BOTTOM edge by its
+/// `RANGE`, a LEFT/RIGHT edge to its `CELLROW` (or `HALFROW`) of the master's rows. Only edge
+/// types the spacing table names are kept; with a `DEFAULT` type in the table, the untyped rest of
+/// every side is added as `DEFAULT`, sides in `EdgeDir` order. A CORE_SPACER (filler) master and
+/// an empty table give no edges.
+///
+/// ⚠️ **The row narrowing reads the UPDATED `yMin`**: `set_ylo(yMin + (row-1)*h)` first, then
+/// `set_yhi(min(yMax, yMin + h))` — the second `yMin` is the new one.
+pub fn master_edges(
+    bbox: EdgeBox,
+    lef_edges: &[(String, i32, i32, i32, i32, i32)],
+    num_rows: i32,
+    table: &EdgeSpacingTable,
+    is_core_spacer: bool,
+) -> Vec<(usize, EdgeBox)> {
+    let mut out = Vec::new();
+    if table.is_empty() || is_core_spacer {
+        return out;
+    }
+    let mut typed: std::collections::BTreeMap<i32, Vec<EdgeBox>> = std::collections::BTreeMap::new();
+    for (etype, dir, cell_row, half_row, range_begin, range_end) in lef_edges {
+        let mut r = boundary_segment(bbox, *dir);
+        if *dir == EDGE_TOP || *dir == EDGE_BOTTOM {
+            if *range_begin != -1 {
+                let x0 = r.0;
+                r.0 = x0 + range_begin;
+                r.2 = x0 + range_end;
+            }
+        } else {
+            let row_height = (r.3 - r.1) / num_rows.max(1);
+            let half = row_height / 2;
+            if *cell_row != -1 {
+                r.1 += (cell_row - 1) * row_height;
+                r.3 = r.3.min(r.1 + row_height);
+            } else if *half_row != -1 {
+                r.1 += (half_row - 1) * half;
+                r.3 = r.3.min(r.1 + half);
+            }
+        }
+        typed.entry(*dir).or_default().push(r);
+        if let Some(idx) = table.index_of(etype) {
+            out.push((idx, r));
+        }
+    }
+    let Some(default_idx) = table.index_of("DEFAULT") else { return out };
+    for dir in [EDGE_TOP, EDGE_RIGHT, EDGE_LEFT, EDGE_BOTTOM] {
+        let parent = boundary_segment(bbox, dir);
+        for seg in segment_difference(parent, typed.get(&dir).map_or(&[][..], |v| v.as_slice())) {
+            out.push((default_idx, seg));
+        }
+    }
+    out
+}
+
+/// `dbTransform(orient).apply(point)`.
+pub fn orient_apply(orient: &str, (x, y): (i32, i32)) -> (i32, i32) {
+    match orient {
+        "R90" => (-y, x),
+        "R180" => (-x, -y),
+        "R270" => (y, -x),
+        "MY" => (-x, y),
+        "MYR90" => (-y, -x),
+        "MX" => (x, -y),
+        "MXR90" => (y, x),
+        _ => (x, y),
+    }
+}
+
+fn orient_rect(orient: &str, r: EdgeBox, off: (i32, i32)) -> EdgeBox {
+    let (a, b) = (orient_apply(orient, (r.0, r.1)), orient_apply(orient, (r.2, r.3)));
+    (a.0.min(b.0) + off.0, a.1.min(b.1) + off.1, a.0.max(b.0) + off.0, a.1.max(b.1) + off.1)
+}
+
+/// `cell_edges::transformEdgeRect` — an edge box from master coordinates to the cell placed with
+/// its boundary's lower-left at `(x, y)` in `orient`: the boundary is rotated first to find the
+/// offset, then the edge is rotated and moved by it.
+pub fn transform_edge_rect(edge: EdgeBox, boundary: EdgeBox, orient: &str, x: i32, y: i32) -> EdgeBox {
+    let b = orient_rect(orient, boundary, (0, 0));
+    orient_rect(orient, edge, (x - b.0, y - b.1))
+}
+
+/// `Rect::getDir() == vertical` — taller than wide.
+pub fn is_vertical(r: EdgeBox) -> bool {
+    r.2 - r.0 < r.3 - r.1
+}
+
+/// `PlacementDRC::checkEdgeSpacing` for one cell at one position.
+///
+/// `edges` are the cell's own, already placed; `occupant(x, y)` is `pixel->cell` on a square (None
+/// off the grid or empty); `placed_edges(o)` another cell's edges where it now sits. The grid
+/// functions are core-relative (`gridX`, `gridEndX`, `gridEndY`).
+///
+/// ⛔ Upstream's pixel scan is INCLUSIVE at both ends and starts one row below
+/// `gridEndY(query.yMin)`; each neighbour is checked once however many squares it holds; the
+/// neighbour's edges are compared only when PARALLEL and when the query rect OVERLAPS them —
+/// `Rect::overlaps`, which is STRICT: touching is not overlapping.
+#[allow(clippy::too_many_arguments)]
+pub fn check_edge_spacing(
+    table: &EdgeSpacingTable,
+    me: usize,
+    edges: &[(usize, EdgeBox)],
+    grid_x: &dyn Fn(i32) -> i32,
+    grid_end_x: &dyn Fn(i32) -> i32,
+    grid_end_y: &dyn Fn(i32) -> i32,
+    occupant: &dyn Fn(i32, i32) -> Option<usize>,
+    placed_edges: &dyn Fn(usize) -> Vec<(usize, EdgeBox)>,
+) -> bool {
+    if table.is_empty() {
+        return true;
+    }
+    for &(t1, e1) in edges {
+        let vertical = is_vertical(e1);
+        let q = query_rect(e1, table.query_radius(t1), vertical);
+        let (x_min, x_max) = (grid_x(q.0), grid_end_x(q.2));
+        let (y_min, y_max) = (grid_end_y(q.1) - 1, grid_end_y(q.3));
+        let mut checked = std::collections::BTreeSet::new();
+        for y1 in y_min..=y_max {
+            for x1 in x_min..=x_max {
+                let Some(o) = occupant(x1, y1) else { continue };
+                if o == me || !checked.insert(o) {
+                    continue;
+                }
+                for (t2, e2) in placed_edges(o) {
+                    if vertical != is_vertical(e2) {
+                        continue;
+                    }
+                    // ⛔ `Rect::overlaps` is STRICT (`intersects` is the inclusive one): two edges
+                    // meeting only at a corner — one row's side above the next row's — have no
+                    // parallel run and are not compared.
+                    if !(e2.2 > q.0 && e2.0 < q.2 && e2.3 > q.1 && e2.1 < q.3) {
+                        continue;
+                    }
+                    let entry = table.entry(t1, t2);
+                    if edge_spacing_violation(edge_distance(e1, e2, vertical), entry) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edges_meeting_only_at_a_corner_are_not_compared() {
+        // ⛔ `query_rect.overlaps(edge2)` is STRICT. A cell's left side on one row and a
+        // neighbour's side at the SAME x on the row below touch only at the corner: measured on
+        // upstream's `edge_spacing` — the reference passes it, and reading `overlaps` as inclusive
+        // made it a distance-0 violation. Side by side on one row, the same pair does violate.
+        let table = EdgeSpacingTable::build(&[("E".into(), "E".into(), 200, false, false)]);
+        let mine = [(0usize, (11400, 14000, 11400, 16800))];
+        let below = vec![(0usize, (11400, 11200, 11400, 14000))];
+        let beside = vec![(0usize, (11400, 14000, 11400, 16800))];
+        let run = |theirs: Vec<(usize, EdgeBox)>| check_edge_spacing(
+            &table, 0, &mine, &|v| v / 380, &|v| (v + 379) / 380, &|v| v / 2800 + 1,
+            &|x, _| (x == 30).then_some(1), &move |_| theirs.clone());
+        assert!(run(below), "corner contact: no parallel run, no comparison");
+        assert!(!run(beside), "a parallel run at distance 0 < 200 violates");
+    }
 
     #[test]
     fn the_matrix_matches_the_table_in_the_source() {
