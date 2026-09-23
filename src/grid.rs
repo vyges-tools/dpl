@@ -352,18 +352,58 @@ impl Grid {
         (xlo, ylo, xhi, yhi)
     }
 
+    /// `Grid::gridCovering(const odb::Rect&)` — the squares a core-relative BOX covers:
+    /// `gridX(xMin)`, `gridSnapDownY(yMin)`, `gridEndX(xMax)`, `gridEndY(yMax)`.
+    ///
+    /// ⚠️ **Not [`Grid::covering`] with the box's width.** That is the CELL form
+    /// (`gridX(left) + divCeil(width)`); this one is `divCeil(xMax)` on the box's own right edge,
+    /// and the two differ by a column for a box that does not start on a site. `gridEndY` is a
+    /// `lower_bound` over the row boundaries — the vector's LENGTH when every boundary is below.
+    pub fn covering_rect(&self, x0: i32, y0: i32, x1: i32, y1: i32) -> (i64, i64, i64, i64) {
+        let xlo = (x0 / self.site_width) as i64;
+        // `divCeil` goes through `double`.
+        let xhi = (f64::from(x1) / f64::from(self.site_width)).ceil() as i64;
+        let ylo = self.grid_snap_down_y(y0).map_or(0, |v| v as i64);
+        let yhi = self.row_y.iter().position(|&ry| ry >= y1).unwrap_or(self.row_y.len()) as i64;
+        (xlo, ylo, xhi, yhi)
+    }
+
+    /// `Grid::getShortestSite` — of the `(site, orient)` entries covering column `x` on grid row
+    /// `y`, the one whose SITE is shortest; the first on a tie. `None` where no row covers it.
+    ///
+    /// ⚠️ Upstream's entries are a set keyed by site POINTER, so on two DIFFERENT sites of equal
+    /// height its tie goes by allocation order; here it goes by row order. Golden-blind: no
+    /// filler case has two equal-height sites over one square.
+    pub fn shortest_site(&self, x: usize, y: usize, height: &dyn Fn(&str) -> i32) -> Option<(String, String)> {
+        let mut best: Option<(i32, &str, &str)> = None;
+        for (lo, hi, site, orient) in self.row_sites.get(y)? {
+            if x >= *lo && x < *hi {
+                let h = height(site);
+                if best.is_none_or(|b| h < b.0) {
+                    best = Some((h, site, orient));
+                }
+            }
+        }
+        best.map(|(_, s, o)| (s.to_string(), o.to_string()))
+    }
+
     /// `Grid::gridSnapDownY` — the row a core-relative Y falls in, snapping DOWN.
     ///
     /// ⚠️ Below the first row it clamps to 0 rather than answering `None`: upstream's
     /// `gridSnapDownY` returns an index, and a fixed cell hanging below the core still paints.
+    ///
+    /// ⛔ **At or above the TOP boundary it answers `row_count` — one past the last row — not the
+    /// last row.** Upstream is `upper_bound` over EVERY boundary, the top one included, minus one,
+    /// so a shape above the core lands on the top boundary's index, which has no pixels: nothing is
+    /// painted. Clamping to the last row painted it: `obstruction1`'s two top corner macros sit
+    /// above the core, and their OVERLAP shapes blanked row 285 for `filler_placement`.
     pub fn grid_snap_down_y(&self, y: i32) -> Option<usize> {
         if self.row_count == 0 {
             return None;
         }
-        if y < self.row_y[0] {
-            return Some(0);
-        }
-        (0..self.row_count).rev().find(|&i| self.row_y[i] <= y)
+        // `std::upper_bound(row_y, y)`: the first boundary strictly above `y`.
+        let ub = self.row_y.iter().position(|&ry| ry > y).unwrap_or(self.row_y.len());
+        Some(ub.saturating_sub(1))
     }
 
     /// `Grid::paintPixel` — mark the squares a cell occupies.
@@ -655,6 +695,31 @@ mod grid_height_tests {
         assert_eq!(g.covering(20, 0, 30, 2800), (2, 0, 5, 1),
                    "sites 2..5 and row 0..1 — three squares on ONE row");
         assert_eq!(g.covering(20, 2800, 30, 5600), (2, 1, 5, 3), "a two-row cell spans rows 1..3");
+    }
+
+    #[test]
+    fn snapping_above_the_core_lands_past_the_last_row() {
+        // ⛔ `gridSnapDownY` is `upper_bound` over every boundary, the TOP one included: at or
+        // above it the answer is `row_count`, which has no pixels, so nothing is painted there.
+        let g = uniform(2800, 4); // boundaries 0, 2800, 5600, 8400, 11200
+        assert_eq!(g.grid_snap_down_y(-5), Some(0), "below the core: clamped to row 0");
+        assert_eq!(g.grid_snap_down_y(2799), Some(0));
+        assert_eq!(g.grid_snap_down_y(2800), Some(1));
+        assert_eq!(g.grid_snap_down_y(11199), Some(3), "inside the last row");
+        assert_eq!(g.grid_snap_down_y(11200), Some(4), "the top boundary: past the last row");
+        assert_eq!(g.grid_snap_down_y(20000), Some(4));
+    }
+
+    #[test]
+    fn a_box_covers_to_the_ceiling_of_its_own_right_edge() {
+        // `gridCovering(Rect)`: `gridX(xMin)`, `divCeil(xMax)` — NOT `gridX + divCeil(width)`,
+        // which is the cell form. A box from 15 to 35 at a 10-dbu site: squares 1..4 here, 1..3
+        // by the cell form.
+        let g = uniform(2800, 4);
+        assert_eq!(g.covering_rect(15, 0, 35, 2800), (1, 0, 4, 1));
+        assert_eq!(g.covering(15, 0, 20, 2800).2, 3);
+        // `gridEndY`: `lower_bound`, the vector's LENGTH when every boundary is below.
+        assert_eq!(g.covering_rect(0, 0, 10, 99_999).3, 5);
     }
 
     #[test]

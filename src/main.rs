@@ -56,7 +56,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
     "LEGALIZATION is implemented and is the default path: the NEGOTIATION legalizer, which is what upstream's `detailed_placement` runs when `-use_diamond_legalizer` is absent. `--use-diamond-legalizer` selects the other one. The two produce DIFFERENT placements, so the report names which ran.",
-    "At pin da9f29f18b6487825aa880597176e0fa97110b31, with placement padding modelled, `detailed_placement` matches the reference on 35 of 35 comparable cases. Earlier, at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34, it matched 28 of 28 comparable cases from its own regression suite, including aes (21340 components), ibex (34184) and gcd (549). The agreement is SWEEP-LEVEL, not final-placement only -- upstream's per-iteration debug trace and this engine's match line for line, every cell, every iteration, on simple05, simple07, gcd (574 lines) and hybrid_cells.",
+    "At pin da9f29f18b6487825aa880597176e0fa97110b31, with placement padding modelled, `detailed_placement` matches the reference on 43 of 44 comparable cases, eight of them followed by `filler_placement` (`filler-placement` here) and scored with the fillers; the one that does not is edge_spacing, whose legalization needs LEF58 cell-edge spacing. Earlier, at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34, it matched 28 of 28 comparable cases from its own regression suite, including aes (21340 components), ibex (34184) and gcd (549). The agreement is SWEEP-LEVEL, not final-placement only -- upstream's per-iteration debug trace and this engine's match line for line, every cell, every iteration, on simple05, simple07, gcd (574 lines) and hybrid_cells.",
     "It read 18 of 28 when the pin first moved from 945a9f48dc6e5cc91d865daa92c45a1094cb682c, because upstream reworked the negotiation legalizer's INITIAL SNAPPING across 7 commits and refreshed 24 of its own goldens. Four mechanisms were transcribed to recover it: `Grid::gridRoundX` (initial x ROUNDS to the nearest site rather than truncating), `displacementInSites`/`rowDispInSites` replacing the deleted `NegCell::displacement()` so displacement is site widths on BOTH axes, `initialSnap()`'s diamond search in place of a four-direction scan, and -- the one that mattered most -- running that snap as its OWN pass after every fixed cell is blockaded, testing grid CAPACITY rather than merely whether a site exists.",
     "BUT 35 of upstream's 63 `detailed_placement` cases are OUTSIDE that number and are not scored at all: 12 ship no golden, 8 need filler placement, 7 declare REGIONS/GROUPS, 7 need placement padding values, 1 needs both. `18 of 28` is a claim about what the corpus asks, not about every design.",
     "AND THE DENOMINATOR IS SHORT: upstream ships 69 .tcl cases calling `detailed_placement`, not 63. Five of them -- report_failures, fragmented_row03, pad02, fillers8, obstruction2 -- wrap the call as `catch { detailed_placement }`, so the harness's command filter does not see them and they are scored by nothing. All five are error-path cases.",
@@ -98,6 +98,16 @@ const DESCRIBE: &str = r#"{
         { "arg": "disable_window_extension", "flag": "--disable-window-extension", "description": "do not widen the search past a macro or a wall" }
       ],
       "assertion": { "id": "placement-legalized", "field": "status", "pass_when": { "eq": "legalized" } }
+    },
+    {
+      "name": "filler-placement",
+      "summary": "fill every empty site run with filler masters",
+      "args_template": ["filler-placement", "{odb}", "{patterns}"],
+      "optional": [
+        { "arg": "out_odb", "flag": "--out-odb", "description": "write the filled database here" },
+        { "arg": "prefix", "flag": "--prefix", "description": "filler instance name prefix (default FILLER_)" }
+      ],
+      "assertion": { "id": "placement-filled", "field": "status", "pass_when": { "eq": "filled" } }
     }
   ],
   "inputs": {
@@ -128,6 +138,7 @@ vyges physical dpl — detailed placement: legality checking and legalization ov
 USAGE:
   vyges physical dpl check-placement    <design.odb> [--json] [-o FILE]
   vyges physical dpl detailed-placement <design.odb> [--out-odb FILE] [--dry-run] [OPTIONS]
+  vyges physical dpl filler-placement   <design.odb> PATTERN... [--prefix P] [--out-odb FILE]
   vyges physical dpl --describe | --help | --version
 
 OPTIONS:
@@ -182,6 +193,7 @@ fn main() -> ExitCode {
         }
         Some("check-placement") => check(&args[1..]),
         Some("detailed-placement") => legalize(&args[1..]),
+        Some("filler-placement") => fill(&args[1..]),
         // A diagnostic, not a command anyone should need in a flow.
         Some("grid-facts") => {
             let Some(p) = args.get(1) else { eprintln!("need <design.odb>"); return ExitCode::from(2) };
@@ -198,6 +210,64 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// `filler_placement [-prefix P] [-verbose] masters` — fill every empty site run.
+///
+/// `filler-placement <design.odb> PATTERN… [--prefix P] [--out-odb OUT]`. Each PATTERN is a Tcl
+/// `string match` glob over master names (`FILL*`), as `get_masters_arg` reads its list.
+fn fill(args: &[String]) -> ExitCode {
+    let (mut odb, mut out_odb, mut prefix, mut patterns) = (None, None, "FILLER_".to_string(), Vec::new());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out-odb" => { i += 1; out_odb = args.get(i).cloned(); }
+            "--prefix" => { i += 1; prefix = args.get(i).cloned().unwrap_or_default(); }
+            // `-verbose` prints the per-master usage table; the fill is the same either way.
+            "--verbose" => {}
+            a if odb.is_none() => odb = Some(a.to_string()),
+            a => patterns.push(a.to_string()),
+        }
+        i += 1;
+    }
+    let Some(path) = odb else {
+        eprintln!("vyges-dpl: filler-placement needs <design.odb> PATTERN…\n\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    // `sta::check_argc_eq1`: exactly one master list — here one or more patterns.
+    if patterns.is_empty() {
+        eprintln!("vyges-dpl: filler-placement needs at least one master PATTERN");
+        return ExitCode::from(2);
+    }
+    let mut db = match Db::open(&path) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
+    };
+    let res = match vyges_dpl::fillers::filler_placement(&mut db, &patterns, &prefix) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("{}", serde_json::json!({ "tool": "vyges-dpl", "command": "filler-placement",
+                                               "status": "error", "error": e.to_string() }));
+            eprintln!("vyges-dpl: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    for p in &res.unmatched_patterns {
+        eprintln!("[WARNING DPL-0028] {p} did not match any masters.");
+    }
+    eprintln!("[INFO DPL-0001] Placed {} filler instances.", res.fillers.len());
+    if let Some(o) = out_odb.as_deref() {
+        if let Err(e) = db.write(o) {
+            eprintln!("vyges-dpl: cannot write {o}: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "tool": "vyges-dpl", "command": "filler-placement", "status": "filled",
+        "fillers": res.fillers.len(), "unmatched_patterns": res.unmatched_patterns,
+        "placed": res.fillers,
+    })).expect("valid JSON"));
+    ExitCode::SUCCESS
 }
 
 fn legalize(args: &[String]) -> ExitCode {

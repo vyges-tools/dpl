@@ -71,9 +71,12 @@ order to be useful — and upstream's own suite leans on it harder: **77 of 92 `
 ## Status
 
 At pin `da9f29f18b6487825aa880597176e0fa97110b31` (2026-09-22), with padding modelled:
-**35 of 35 comparable cases match** the reference component for component — every one the harness
-can compare — with the sweep trace (upstream's `negotiationIter` debug line) identical for the
-whole run on `cell_on_block2` (16,176 lines) and `obstruction2` (248), among others.
+**43 of 44 comparable cases match** the reference component for component, with filler
+placement (`filler-placement`) scored on eight of them — `obstruction1` alone is 19,768 components —
+and the sweep trace (upstream's `negotiationIter` debug line) identical for the whole run on
+`cell_on_block2` (16,176 lines) and `obstruction2` (248), among others. The one that does not is
+`edge_spacing`, where the LEGALIZATION differs: its DRC term does not evaluate LEF58 cell-edge
+spacing yet (named in `--describe`), and the fillers then fill different gaps.
 
 The last three defects, each found by printing every candidate of the first diverging
 `findBestLocation` call on both sides (`VYGES_DPL_CELL` / `VYGES_DPL_ITER`, and the reference
