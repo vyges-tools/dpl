@@ -30,6 +30,7 @@ pub mod grid;
 pub mod improve;
 pub mod improve_opt;
 pub mod improve_run;
+pub mod lemon;
 pub mod mirror;
 pub mod negotiate;
 pub mod network;

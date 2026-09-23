@@ -10,6 +10,7 @@
 //! stops with it named, unless [`Options::rng_skip`] stands in for them (see there).
 
 use crate::improve::{Kind, Setup};
+use crate::lemon::{ListDigraph, NetworkSimplex};
 
 /// What the driver is asked to do.
 #[derive(Debug, Clone, Default)]
@@ -83,6 +84,8 @@ pub fn improve(s: &mut Setup, opts: &Options) -> Result<Report, String> {
         match args[0] {
             "default" => random_improver(s, args),
             "gs" => global_swap(s, args),
+            "vs" => vertical_swap(s, args),
+            "mis" => mis(s, args),
             "ro" => reorder(s, args),
             other => return Err(format!("improve_placement stage '{other}' is not implemented")),
         }
@@ -476,6 +479,418 @@ fn gs_generate(s: &mut Setup, ndi: usize) -> bool {
     }
     let (x0, y0) = (s.nodes[ndi].left, s.nodes[ndi].bottom);
     s.try_move(ndi, x0, y0, si, xj, yj, sj) || s.try_swap(ndi, x0, y0, si, xj, yj, sj)
+}
+
+// ── vertical swap ────────────────────────────────────────────────────────────────────────────
+
+/// `DetailedVerticalSwap::run`.
+fn vertical_swap(s: &mut Setup, args: &[&str]) {
+    let (passes, tol) = passes_tol(args);
+    let mut curr = s.total_hpwl_xy() as i64;
+    let init = curr;
+    if init == 0 {
+        return;
+    }
+    for p in 1..=passes {
+        let last = curr;
+        vertical_swap_pass(s);
+        curr = s.total_hpwl_xy() as i64;
+        s.log.push(format!("[INFO DPL-0308] Pass {p:3} of vertical swaps; hpwl is {}.", sci(curr as f64)));
+        if last == 0 || (curr - last).abs() as f64 / last as f64 <= tol {
+            break;
+        }
+    }
+    let imp = (init - curr) as f64 / init as f64 * 100.0;
+    s.log.push(format!("[INFO DPL-0309] End of vertical swaps; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
+}
+
+/// `verticalSwap` — as `globalSwap`, each cell once in shuffled order.
+fn vertical_swap_pass(s: &mut Setup) {
+    s.resort_segments();
+    let mut candidates = s.single.clone();
+    s.rt.rng.shuffle(&mut candidates);
+    let mut obj = Hpwl { edge: vec![0; s.rt.edges.len()], pending: Vec::new() };
+    let mut curr = obj.curr(s);
+    for ndi in candidates {
+        if !vs_generate(s, ndi) {
+            continue;
+        }
+        let next = curr - obj.delta(s);
+        if next <= curr {
+            obj.accept(s);
+            s.accept_move();
+            curr = next;
+        } else {
+            s.reject_move();
+        }
+    }
+}
+
+/// `DetailedVerticalSwap::generate(ndi)` — toward the median box, but only one or two rows up or
+/// down (a RANDOM one of the two), at the box's centre x.
+fn vs_generate(s: &mut Setup, ndi: usize) -> bool {
+    let n = &s.nodes[ndi];
+    let yi = n.bottom as f64 + 0.5 * n.height as f64;
+    let xi = n.left as f64 + 0.5 * n.width as f64;
+    let Some((bx0, by0, bx1, by1)) = gs_range(s, ndi) else { return false };
+    if xi >= bx0 as f64 && xi <= bx1 as f64 && yi >= by0 as f64 && yi <= by1 as f64 {
+        return false;
+    }
+    if s.cell_segs[ndi].len() != 1 {
+        return false;
+    }
+    let si = s.cell_segs[ndi][0];
+    let ri = s.segments[si].row as i32;
+    let xj = (0.5 * (bx0 + bx1) as f64 - 0.5 * n.width as f64).floor() as i32;
+    let yj = (0.5 * (by0 + by1) as f64 - 0.5 * n.height as f64).floor() as i32;
+    let nrows = s.arch.rows.len() as i32;
+    let rj = if yj as f64 > yi {
+        let (rmin, rmax) = ((nrows - 1).min(ri + 1), (nrows - 1).min(ri + 2));
+        rmin + s.rt.rng.get_random((rmax - rmin + 1) as usize) as i32
+    } else {
+        let (rmax, rmin) = (0.max(ri - 1), 0.max(ri - 2));
+        rmin + s.rt.rng.get_random((rmax - rmin + 1) as usize) as i32
+    };
+    let rj = rj as usize;
+    let yj = s.arch.rows[rj].bottom;
+    let Some(sj) = s.segs_in_row[rj].iter().copied()
+        .find(|&sg| xj >= s.segments[sg].min_x && xj <= s.segments[sg].max_x) else { return false };
+    if s.nodes[ndi].group != s.segments[sj].reg {
+        return false;
+    }
+    let (x0, y0) = (s.nodes[ndi].left, s.nodes[ndi].bottom);
+    s.try_move(ndi, x0, y0, si, xj, yj, sj) || s.try_swap(ndi, x0, y0, si, xj, yj, sj)
+}
+
+// ── independent set matching ─────────────────────────────────────────────────────────────────
+
+const MIS_MAX_PROBLEM: usize = 25;
+const MIS_MAX_TIMES_USED: u32 = 2;
+const MIS_SKIP_EDGES_LARGER_THAN: usize = 100;
+
+/// `DetailedMis` state kept across passes.
+struct Mis {
+    candidates: Vec<usize>,
+    colors: Vec<i32>,
+    step: (f64, f64),
+    dim: (i32, i32),
+    /// Buckets `[i][j]`, each the cells whose centre falls in it, in insertion order.
+    grid: Vec<Vec<Vec<usize>>>,
+    bin_of: std::collections::HashMap<usize, (usize, usize)>,
+}
+
+/// `DetailedMis::run` (wirelength objective).
+fn mis(s: &mut Setup, args: &[&str]) {
+    let (passes, tol) = passes_tol(args);
+    s.log.push("[INFO DPL-0300] Set matching objective is wirelength.".into());
+    s.resort_segments();
+    let mut curr = s.total_hpwl_xy() as i64;
+    let init = curr;
+    if init == 0 {
+        return;
+    }
+    let mut m = Mis { candidates: s.single.clone(), colors: Vec::new(), step: (0.0, 0.0), dim: (0, 0),
+                      grid: Vec::new(), bin_of: Default::default() };
+    for mh in s.multi.iter().skip(2) {
+        m.candidates.extend(mh.iter().copied());
+    }
+    if m.candidates.is_empty() {
+        s.log.push("[INFO DPL-0202] No movable cells found".into());
+        return;
+    }
+    mis_color(s, &mut m);
+    mis_build_grid(s, &mut m);
+    for p in 1..=passes {
+        s.log.push(format!("[INFO DPL-0301] Pass {p:3} of matching; objective is {}.", sci(curr as f64)));
+        mis_place(s, &mut m);
+        let last = curr;
+        curr = s.total_hpwl_xy() as i64;
+        if last == 0 || (curr - last).abs() as f64 / last as f64 <= tol {
+            break;
+        }
+    }
+    s.resort_segments();
+    let imp = (init - curr) as f64 / init as f64 * 100.0;
+    s.log.push(format!("[INFO DPL-0302] End of matching; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
+}
+
+/// `colorCells` — `ColorGraph` over every network node, an edge between two movable cells that
+/// share a net of 2..=100 pins; greedy colouring in node order (node 0 takes colour 0 whatever
+/// it is), smallest colour not used by a coloured neighbour.
+fn mis_color(s: &Setup, m: &mut Mis) {
+    let nn = s.nodes.len();
+    let mut movable = vec![false; nn];
+    for &c in &m.candidates {
+        movable[c] = true;
+    }
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); nn];
+    for e in 0..s.rt.edges.len() {
+        let pins = &s.rt.edges[e];
+        if pins.len() <= 1 || pins.len() > MIS_SKIP_EDGES_LARGER_THAN {
+            continue;
+        }
+        for (a, &pi) in pins.iter().enumerate() {
+            let ni = s.rt.pins[pi].node;
+            if !movable[ni] {
+                continue;
+            }
+            for &pj in &pins[a + 1..] {
+                let nj = s.rt.pins[pj].node;
+                if !movable[nj] || nj == ni {
+                    continue;
+                }
+                adj[ni].push(nj);
+                adj[nj].push(ni);
+            }
+        }
+    }
+    for a in &mut adj {
+        a.sort_unstable();
+        a.dedup();
+    }
+    let mut color = vec![-1i32; nn];
+    if nn > 0 {
+        color[0] = 0;
+    }
+    let mut avail = vec![usize::MAX; nn];
+    for v in 1..nn {
+        for &u in &adj[v] {
+            if color[u] != -1 {
+                avail[color[u] as usize] = v;
+            }
+        }
+        for cr in 0..nn {
+            if avail[cr] != v {
+                color[v] = cr as i32;
+                break;
+            }
+        }
+    }
+    m.colors = (0..nn).map(|i| if movable[i] { color[i] } else { -1 }).collect();
+}
+
+/// `buildGrid` — bins of `sqrt(25)` average cells a side.
+fn mis_build_grid(s: &Setup, m: &mut Mis) {
+    let a = &s.arch;
+    let (xmin, xmax, ymin, ymax) = (a.min_x as f64, a.max_x as f64, a.min_y as f64, a.max_y as f64);
+    let (mut avg_h, mut avg_w) = (0.0, 0.0);
+    for &c in &m.candidates {
+        avg_h += s.nodes[c].height as f64;
+        avg_w += s.nodes[c].width as f64;
+    }
+    avg_h /= m.candidates.len() as f64;
+    avg_w /= m.candidates.len() as f64;
+    let root = (MIS_MAX_PROBLEM as f64).sqrt();
+    m.step = (avg_w * root, avg_h * root);
+    m.dim = (((xmax - xmin) / m.step.0).ceil() as i32, ((ymax - ymin) / m.step.1).ceil() as i32);
+    m.grid = vec![vec![Vec::new(); m.dim.1.max(0) as usize]; m.dim.0.max(0) as usize];
+}
+
+/// `place` — repopulate the bins, then each shuffled candidate as a seed (at most twice used).
+fn mis_place(s: &mut Setup, m: &mut Mis) {
+    for col in &mut m.grid {
+        for b in col.iter_mut() {
+            b.clear();
+        }
+    }
+    let (xmin, ymin) = (s.arch.min_x as f64, s.arch.min_y as f64);
+    m.bin_of.clear();
+    for &c in &m.candidates {
+        let n = &s.nodes[c];
+        let y = n.bottom as f64 + 0.5 * n.height as f64;
+        let x = n.left as f64 + 0.5 * n.width as f64;
+        let j = (((y - ymin) / m.step.1) as i32).min(m.dim.1 - 1).max(0) as usize;
+        let i = (((x - xmin) / m.step.0) as i32).min(m.dim.0 - 1).max(0) as usize;
+        m.grid[i][j].push(c);
+        m.bin_of.insert(c, (i, j));
+    }
+    let mut used = vec![0u32; s.nodes.len()];
+    s.rt.rng.shuffle(&mut m.candidates);
+    for k in 0..m.candidates.len() {
+        let ndi = m.candidates[k];
+        if used[ndi] >= MIS_MAX_TIMES_USED {
+            continue;
+        }
+        let Some(nbrs) = mis_gather(s, m, ndi) else { continue };
+        mis_solve(s, &nbrs);
+        for &n in &nbrs {
+            used[n] += 1;
+        }
+    }
+}
+
+/// `gatherNeighbours` — breadth-first over bins from the seed's, collecting same-colour,
+/// same-size, same-region, power- and row-compatible cells; stop once 25 are held (checked after
+/// a whole bin, so it can pass 25).
+fn mis_gather(s: &Setup, m: &Mis, ndi: usize) -> Option<Vec<usize>> {
+    let &(bi, bj) = m.bin_of.get(&ndi)?;
+    let srh = s.arch.rows[0].height as f64;
+    let spanned = |n: usize| (s.nodes[n].height as f64 / srh).round() as i64;
+    let rails = |n: usize| s.rt.power.master_rails(&s.nodes[n].master);
+    let mut out = vec![ndi];
+    let mut visited = vec![vec![false; m.dim.1 as usize]; m.dim.0 as usize];
+    let mut q = std::collections::VecDeque::new();
+    q.push_back((bi, bj));
+    while let Some((i, j)) = q.pop_front() {
+        if visited[i][j] {
+            continue;
+        }
+        visited[i][j] = true;
+        for &ndj in &m.grid[i][j] {
+            if ndj == ndi || m.colors[ndi] != m.colors[ndj] {
+                continue;
+            }
+            let (a, b) = (&s.nodes[ndi], &s.nodes[ndj]);
+            if a.width != b.width || a.height != b.height || a.group != b.group {
+                continue;
+            }
+            if rails(ndi) != rails(ndj) || spanned(ndi) != spanned(ndj) {
+                continue;
+            }
+            out.push(ndj);
+        }
+        if out.len() >= MIS_MAX_PROBLEM {
+            break;
+        }
+        if i > 0 {
+            q.push_back((i - 1, j));
+        }
+        if i + 1 < m.dim.0 as usize {
+            q.push_back((i + 1, j));
+        }
+        if j > 0 {
+            q.push_back((i, j - 1));
+        }
+        if j + 1 < m.dim.1 as usize {
+            q.push_back((i, j + 1));
+        }
+    }
+    Some(out)
+}
+
+/// `getHpwl(ndi, xi, yi)` — the HPWL of `ndi`'s nets (2..=100 pins) with its centre at `(xi, yi)`.
+fn mis_hpwl(s: &Setup, ndi: usize, xi: i32, yi: i32) -> u64 {
+    let mut total = 0u64;
+    for &p in &s.rt.node_pins[ndi] {
+        let e = s.rt.pins[p].edge;
+        let np = s.rt.edges[e].len();
+        if np <= 1 || np > MIS_SKIP_EDGES_LARGER_THAN {
+            continue;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for &q in &s.rt.edges[e] {
+            let pin = &s.rt.pins[q];
+            let (x, y) = if pin.node == ndi {
+                (xi + pin.ox, yi + pin.oy)
+            } else {
+                let n = &s.nodes[pin.node];
+                (n.left + n.width / 2 + pin.ox, n.bottom + n.height / 2 + pin.oy)
+            };
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+        }
+        if x1 >= x0 && y1 >= y0 {
+            total += ((x1 - x0) as i64 + (y1 - y0) as i64) as u64;
+        }
+    }
+    total
+}
+
+/// `solveMatch` — assign the gathered cells to each other's spots at minimum total HPWL. A cell
+/// may always keep its own spot; another spot only within the displacement limit. ⚠️ Upstream
+/// solves this with LEMON's `NetworkSimplex`; this is an exact minimum-cost assignment
+/// (Hungarian), identical wherever the optimum is unique.
+fn mis_solve(s: &mut Setup, nodes: &[usize]) {
+    let n = nodes.len();
+    if n <= 1 {
+        return;
+    }
+    let pos: Vec<(i32, i32)> = nodes.iter().map(|&c| (s.nodes[c].left, s.nodes[c].bottom)).collect();
+    let segs: Vec<Vec<usize>> = nodes.iter().map(|&c| s.cell_segs[c].clone()).collect();
+    // The graph exactly as `solveMatch` builds it — node and arc CREATION order decides which of
+    // several optimal assignments `NetworkSimplex` returns (see `lemon`).
+    let mut g = ListDigraph::new();
+    let mut cell_node = Vec::with_capacity(n);
+    let mut spot_node = Vec::with_capacity(n);
+    for _ in 0..n {
+        cell_node.push(g.add_node());
+        spot_node.push(g.add_node());
+    }
+    let supply = g.add_node();
+    let demand = g.add_node();
+    let mut unit = Vec::new();
+    let mut pair = Vec::new();
+    for i in 0..n {
+        let c = nodes[i];
+        unit.push((g.add_arc(supply, cell_node[i]), 0));
+        unit.push((g.add_arc(spot_node[i], demand), 0));
+        for j in 0..n {
+            if i != j {
+                let (ox, oy) = s.rt.orig[c];
+                if (pos[j].0 - ox).abs() > s.rt.max_disp.0 || (pos[j].1 - oy).abs() > s.rt.max_disp.1 {
+                    continue;
+                }
+            }
+            let w = s.nodes[c].width / 2;
+            let h = s.nodes[c].height / 2;
+            let icost = mis_hpwl(s, c, pos[j].0 + w, pos[j].1 + h) as f64;
+            let cost = if icost > i32::MAX as f64 { i32::MAX } else { icost as i32 };
+            let a = g.add_arc(cell_node[i], spot_node[j]);
+            unit.push((a, cost));
+            pair.push((a, i, j));
+        }
+    }
+    let mut ns = NetworkSimplex::new(&g);
+    for &(a, c) in &unit {
+        ns.set_arc(a, 0, 1, c);
+    }
+    ns.st_supply(supply, demand, n as i32);
+    if !ns.run() {
+        return;
+    }
+    let mut assign: Vec<usize> = (0..n).collect();
+    for &(a, i, j) in &pair {
+        if ns.flow(a) != 0 {
+            assign[i] = j;
+        }
+    }
+    let mut applied: Vec<(usize, (i32, i32), Vec<usize>, (i32, i32), Vec<usize>)> = Vec::new();
+    // Applied in the flow map's `ArcIt` order: nodes newest first, so cells from the LAST down.
+    for i in (0..n).rev() {
+        let j = assign[i];
+        if i == j {
+            continue;
+        }
+        let nd = nodes[i];
+        for &sg in &segs[i] {
+            s.remove_cell_from_segment_pub(nd, sg);
+        }
+        s.erase_cell(nd);
+        s.nodes[nd].left = pos[j].0;
+        s.nodes[nd].bottom = pos[j].1;
+        s.paint_in_grid(nd);
+        for &sg in &segs[j] {
+            s.add_cell_to_segment_util(nd, sg);
+        }
+        applied.push((nd, pos[i], segs[i].clone(), pos[j], segs[j].clone()));
+    }
+    if nodes.iter().any(|&nd| s.has_placement_violation(nd)) {
+        // `journal.undo()` — in reverse.
+        for (nd, orig, osegs, _new, nsegs) in applied.into_iter().rev() {
+            s.erase_cell(nd);
+            for &sg in &nsegs {
+                s.remove_cell_from_segment_pub(nd, sg);
+            }
+            s.nodes[nd].left = orig.0;
+            s.nodes[nd].bottom = orig.1;
+            s.paint_in_grid_round_pub(nd);
+            for &sg in &osegs {
+                s.add_cell_to_segment_util(nd, sg);
+            }
+        }
+    }
 }
 
 // ── reorder ──────────────────────────────────────────────────────────────────────────────────

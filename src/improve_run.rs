@@ -404,6 +404,16 @@ impl Setup {
         self.align_pos(nd, xi, xl, xr)
     }
 
+    /// `removeCellFromSegment` for the optimizers.
+    pub(crate) fn remove_cell_from_segment_pub(&mut self, nd: usize, seg: usize) {
+        self.remove_cell_from_segment(nd, seg);
+    }
+
+    /// The journal's `paintInGrid` (at `gridRoundY`) for the optimizers.
+    pub(crate) fn paint_in_grid_round_pub(&mut self, nd: usize) {
+        self.paint_in_grid_round(nd);
+    }
+
     /// `DetailedMgr::eraseFromGrid`.
     pub(crate) fn erase_cell(&mut self, nd: usize) {
         self.erase_from_grid(nd);
