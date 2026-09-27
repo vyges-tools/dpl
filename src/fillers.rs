@@ -87,8 +87,9 @@ pub fn is_filler(master_type: &str, placement_status: &str) -> bool {
 /// `Opendp::removeFillers` — destroy every [`is_filler`] instance, in block order. Returns the
 /// names removed.
 pub fn remove_fillers(db: &mut Db) -> Result<Vec<String>, FillError> {
-    let doomed: Vec<String> = (0..db.num_insts())
-        .map(|i| db.nth_inst_name(i))
+    let doomed: Vec<String> = db
+        .inst_names()
+        .into_iter()
         .filter(|n| is_filler(&db.master_get_type(&db.inst_master(n)).unwrap_or_default(),
                               &db.inst_get_placement_status(n)))
         .collect();

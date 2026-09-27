@@ -394,8 +394,7 @@ impl Diamond {
         };
         let center = ((core.0 + core.2) / 2, (core.1 + core.3) / 2);
         let mut cells: Vec<Movable> = Vec::new();
-        for i in 0..db.num_insts() {
-            let name = db.nth_inst_name(i);
+        for name in db.inst_names() {
             let master = db.inst_master(&name);
             let (x, y) = db.inst_location(&name);
             let (w, h) = (db.master_get_width(&master) as i32, db.master_get_height(&master) as i32);

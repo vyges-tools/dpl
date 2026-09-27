@@ -3398,8 +3398,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
     // site gives one), and each FIXED cell's master and DEF placement, core-relative.
     let mut init_orients: Vec<String> = Vec::new();
     let mut fixed_edge_at: Vec<(String, i32, i32, String)> = Vec::new();
-    for i in 0..db.num_insts() {
-        let name = db.nth_inst_name(i);
+    for name in db.inst_names() {
         let master = db.inst_master(&name);
         let (x, y) = db.inst_location(&name);
         let (w, h) = (db.master_get_width(&master) as i32, db.master_get_height(&master) as i32);
@@ -4319,8 +4318,8 @@ impl PowerModel {
 
         // `inferR0RowPower` — the first single-height CORE master, in INSTANCE order.
         let mut candidates = Vec::new();
-        for i in 0..db.num_insts() {
-            let m = db.inst_master(&db.nth_inst_name(i));
+        for name in db.inst_names() {
+            let m = db.inst_master(&name);
             let ty = db.master_get_type(&m).unwrap_or_default();
             if !ty.eq_ignore_ascii_case("CORE") {
                 continue;
@@ -4346,8 +4345,8 @@ impl PowerModel {
         };
         let known = r0_bot != Power::Unknown;
         // Make sure every master a caller may ask about is cached, not just the candidates.
-        for i in 0..db.num_insts() {
-            let m = db.inst_master(&db.nth_inst_name(i));
+        for name in db.inst_names() {
+            let m = db.inst_master(&name);
             rails_of(db, &m);
         }
         PowerModel { master, rows, known }

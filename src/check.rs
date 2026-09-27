@@ -549,8 +549,8 @@ mod tests {
 /// look identical from the failure list.
 fn status_counts(db: &Db) -> std::collections::BTreeMap<String, usize> {
     let mut c: std::collections::BTreeMap<String, usize> = Default::default();
-    for i in 0..db.num_insts() {
-        *c.entry(db.inst_get_placement_status(&db.nth_inst_name(i))).or_default() += 1;
+    for name in db.inst_names() {
+        *c.entry(db.inst_get_placement_status(&name)).or_default() += 1;
     }
     c
 }
