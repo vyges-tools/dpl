@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `dpl` — detailed placement: legality checking, and (later) legalization.
+//! `dpl` — detailed placement: legality checking, legalization, filler placement and placement
+//! improvement.
 //!
 //! Reference is OpenROAD `src/dpl` at pin `945a9f48dc6e5cc91d865daa92c45a1094cb682c`.
 //!
-//! ⛔ **Scope, stated because the name promises more than this delivers today.** `check-placement`
-//! is here; `detailed_placement` is not. That order is deliberate: the checker is the ORACLE, it
-//! needs no placement to be correct, and upstream's own suite leans on it more heavily — **77 of
-//! 92 `.tcl` tests call `check_placement`, 68 call `detailed_placement`**.
+//! **The checker came first, on purpose.** `check-placement` is the ORACLE: it needs no placement
+//! to be correct, and upstream's own suite leans on it more heavily — **77 of 92 `.tcl` tests call
+//! `check_placement`, 68 call `detailed_placement`**. Legalization (`detailed-placement`), filler
+//! placement and `improve-placement` were built on it afterwards.
 //!
 //! 🔑 **The Grid is the engine.** `checkInRows` and `checkOverlap` both resolve through
 //! `Grid`/`Pixel`, and `checkOverlap` MUTATES it (`pixel->cell = &cell` on empty pixels), which is
