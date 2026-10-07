@@ -341,6 +341,37 @@ impl Grid {
         (gx.clamp(0, self.row_site_count as i64 - 1), self.grid_round_y(cy) as i64)
     }
 
+    /// `Opendp::legalCellPos(db_inst)` — what the resizer runs on each instance it makes or resizes
+    /// under global-route parasitics, "for accurate parasitic estimation". `(x, y)` the instance's
+    /// location (absolute dbu), `(w, h)` its bounding box (`getBbox`: the master's, swapped for a
+    /// quarter-turn orientation). The new location when it moved, `None` when it was already legal.
+    ///
+    /// Upstream, in order: `initialLocation` (core-relative); `pointOffMacro` — ⛔ not here: it reads
+    /// the grid's BLOCK pixels, and the caller refuses a design with a block; `legalPt(cell, pt)` —
+    /// x clamped into the core then ROUNDED to a site (`divRound`), y clamped then `gridRoundY`; when
+    /// that is the initial location, nothing; else snapped again (`gridX`, `gridSnapDownY`),
+    /// `setGridLoc`, and written back as the core's corner plus the cell's left and bottom.
+    ///
+    /// ⚠️ Unlike [`Grid::legal_start`], `legalPt` does not clamp the column to the last site.
+    pub fn legal_cell_pos(&self, x: i32, y: i32, w: i32, h: i32) -> Option<(i32, i32)> {
+        let init = (x - self.core.0, y - self.core.1);
+        // legalPt(cell, pt): move inside the core, align with a row site.
+        let max_x = (self.row_site_count as i32 * self.site_width - w).max(0);
+        let core_x = init.0.clamp(0, max_x);
+        let grid_x = (f64::from(core_x) / f64::from(self.site_width)).round() as i32;
+        let legal_x = grid_x * self.site_width;
+        let core_dy = self.core.3 - self.core.1;
+        let core_y = init.1.clamp(0, (core_dy - h).max(0));
+        let legal_y = *self.row_y.get(self.grid_round_y(core_y))?;
+        if (legal_x, legal_y) == init {
+            return None;
+        }
+        // To grid, then back: `gridX` (C++ division) and `gridSnapDownY`.
+        let gx = legal_x / self.site_width;
+        let gy = self.grid_snap_down_y(legal_y)?;
+        Some((self.core.0 + gx * self.site_width, self.core.1 + *self.row_y.get(gy)?))
+    }
+
     /// `Grid::gridRoundY` — snap DOWN to a row boundary, then take the NEXT one when it is at least
     /// as close: `|row_y[gy] - y| >= |row_y[gy + 1] - y|`.
     ///
@@ -982,5 +1013,26 @@ mod uniform_row_height_tests {
         let mut g = with_site_heights(vec![2800, 1800]);
         g.row_y = vec![0, 100, 200, 300];
         assert_eq!(g.uniform_row_height(), None);
+    }
+}
+
+#[cfg(test)]
+mod legal_cell_pos_tests {
+    /// Rule (`Opendp::legalCellPos`, what rsz runs on a hold buffer under global-route parasitics):
+    /// x ROUNDED to a site, y to the nearer row, written back only when it moved. Witness:
+    /// `repair_hold10` (sky130hd rows from (9660, 8160), 460 x 2720): the reference legalized
+    /// `hold1` from (41193, 38868) to (41400, 38080) and `hold2` from (90731, 41510) to
+    /// (90620, 40800).
+    #[test]
+    fn legal_cell_pos_rounds_to_the_nearest_site_and_row() {
+        let row_y: Vec<i32> = (0..=177).map(|k| k * 2720).collect();
+        let g = super::Grid::uniform_for_test((9660, 8160, 9660 + 1044 * 460, 8160 + 177 * 2720), 460, row_y);
+        let (w, h) = (3680, 2720);
+        assert_eq!(g.legal_cell_pos(41193, 38868, w, h), Some((41400, 38080)));
+        assert_eq!(g.legal_cell_pos(90731, 41510, w, h), Some((90620, 40800)));
+        // Already on a site and a row: untouched.
+        assert_eq!(g.legal_cell_pos(41400, 38080, w, h), None);
+        // Left of the core: clamped to its first site.
+        assert_eq!(g.legal_cell_pos(100, 38080, w, h), Some((9660, 38080)));
     }
 }
