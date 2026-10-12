@@ -70,6 +70,11 @@ order to be useful — and upstream's own suite leans on it harder: **77 of 92 `
 
 ## Status
 
+At pin `27288f5c90265ae5296b2f5a9fa6e8714fa191ad` (2026-10-12), `detailed_placement` matches the reference on
+76 of 78 comparable cases and `check-placement` agrees on 77 of 78; the cases that differ are new upstream cases
+for pins under power-via-stack metal (`blocked_via_layers`, `blocked_via_pins`), which the blocked-layers rule
+does not yet evaluate.
+
 At pin `da9f29f18b6487825aa880597176e0fa97110b31` (2026-09-22), with padding modelled:
 **46 of 46 comparable cases match** the reference component for component, with filler
 placement (`filler-placement`) scored on eight of them — `obstruction1` alone is 19,768 components —
