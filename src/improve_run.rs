@@ -150,6 +150,8 @@ pub struct Runtime {
     /// Master `(X, Y, R90)` symmetry.
     pub sym: Vec<(bool, bool, bool)>,
     pub used_layers: Vec<u32>,
+    /// Each node's master pin shapes for the via-metal stage of `checkBlockedLayers`.
+    pub pin_models: Vec<std::rc::Rc<crate::viametal::PinModel>>,
     pub classes: Vec<crate::drc::Class>,
     pub edge_model: crate::edges::EdgeModel,
     pub power: crate::negotiate::PowerModel,
@@ -186,6 +188,10 @@ impl Runtime {
                 crate::drc::used_layers(db.master_pin_boxes(&n.master).unwrap_or_default().into_iter()
                     .filter_map(|(ln, ..)| levels.get(&db.layer_name_by_number(ln)).copied()))
             }).collect(),
+            pin_models: {
+                let mut models = crate::viametal::PinModels::new(levels);
+                nodes.iter().map(|n| models.of(db, &n.master)).collect()
+            },
             classes: nodes.iter().map(|n| crate::drc::classify(&mtype(n))).collect(),
             edge_model, power, seg_util: Vec::new(),
             orig: nodes.iter().map(|n| (n.left, n.bottom)).collect(),
@@ -322,8 +328,8 @@ impl Setup {
         let x_end = x + self.grid_width(nd) as i32;
         let y_end = g.grid_end_y(y, n.height) as i32;
         let y = y as i32;
-        let blocked = crate::drc::check_blocked_layers(x, x_end, y, y_end, self.rt.used_layers[nd],
-            &|px, py| g.pixel(px as i64, py as i64).map(|p| p.blocked_layers));
+        // `checkDRC(node)`: the node's own orientation.
+        let blocked = self.rt.pin_models[nd].check(g, self.rt.used_layers[nd], x, x_end, y, y_end, &n.orient);
         if !blocked {
             return true;
         }

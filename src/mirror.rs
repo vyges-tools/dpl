@@ -25,6 +25,9 @@ pub struct MirrorReport {
     pub mirrored: Vec<String>,
     /// `edge_spacing_reject_count_` — candidates whose flip would break a LEF58 edge rule.
     pub edge_spacing_rejected: Vec<String>,
+    /// `blocked_layers_reject_count_` — candidates whose flip would short a pin to power via metal
+    /// (`fb9d98e5fe`: the via-metal test depends on orientation, so mirroring must re-ask it).
+    pub blocked_layers_rejected: Vec<String>,
     pub candidates: usize,
 }
 
@@ -141,6 +144,16 @@ pub fn optimize_mirroring(db: &mut Db) -> Result<MirrorReport, String> {
         grid.paint_cell(b.0, b.1, b.2, b.3, Some(i as u32));
     }
     let edges = crate::edges::EdgeModel::build(db, &grid, masters.iter().map(String::as_str));
+    // `isBlockedLayersLegal`'s inputs: each master's `used_layers` and via-metal pin model.
+    let levels = {
+        let types: Vec<(String, String)> = db.layers_with_direction().unwrap_or_default().iter()
+            .map(|(n, _)| (n.clone(), db.layer_get_type(n).unwrap_or_default())).collect();
+        crate::drc::routing_levels(&types)
+    };
+    let used: Vec<u32> = masters.iter().map(|m| crate::drc::used_layers(db.master_pin_boxes(m).unwrap_or_default().into_iter()
+        .filter_map(|(ln, ..)| levels.get(&db.layer_name_by_number(ln)).copied()))).collect();
+    let mut models = crate::viametal::PinModels::new(&levels);
+    let pin_model: Vec<std::rc::Rc<crate::viametal::PinModel>> = masters.iter().map(|m| models.of(db, m)).collect();
 
     // `findNetBoxes`, then the sort: HPWL descending, net id ascending — the block's net order
     // IS id order, so a stable sort on HPWL alone gives the tie-break.
@@ -168,6 +181,13 @@ pub fn optimize_mirroring(db: &mut Db) -> Result<MirrorReport, String> {
         );
         if !legal {
             report.edge_spacing_rejected.push(inst.clone());
+            continue;
+        }
+        // `isBlockedLayersLegal(cell, orient_my)` — `checkBlockedLayers` at `gridX(cell)`,
+        // `gridRoundY(cell)` in the mirrored orientation: both stages, the stripe mask included.
+        let (gx0, gy0, gx1, gy1) = grid.covering(b.0, b.1, b.2, b.3);
+        if !pin_model[i].check(&grid, used[i], gx0 as i32, gx1 as i32, gy0 as i32, gy1 as i32, orient_my) {
+            report.blocked_layers_rejected.push(inst.clone());
             continue;
         }
         let before = inst_hpwl(db, inst, &boxes);

@@ -37,6 +37,7 @@ pub mod negotiate;
 pub mod network;
 pub mod place;
 pub mod regions;
+pub mod viametal;
 
 /// This crate's version, as Cargo knows it — the single number the whole suite is released on.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

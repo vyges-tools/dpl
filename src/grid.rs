@@ -56,6 +56,10 @@ pub struct Pixel {
     pub padding_reserved_by: Option<u32>,
     /// Bitmask of routing levels blocked here, `1 << level`.
     pub blocked_layers: u32,
+    /// `pixel->blocked_pin_layers` — routing levels (`1 << level`) holding power VIA or patch
+    /// metal outside the stripes somewhere in this square. Only a coarse filter: a cell with a pin
+    /// on such a level is then tested shape by shape against [`Grid::pin_blockages`].
+    pub blocked_pin_layers: u32,
     /// `pixel->group` — the placement group whose region owns this square, set by
     /// [`crate::regions::group_init_pixels`]. An index into [`crate::regions::placement_groups`].
     pub group: Option<usize>,
@@ -93,6 +97,10 @@ pub struct Grid {
     pub row_orient: Vec<String>,
     /// Whether `mark_blocked_layers` found any special wire to record.
     blocked_layers_populated: bool,
+    /// `Grid::pin_blockages_` — per routing level (index = level, 0 unused), the power via / patch
+    /// metal outside the stripes, grown by the layer's min spacing less one, core-relative. A pin
+    /// shape TOUCHING one (closed test, as `bgi::intersects`) is a short the router cannot fix.
+    pub pin_blockages: Vec<Vec<crate::drc::EdgeBox>>,
     /// The SITE height of every row in the block, in the order the rows were read.
     ///
     /// ⛔ Kept because `uniform_row_height_` is derived from SITE heights, not from the spacing
@@ -176,7 +184,7 @@ impl Grid {
         }
 
         let mut g = Grid { core, site_width, row_count, row_site_count, pixels, row_sites, row_y,
-                           row_orient, blocked_layers_populated: false,
+                           row_orient, blocked_layers_populated: false, pin_blockages: vec![Vec::new(); crate::drc::MAX_PIN_LEVEL as usize + 1],
                            site_heights: rows.iter().map(|r| r.5 as i32).collect() };
         g.mark_blocked(db);
         g.mark_blocked_layers(db);
@@ -253,6 +261,57 @@ impl Grid {
             }
             self.blocked_layers_populated = true;
         }
+        self.mark_pin_blockages(db, &levels);
+    }
+
+    /// `Grid::markBlocked`, the via-metal half (`761784900`, made geometric by `fb9d98e5fe`).
+    ///
+    /// Per routing level up to [`crate::drc::MAX_PIN_LEVEL`]: STRIPE metal is every special-net wire
+    /// that is not a via and not `DRCFILL`; VIA metal is every special-net via's boxes on that
+    /// level plus every `DRCFILL` patch. `via_metal -= wire_metal`, cut into rectangles, each grown
+    /// by `max(spacing − 1, 0)` of the level's layer: it marks `blocked_pin_layers` on the squares
+    /// it covers and is kept, core-relative, for the exact test.
+    ///
+    /// 🔑 The rectangles the difference is cut into need not match the reference's
+    /// (`get_rectangles`): both uses — the squares covered and "does a pin shape touch one" — are
+    /// questions about the UNION, and growing by a square distributes over a union.
+    fn mark_pin_blockages(&mut self, db: &Db, levels: &std::collections::HashMap<String, i32>) {
+        let max = crate::drc::MAX_PIN_LEVEL as usize;
+        let mut wire: Vec<Vec<crate::drc::EdgeBox>> = vec![Vec::new(); max + 1];
+        let mut via: Vec<Vec<crate::drc::EdgeBox>> = vec![Vec::new(); max + 1];
+        let level_of = |layer_no: i64| -> Option<usize> {
+            let l = *levels.get(&db.layer_name_by_number(layer_no))?;
+            (1..=max as i32).contains(&l).then_some(l as usize)
+        };
+        for (layer_no, x0, y0, x1, y1, shape) in db.special_wire_boxes().unwrap_or_default() {
+            let Some(l) = level_of(layer_no) else { continue };
+            if shape == "DRCFILL" { via[l].push((x0, y0, x1, y1)) } else { wire[l].push((x0, y0, x1, y1)) }
+        }
+        for (layer_no, x0, y0, x1, y1) in db.special_via_boxes().unwrap_or_default() {
+            if let Some(l) = level_of(layer_no) {
+                via[l].push((x0, y0, x1, y1));
+            }
+        }
+        let names: std::collections::HashMap<i32, &String> = levels.iter().map(|(n, &l)| (l, n)).collect();
+        for l in 1..=max {
+            let bloat = names.get(&(l as i32)).map_or(0, |n| (db.layer_get_spacing(n) - 1).max(0));
+            for r in crate::drc::rects_minus(&via[l], &wire[l]) {
+                let b = (r.0 - bloat - self.core.0, r.1 - bloat - self.core.1, r.2 + bloat - self.core.0, r.3 + bloat - self.core.1);
+                let gx0 = (b.0 / self.site_width).max(0) as usize;
+                let gx1 = (((b.2 + self.site_width - 1) / self.site_width).max(0) as usize).min(self.row_site_count);
+                for gy in self.grid_rows_covering(b.1, b.3) {
+                    for gx in gx0..gx1 {
+                        self.pixels[gy][gx].blocked_pin_layers |= 1 << l;
+                    }
+                }
+                self.pin_blockages[l].push(b);
+            }
+        }
+    }
+
+    /// `Grid::overlapsPinBlockage` — does `rect` (core-relative) touch any blockage on `level`?
+    pub fn overlaps_pin_blockage(&self, level: usize, rect: crate::drc::EdgeBox) -> bool {
+        self.pin_blockages.get(level).is_some_and(|v| v.iter().any(|&b| crate::drc::rects_touch(b, rect)))
     }
 
     /// Whether `blocked_layers` was actually populated, and from how many squares.
@@ -290,7 +349,7 @@ impl Grid {
             pixels: vec![vec![Pixel { is_valid: true, ..Default::default() }; sites]; rows],
             row_sites: vec![vec![(0, sites, "S".to_string(), "R0".to_string())]; rows],
             row_orient: vec!["R0".to_string(); rows],
-            blocked_layers_populated: false,
+            blocked_layers_populated: false, pin_blockages: vec![Vec::new(); crate::drc::MAX_PIN_LEVEL as usize + 1],
             site_heights: vec![row_y[1] - row_y[0]],
             row_y,
         }
@@ -773,7 +832,7 @@ mod padding_paint_tests {
             row_sites: vec![vec![(0, w, "S".to_string(), "R0".to_string())]],
             row_y: vec![0, 10],
             row_orient: vec!["R0".to_string()],
-            blocked_layers_populated: false,
+            blocked_layers_populated: false, pin_blockages: vec![Vec::new(); crate::drc::MAX_PIN_LEVEL as usize + 1],
             site_heights: vec![10],
         }
     }
@@ -838,7 +897,7 @@ mod grid_height_tests {
             row_sites: vec![vec![(0, 10, "S".to_string(), "R0".to_string())]; rows],
             row_y: (0..=rows).map(|i| i as i32 * pitch).collect(),
             row_orient: vec!["R0".to_string(); rows],
-            blocked_layers_populated: false,
+            blocked_layers_populated: false, pin_blockages: vec![Vec::new(); crate::drc::MAX_PIN_LEVEL as usize + 1],
             site_heights: vec![pitch; rows],
         }
     }
@@ -940,7 +999,7 @@ mod site_orientation_tests {
             // ⚠️ The row-level value is the LAST one parsed — which is what the old lookup
             // returned for every master in the row.
             row_orient: vec!["N".to_string()],
-            blocked_layers_populated: false,
+            blocked_layers_populated: false, pin_blockages: vec![Vec::new(); crate::drc::MAX_PIN_LEVEL as usize + 1],
             site_heights: vec![10],
         }
     }
@@ -978,7 +1037,7 @@ mod uniform_row_height_tests {
             core: (0, 0, 100, 100), site_width: 10, row_count: 1, row_site_count: 10,
             pixels: vec![vec![super::Pixel::default(); 10]],
             row_sites: vec![vec![]], row_y: vec![0, 10],
-            row_orient: vec!["R0".to_string()], blocked_layers_populated: false,
+            row_orient: vec!["R0".to_string()], blocked_layers_populated: false, pin_blockages: vec![Vec::new(); crate::drc::MAX_PIN_LEVEL as usize + 1],
             site_heights: hs,
         }
     }

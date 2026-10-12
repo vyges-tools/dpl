@@ -3748,10 +3748,15 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
         crate::drc::used_layers(db.master_pin_boxes(m).unwrap_or_default().into_iter()
             .filter_map(|(ln, ..)| levels.get(&db.layer_name_by_number(ln)).copied()))
     }).collect();
+    // ... and the via-metal pin stage (`fb9d98e5fe`): each master's pin shapes placed at the
+    // candidate in `targetOrient` — the same orientation `edge_ok` takes — against the grid's
+    // grown via / patch metal.
+    let mut pin_models = crate::viametal::PinModels::new(&levels);
+    let pin_model: Vec<std::rc::Rc<crate::viametal::PinModel>> = masters.iter().map(|m| pin_models.of(db, m)).collect();
     let blocked_ok = |i: usize, x: i32, y: i32| -> bool {
         let (cw, ch) = dpl_dims[i];
-        crate::drc::check_blocked_layers(x, x + cw, y, y + ch, used_layers[i],
-            &|px, py| grid.pixel(px as i64, py as i64).map(|p| p.blocked_layers))
+        let orient = grid.site_orient_at(x as i64, y as i64, &sites[i]).unwrap_or_else(|| init_orients[i].clone());
+        pin_model[i].check(&grid, used_layers[i], x, x + cw, y, y + ch, &orient)
     };
     let gap_ok = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
         // `checkOneSiteGap` measures the cell with `grid_->gridWidth(cell)`.

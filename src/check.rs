@@ -267,6 +267,8 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
         m
     };
 
+    let mut pin_models = crate::viametal::PinModels::new(&levels);
+
     // `set_placement_padding` lives in the session, not the database: the caller passes it
     // (`--padding-global/-master/-inst`), and each cell's `padLeft`/`padRight` is
     // [`Padding::of`](crate::negotiate::Padding::of) — instance, then master, then global, CORE
@@ -284,10 +286,18 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
             "one_site_gap (the technology HAS a one-site master, so upstream does not apply it)"
                 .into());
     }
+    if let Some(g) = drc_grid.as_ref() {
+        let n: usize = g.pin_blockages.iter().map(Vec::len).sum();
+        if n > 0 {
+            out.limitations.push(format!(
+                "blocked_layers: {n} power via/patch blockage(s) outside the stripes on M1-M3, each \
+                 pin shape tested against them"));
+        }
+    }
     match drc_grid.as_ref().map(|g| g.blocked_layer_status()) {
         Some((true, n)) => out.limitations.push(format!(
             "blocked_layers: {n} grid square(s) carry a blocked level, from vertical M2/M3 \
-             special wires only")),
+             special wires")),
         _ => out.not_checked.push(
             "blocked_layers (no vertical M2/M3 special wire in this design: the mask is empty, \
              so a pass would be vacuous)".into()),
@@ -425,9 +435,10 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
             }
 
             let used = used_layers_of(db, name);
-            if !crate::drc::check_blocked_layers(
-                gx0 as i32, gx1 as i32, gy0 as i32, gy1 as i32, used,
-                &|px, py| g.pixel(px as i64, py as i64).map(|p| p.blocked_layers))
+            // The pin stage places the master's pin shapes with its boundary's lower-left at
+            // `gridToDbu(gridX)`, `gridYToDbu(gridRoundY)` in the cell's own orientation
+            // (`cell_edges::transformEdgeRect`), core-relative like the blockages.
+            if !pin_models.of(db, &master).check(g, used, gx0 as i32, gx1 as i32, gy0 as i32, gy1 as i32, &orients[idx])
             {
                 out.failures.push(Failure { family: "blocked_layers".into(), cell: name.clone(),
                                             with: None });

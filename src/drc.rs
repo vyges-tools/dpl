@@ -170,27 +170,99 @@ pub fn check_padding(
     true
 }
 
-/// `checkBlockedLayers` — does any square under the cell block a layer the cell uses?
+/// `kMaxPinLevel` — the highest routing level tracked for pin layers and blocked layers.
+pub const MAX_PIN_LEVEL: i32 = 3;
+
+/// `checkBlockedLayers` — does the cell, placed here, collide with power metal on a layer it uses?
 ///
-/// `pixel.blocked_layers & cell.used_layers` over the footprint; any overlap fails.
+/// Two stages, in the reference's order:
+///
+/// 1. Over the footprint: any square whose `blocked_layers` meets the cell's `used_layers` fails AT
+///    ONCE. Meanwhile the squares' `blocked_pin_layers` met with the cell's `pin_layers` are OR-ed.
+/// 2. If any pin layer was met, each such level, ascending: [`pin_hit`](level) asks whether one of
+///    the master's pin shapes on that level, placed at this position and orientation, touches the
+///    via metal there. Any hit fails.
 ///
 /// ℹ️ `blocked_layers` is set by `Grid::markBlocked` from **vertical M2/M3 special-net wires only**
-/// (`routing_level` 2 or 3, `getDir() != horizontal`), so this is narrower than it sounds: it is
-/// about power straps crossing a cell, not about routing in general.
+/// (`routing_level` 2 or 3, `getDir() != horizontal`): power straps crossing a cell. The pin
+/// stage (`761784900`, geometric since `fb9d98e5fe`) is about via stacks and patches beside them;
+/// its pixel mask is only a coarse filter, because via metal is much smaller than a square.
+#[allow(clippy::too_many_arguments)]
 pub fn check_blocked_layers(
-    x: i32, x_end: i32, y: i32, y_end: i32, used_layers: u32,
-    blocked_at: &dyn Fn(i32, i32) -> Option<u32>,
+    x: i32, x_end: i32, y: i32, y_end: i32, used_layers: u32, pin_layers: u32,
+    blocked_at: &dyn Fn(i32, i32) -> Option<(u32, u32)>,
+    pin_hit: &dyn Fn(usize) -> bool,
 ) -> bool {
+    let mut met = 0u32;
     for gy in y..y_end {
         for gx in x..x_end {
-            if let Some(blocked) = blocked_at(gx, gy) {
+            if let Some((blocked, blocked_pins)) = blocked_at(gx, gy) {
                 if blocked & used_layers != 0 {
                     return false;
                 }
+                met |= blocked_pins & pin_layers;
             }
         }
     }
-    true
+    if met == 0 {
+        return true;
+    }
+    !(1..=MAX_PIN_LEVEL as usize).any(|l| met & (1 << l) != 0 && pin_hit(l))
+}
+
+/// `Master::getPinShapes` per level, and the node's `pin_layers` they imply.
+///
+/// Rule (`Network::createMaster`, `f4798386d5`): every NON-SUPPLY terminal's geometry on a ROUTING
+/// layer of level `<= kMaxPinLevel`, whether or not the terminal is connected — "pin shapes can
+/// short to power metal whether or not they are connected". So an unconnected cell is tested too,
+/// unlike `used_layers`, which models routing access. `pin_layers` = the levels with a shape.
+pub fn master_pin_shapes(
+    terms: &[(String, String)],
+    boxes_of: &dyn Fn(&str) -> Vec<(i32, EdgeBox)>,
+) -> (Vec<Vec<EdgeBox>>, u32) {
+    let mut shapes = vec![Vec::new(); MAX_PIN_LEVEL as usize + 1];
+    for (term, sig) in terms {
+        if sig == "POWER" || sig == "GROUND" {
+            continue;
+        }
+        for (level, b) in boxes_of(term) {
+            if (1..=MAX_PIN_LEVEL).contains(&level) {
+                shapes[level as usize].push(b);
+            }
+        }
+    }
+    let mask = (1..=MAX_PIN_LEVEL as usize).filter(|&l| !shapes[l].is_empty()).fold(0, |m, l| m | (1 << l));
+    (shapes, mask)
+}
+
+/// Closed rectangle intersection — touching counts, as `boost::geometry::index::intersects` on
+/// boxes. A pin AT the grown blockage's edge is one DBU short of min spacing: a violation.
+pub fn rects_touch(a: EdgeBox, b: EdgeBox) -> bool {
+    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
+}
+
+/// The area of `a` not covered by `b`, as rectangles of positive area (they may overlap each other
+/// when `a`'s do). Stands in for `polygon_90_set -=` + `get_rectangles`: what is asked of the result
+/// is a question about its union, which this preserves.
+pub fn rects_minus(a: &[EdgeBox], b: &[EdgeBox]) -> Vec<EdgeBox> {
+    let mut out: Vec<EdgeBox> = a.iter().copied().filter(|r| r.0 < r.2 && r.1 < r.3).collect();
+    for &c in b {
+        let mut next = Vec::with_capacity(out.len());
+        for r in out {
+            // strict overlap only: a shared edge removes nothing
+            if !(r.0 < c.2 && c.0 < r.2 && r.1 < c.3 && c.1 < r.3) {
+                next.push(r);
+                continue;
+            }
+            if r.1 < c.1 { next.push((r.0, r.1, r.2, c.1)); }
+            if c.3 < r.3 { next.push((r.0, c.3, r.2, r.3)); }
+            let (y0, y1) = (r.1.max(c.1), r.3.min(c.3));
+            if r.0 < c.0 { next.push((r.0, y0, c.0, y1)); }
+            if c.2 < r.2 { next.push((c.2, y0, r.2, y1)); }
+        }
+        out = next;
+    }
+    out
 }
 
 /// Which spelling of the one-site-gap neighbour test to use.
@@ -673,10 +745,61 @@ mod tests {
     fn a_blocked_layer_the_cell_uses_fails_it() {
         let m2 = 1 << 2;
         let m3 = 1 << 3;
-        let blocked = |gx: i32, _: i32| Some(if gx == 1 { m2 } else { 0 });
-        assert!(!check_blocked_layers(0, 3, 0, 1, m2, &blocked), "the cell uses M2, M2 is blocked");
-        assert!(check_blocked_layers(0, 3, 0, 1, m3, &blocked), "it uses M3 only: clear");
-        assert!(check_blocked_layers(0, 1, 0, 1, m2, &blocked), "square 1 is outside the footprint");
+        let blocked = |gx: i32, _: i32| Some((if gx == 1 { m2 } else { 0 }, 0));
+        assert!(!check_blocked_layers(0, 3, 0, 1, m2, 0, &blocked, &|_| false), "the cell uses M2, M2 is blocked");
+        assert!(check_blocked_layers(0, 3, 0, 1, m3, 0, &blocked, &|_| false), "it uses M3 only: clear");
+        assert!(check_blocked_layers(0, 1, 0, 1, m2, 0, &blocked, &|_| false), "square 1 is outside the footprint");
+    }
+
+    // Rule (checkBlockedLayers, fb9d98e5fe): the via-metal pixel mask only FILTERS. A pin layer met
+    // under the footprint sends the cell to the exact shape test, level by level; a pin layer the
+    // squares do not carry never reaches it, and a layer the cell has no pin on is ignored.
+    #[test]
+    fn via_metal_is_a_coarse_filter_then_an_exact_pin_test() {
+        let m3 = 1 << 3;
+        let squares = |gx: i32, _: i32| Some((0, if gx == 2 { m3 } else { 0 }));
+        let asked = std::cell::RefCell::new(Vec::new());
+        let hit = |l: usize| { asked.borrow_mut().push(l); true };
+        assert!(!check_blocked_layers(0, 3, 0, 1, 0, m3, &squares, &hit), "M3 pin, M3 via metal, shape hits");
+        assert_eq!(*asked.borrow(), vec![3]);
+        assert!(check_blocked_layers(0, 3, 0, 1, 0, m3, &squares, &|_| false), "same squares, the shapes miss");
+        asked.borrow_mut().clear();
+        assert!(check_blocked_layers(0, 2, 0, 1, 0, m3, &squares, &hit), "the footprint stops before square 2");
+        assert!(check_blocked_layers(0, 3, 0, 1, 0, 1 << 2, &squares, &hit), "an M2 pin is not tested against M3 metal");
+        assert!(asked.borrow().is_empty(), "neither reached the exact test");
+    }
+
+    // Rules (markBlocked + overlapsPinBlockage): via metal minus stripe metal, grown by spacing − 1,
+    // and TOUCHING counts. The reference trace (blocked_via_layers, asap7 M3, spacing 18 → bloat 17):
+    // blockage 1130 236 1254 304; m3_cell's pin at x 1080 is 1179 50 1197 260 → hit.
+    #[test]
+    fn via_metal_outside_the_stripe_is_the_blockage_and_touching_is_a_hit() {
+        let left = rects_minus(&[(0, 0, 100, 40)], &[(0, 0, 100, 10), (60, 0, 100, 40)]);
+        let area: i64 = left.iter().map(|r| (r.2 - r.0) as i64 * (r.3 - r.1) as i64).sum();
+        assert_eq!(area, 60 * 30, "an L of stripe removed from the via landing");
+        assert!(rects_minus(&[(0, 0, 10, 10)], &[(0, 0, 10, 10)]).is_empty(), "a via wholly on its stripe leaves nothing");
+        assert_eq!(rects_minus(&[(0, 0, 10, 10)], &[(10, 0, 20, 10)]), vec![(0, 0, 10, 10)], "a shared edge removes nothing");
+        assert!(rects_touch((1130, 236, 1254, 304), (1179, 50, 1197, 260)));
+        assert!(rects_touch((1130, 236, 1254, 304), (1179, 50, 1197, 236)), "touching the grown edge is a hit");
+        assert!(!rects_touch((1130, 236, 1254, 304), (1179, 50, 1197, 235)));
+    }
+
+    // Rule (createMaster, f4798386d5): pin shapes from every NON-SUPPLY terminal, connected or not,
+    // routing levels 1..=3 only; pin_layers = the levels holding one.
+    #[test]
+    fn pin_shapes_skip_supply_terminals_and_high_levels() {
+        let terms: Vec<(String, String)> = [("A", "SIGNAL"), ("VDD", "POWER"), ("VSS", "GROUND"), ("Y", "SIGNAL")]
+            .iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
+        let boxes = |t: &str| match t {
+            "A" => vec![(3, (1, 2, 3, 4)), (4, (0, 0, 9, 9))],
+            "Y" => vec![(1, (5, 6, 7, 8))],
+            _ => vec![(2, (0, 0, 1, 1))],
+        };
+        let (shapes, mask) = master_pin_shapes(&terms, &boxes);
+        assert_eq!(shapes[3], vec![(1, 2, 3, 4)]);
+        assert_eq!(shapes[1], vec![(5, 6, 7, 8)]);
+        assert!(shapes[2].is_empty(), "M2 shapes belong to VDD/VSS only");
+        assert_eq!(mask, (1 << 1) | (1 << 3));
     }
 
     #[test]
