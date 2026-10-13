@@ -362,6 +362,8 @@ impl NetworkSimplex {
         self.join = u;
     }
 
+    // `c >= MAX` against `i32::MAX` is LEMON's own test, transcribed as written.
+    #[allow(clippy::absurd_extreme_comparisons)]
     fn find_leaving_arc(&mut self) -> bool {
         let (first, second) = if self.state[self.in_arc] == STATE_LOWER {
             (self.source[self.in_arc], self.target[self.in_arc])
@@ -558,6 +560,8 @@ impl NetworkSimplex {
 
     /// `start<BlockSearchPivotRule>()`. `initialPivots` is a no-op for `stSupply(s, t, k)` with
     /// every arc's capacity below `k` — the only use here — and is asserted rather than built.
+    // `delta >= MAX` against `i32::MAX` is LEMON's own test, transcribed as written.
+    #[allow(clippy::absurd_extreme_comparisons)]
     fn start(&mut self) -> bool {
         self.block_size = ((self.search_arc_num as f64).sqrt() as usize).max(10);
         self.next_arc = 0;

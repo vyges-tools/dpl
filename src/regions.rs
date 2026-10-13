@@ -338,8 +338,7 @@ mod tests {
 
     /// Two abutting regions, one grouped cell assigned to the left one. Site 10, rows 0/100/200.
     fn two_regions() -> Regions {
-        let mut r = Regions::default();
-        r.rtree = vec![(0, 0, 99, 199), (100, 0, 199, 199)];
+        let mut r = Regions { rtree: vec![(0, 0, 99, 199), (100, 0, 199, 199)], ..Default::default() };
         r.assigned.insert("u1".into(), (0, 0, 100, 200));
         r
     }
@@ -378,8 +377,7 @@ mod tests {
     /// core at absolute y 1000, the query ends at 999 and falls outside the region box.
     #[test]
     fn one_past_the_last_boundary_reads_absolute_core_top() {
-        let mut r = Regions::default();
-        r.rtree = vec![(0, 0, 99, 299)];
+        let mut r = Regions { rtree: vec![(0, 0, 99, 299)], ..Default::default() };
         r.assigned.insert("u".into(), (0, 0, 100, 300));
         // h = 100, y = 200: y_end / h = 3 == len → core_y_max.
         assert!(r.check("u", 0, 200, 40, 100, 10, &[0, 100, 200], 300));
@@ -458,8 +456,7 @@ mod tests {
 
     /// `regions1`'s fences as the reference computed them: `(-73, 0, 104, 1)` and `(-73, 1, 18, 2)`.
     fn regions1_fences() -> Fences {
-        let mut f = Fences::default();
-        f.rects = vec![vec![(-73, 0, 104, 1)], vec![(-73, 1, 18, 2)]];
+        let mut f = Fences { rects: vec![vec![(-73, 0, 104, 1)], vec![(-73, 1, 18, 2)]], ..Default::default() };
         f.cell_fence.insert("f1/_283_".into(), 1);
         f
     }
@@ -478,8 +475,7 @@ mod tests {
     /// default cell wholly inside a fence fails, one straddling a fence edge passes.
     #[test]
     fn a_default_cell_fails_only_wholly_inside_a_fence() {
-        let mut f = Fences::default();
-        f.rects = vec![vec![(0, 0, 10, 1)]];
+        let f = Fences { rects: vec![vec![(0, 0, 10, 1)]], ..Default::default() };
         assert!(!f.respects("u", 2, 0, 4, 1), "inside");
         assert!(f.respects("u", 8, 0, 4, 1), "straddles the edge — passes, as upstream writes it");
         assert!(f.respects("u", 12, 0, 4, 1), "outside");

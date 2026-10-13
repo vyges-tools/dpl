@@ -946,6 +946,7 @@ fn mis_solve(s: &mut Setup, nodes: &[usize]) {
             assign[i] = j;
         }
     }
+    #[allow(clippy::type_complexity)]
     let mut applied: Vec<(usize, (i32, i32), Vec<usize>, (i32, i32), Vec<usize>)> = Vec::new();
     // Applied in the flow map's `ArcIt` order: nodes newest first, so cells from the LAST down.
     for i in (0..n).rev() {
@@ -1316,13 +1317,13 @@ fn orient_single(s: &mut Setup, nd: usize, row: usize) -> bool {
         "R0" | "MY" => match cell_o.as_str() {
             "R0" | "MY" => is_legal_sym(sym, &cell_o),
             "MX" => { s.adjust_orient(nd, "R0"); true }
-            "R180" => if is_legal_sym(sym, "MY") { s.adjust_orient(nd, "MY"); true } else { false },
+            "R180" if is_legal_sym(sym, "MY") => { s.adjust_orient(nd, "MY"); true }
             _ => false,
         },
         "MX" | "R180" => match cell_o.as_str() {
             "MX" | "R180" => is_legal_sym(sym, &cell_o),
-            "R0" => if is_legal_sym(sym, "MX") { s.adjust_orient(nd, "MX"); true } else { false },
-            "MY" => if is_legal_sym(sym, "R180") { s.adjust_orient(nd, "R180"); true } else { false },
+            "R0" if is_legal_sym(sym, "MX") => { s.adjust_orient(nd, "MX"); true }
+            "MY" if is_legal_sym(sym, "R180") => { s.adjust_orient(nd, "R180"); true }
             _ => false,
         },
         _ => false,

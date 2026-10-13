@@ -23,6 +23,11 @@
 //! while nothing AFTER it reads the placement: a later legalization, route or repair sees the
 //! fillers as occupied sites. A placement or DEF comparison after it is never unaffected — which
 //! is what `filler-placement` is for.
+// The engine is a line-by-line transcription of the reference: its function signatures and its
+// index loops mirror the C++ they come from, so these two lints are allowed crate-wide rather than
+// refactored away.
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+
 pub mod check;
 pub mod drc;
 pub mod edges;

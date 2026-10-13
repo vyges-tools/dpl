@@ -156,7 +156,7 @@ fn check_in_rows(g: &crate::grid::Grid, x: i32, y: i32, w: i32, h: i32, site: &s
             }
         }
     }
-    power_ok.map_or(true, |ok| ok(ylo, yhi - ylo))
+    power_ok.is_none_or(|ok| ok(ylo, yhi - ylo))
 }
 
 /// Run the legality check.
@@ -191,6 +191,7 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
     let is_block = |i: &str| {
         db.master_get_type(&db.inst_master(i)).map(|t| t.contains("BLOCK")).unwrap_or(false)
     };
+    #[allow(clippy::type_complexity)]
     let boxes: Vec<(String, (i64, i64, i64, i64), bool)> =
         insts.iter().map(|i| (i.clone(), cell_box(db, i), is_block(i))).collect();
 
@@ -340,7 +341,7 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
                 let multi_row = g.is_multi_height(
                     bx.3 as i32, db.row_pattern(&site).map_or(0, |p| p.len()));
                 let power_ok = |row: i64, rows: i64| {
-                    power.as_ref().map_or(true, |p| p.compatible(&master, row as i32, rows as i32))
+                    power.as_ref().is_none_or(|p| p.compatible(&master, row as i32, rows as i32))
                 };
                 if !check_in_rows(g, bx.0 as i32 - g.core.0, bx.1 as i32 - g.core.1,
                                   bx.2 as i32, bx.3 as i32, &site,
@@ -407,6 +408,7 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
             let master = db.inst_master(name);
             let (left_pad, right_pad) =
                 padding.of(name, &master, &db.master_get_type(&master).unwrap_or_default());
+            #[allow(clippy::type_complexity)]
             let at = |px: i32, py: i32| -> Option<(Option<(crate::drc::Class, bool)>,
                                                    Option<(crate::drc::Class, bool)>)> {
                 let p = g.pixel(px as i64, py as i64)?;
@@ -423,7 +425,7 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
 
             // `checkEdgeSpacing(cell)` — at `gridX(cell)`, `gridRoundY(cell)`, the cell's orient;
             // against the cells painted BEFORE it. ⛔ After `paintCellPadding`, as upstream.
-            let ok = edge_model.as_ref().map_or(true, |em| em.check(
+            let ok = edge_model.as_ref().is_none_or(|em| em.check(
                 g, idx, &inst_masters[idx], &orients[idx], cx, cy,
                 &|px, py| g.pixel(px as i64, py as i64).and_then(|p| p.cell).map(|c| c as usize),
                 &|o| em.edges_at(&inst_masters[o], &orients[o],
@@ -492,6 +494,66 @@ pub fn check_one_site_gaps(
     gap
 }
 
+/// Diagnostic: the grid facts the site-alignment check depends on.
+///
+/// ⚠️ Exists because the first run of that check reported EVERY cell misaligned on a design the
+/// reference calls clean. A wrong site width or an empty row set produces exactly that, and both
+/// look identical from the failure list.
+fn status_counts(db: &Db) -> std::collections::BTreeMap<String, usize> {
+    let mut c: std::collections::BTreeMap<String, usize> = Default::default();
+    for name in db.inst_names() {
+        *c.entry(db.inst_get_placement_status(&name)).or_default() += 1;
+    }
+    c
+}
+
+pub fn grid_facts(db: &Db) -> serde_json::Value {
+    let ys: Vec<i64> = row_ys(db).into_iter().take(5).collect();
+    let sample: Vec<serde_json::Value> = (0..db.num_insts().min(3))
+        .map(|i| {
+            let n = db.nth_inst_name(i);
+            let (x, y) = db.inst_location(&n);
+            let m = db.inst_master(&n);
+            // 🔑 The SITE, because every row-legality test keys on it: a master whose site no
+            // row carries can never be seated, and nothing in a position reveals that.
+            serde_json::json!({"inst": n, "x": x, "y": y, "master": m.clone(),
+                               "site": db.master_get_site(&m),
+                               "height": db.master_get_height(&m)})
+        })
+        .collect();
+    serde_json::json!({
+        "core_area": [db.block_get_core_area_x_min(), db.block_get_core_area_y_min(),
+                      db.block_get_core_area_x_max(), db.block_get_core_area_y_max()],
+        "num_rows": db.num_rows().unwrap_or(0),
+        "placement_statuses": status_counts(db),
+        "site_width": site_width(db),
+        "first_row_ys": ys,
+        "row_x_origins": (0..db.num_rows().unwrap_or(0))
+            .filter_map(|i| db.nth_row(i).ok().flatten())
+            .map(|(b, _, _)| b[0] as i64)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter().take(4).collect::<Vec<_>>(),
+        "row_count_distinct_y": row_ys(db).len(),
+        // The distinct sites the ROWS offer, which is what a master's site must match.
+        "row_sites": (0..db.num_rows().unwrap_or(0))
+            .filter_map(|i| db.nth_row(i).ok().flatten())
+            .map(|(_, site, _)| site)
+            .collect::<std::collections::BTreeSet<_>>(),
+        // 🔑 The GRID's own dimensions, not the database's. They are what every placement
+        // decision is clamped against, and a diagnostic that reports only the DEF cannot show a
+        // grid that came out the wrong size.
+        "grid": match crate::grid::Grid::build(db) {
+            Ok(g) => serde_json::json!({
+                "row_count": g.row_count, "row_site_count": g.row_site_count,
+                "site_width": g.site_width, "core": [g.core.0, g.core.1, g.core.2, g.core.3],
+                "row_y": g.row_y, "valid_sites": g.valid_sites(),
+            }),
+            Err(e) => serde_json::json!({"error": e}),
+        },
+        "sample_insts": sample,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     /// Upstream `checkInRows` ends `!isMultiRow || checkRowPowerCompatible(cell, ylo)`: a
@@ -551,64 +613,4 @@ mod tests {
     fn disjoint_cells_do_not_overlap() {
         assert!(!rects_overlap((0, 0, 10, 10), (100, 100, 5, 5)));
     }
-}
-
-/// Diagnostic: the grid facts the site-alignment check depends on.
-///
-/// ⚠️ Exists because the first run of that check reported EVERY cell misaligned on a design the
-/// reference calls clean. A wrong site width or an empty row set produces exactly that, and both
-/// look identical from the failure list.
-fn status_counts(db: &Db) -> std::collections::BTreeMap<String, usize> {
-    let mut c: std::collections::BTreeMap<String, usize> = Default::default();
-    for name in db.inst_names() {
-        *c.entry(db.inst_get_placement_status(&name)).or_default() += 1;
-    }
-    c
-}
-
-pub fn grid_facts(db: &Db) -> serde_json::Value {
-    let ys: Vec<i64> = row_ys(db).into_iter().take(5).collect();
-    let sample: Vec<serde_json::Value> = (0..db.num_insts().min(3))
-        .map(|i| {
-            let n = db.nth_inst_name(i);
-            let (x, y) = db.inst_location(&n);
-            let m = db.inst_master(&n);
-            // 🔑 The SITE, because every row-legality test keys on it: a master whose site no
-            // row carries can never be seated, and nothing in a position reveals that.
-            serde_json::json!({"inst": n, "x": x, "y": y, "master": m.clone(),
-                               "site": db.master_get_site(&m),
-                               "height": db.master_get_height(&m)})
-        })
-        .collect();
-    serde_json::json!({
-        "core_area": [db.block_get_core_area_x_min(), db.block_get_core_area_y_min(),
-                      db.block_get_core_area_x_max(), db.block_get_core_area_y_max()],
-        "num_rows": db.num_rows().unwrap_or(0),
-        "placement_statuses": status_counts(db),
-        "site_width": site_width(db),
-        "first_row_ys": ys,
-        "row_x_origins": (0..db.num_rows().unwrap_or(0))
-            .filter_map(|i| db.nth_row(i).ok().flatten())
-            .map(|(b, _, _)| b[0] as i64)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter().take(4).collect::<Vec<_>>(),
-        "row_count_distinct_y": row_ys(db).len(),
-        // The distinct sites the ROWS offer, which is what a master's site must match.
-        "row_sites": (0..db.num_rows().unwrap_or(0))
-            .filter_map(|i| db.nth_row(i).ok().flatten())
-            .map(|(_, site, _)| site)
-            .collect::<std::collections::BTreeSet<_>>(),
-        // 🔑 The GRID's own dimensions, not the database's. They are what every placement
-        // decision is clamped against, and a diagnostic that reports only the DEF cannot show a
-        // grid that came out the wrong size.
-        "grid": match crate::grid::Grid::build(db) {
-            Ok(g) => serde_json::json!({
-                "row_count": g.row_count, "row_site_count": g.row_site_count,
-                "site_width": g.site_width, "core": [g.core.0, g.core.1, g.core.2, g.core.3],
-                "row_y": g.row_y, "valid_sites": g.valid_sites(),
-            }),
-            Err(e) => serde_json::json!({"error": e}),
-        },
-        "sample_insts": sample,
-    })
 }

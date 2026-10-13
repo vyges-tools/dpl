@@ -156,7 +156,7 @@ impl Grid {
         let mut ys: BTreeSet<i32> = BTreeSet::new();
         for (_, y, _, _, _, h) in &rows {
             ys.insert(*y);
-            ys.insert(*y + *h as i32);
+            ys.insert(*y + *h);
         }
         let row_y: Vec<i32> = ys.into_iter().collect();
         let index_of: BTreeMap<i32, usize> =
@@ -185,7 +185,7 @@ impl Grid {
 
         let mut g = Grid { core, site_width, row_count, row_site_count, pixels, row_sites, row_y,
                            row_orient, blocked_layers_populated: false, pin_blockages: vec![Vec::new(); crate::drc::MAX_PIN_LEVEL as usize + 1],
-                           site_heights: rows.iter().map(|r| r.5 as i32).collect() };
+                           site_heights: rows.iter().map(|r| r.5).collect() };
         g.mark_blocked(db);
         g.mark_blocked_layers(db);
         Ok(g)

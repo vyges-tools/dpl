@@ -168,7 +168,7 @@ pub fn split_by_implant(masters: Vec<FillerMaster>) -> ByImplant {
     }
     map.into_iter()
         .map(|(k, mut v)| {
-            v.sort_by(|a, b| b.width.cmp(&a.width));
+            v.sort_by_key(|b| std::cmp::Reverse(b.width));
             (k, v)
         })
         .collect()

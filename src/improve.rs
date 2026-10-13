@@ -748,7 +748,7 @@ impl Setup {
                 }
             }
             let above = row as i64 + offset;
-            if above <= n - 1 && (vert <= dist1 || vert <= dist2) {
+            if above < n && (vert <= dist1 || vert <= dist2) {
                 for &sid in &self.segs_in_row[above as usize] {
                     consider(sid, vert, &mut best1, &mut best2, &mut dist1, &mut dist2);
                 }

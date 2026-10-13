@@ -132,6 +132,8 @@ pub fn build_pins(db: &Db, nodes: &[Node]) -> (Vec<Pin>, Vec<Vec<usize>>, Vec<Ve
 struct Action {
     node: usize,
     orig: (i32, i32),
+    // Recorded as `MoveCellAction` records it; nothing here reads it back (undo restores `orig`).
+    #[allow(dead_code)]
     new: (i32, i32),
     orig_segs: Vec<i32>,
     new_segs: Vec<i32>,

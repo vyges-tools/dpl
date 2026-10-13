@@ -288,7 +288,7 @@ pub fn init_position(
 ) -> (i32, i32) {
     // `gridRoundX` — nearest site column, NOT the floor. See the note above.
     let gx = ((x_dbu - core_x) as f64 / site_width as f64).round() as i32;
-    let rel_y = (y_dbu - core_y) as i64;
+    let rel_y = y_dbu - core_y;
     // `gridRoundY` — snap DOWN, then take the row above when it is AT LEAST AS CLOSE.
     //
     // ⛔ **`>=`, so a cell exactly halfway between two rows rounds UP.** A "nearest row" search
@@ -304,7 +304,7 @@ pub fn init_position(
     // from the end.
     let gy = {
         let g = row_y.iter().rposition(|&ry| ry as i64 <= rel_y).unwrap_or(0);
-        let above_exists = g + 1 <= row_y.len().saturating_sub(2);
+        let above_exists = g < row_y.len().saturating_sub(2);
         if above_exists
             && (row_y[g] as i64 - rel_y).abs() >= (row_y[g + 1] as i64 - rel_y).abs()
         {
@@ -2127,7 +2127,6 @@ mod tests {
         assert_eq!(consts::INF_COST, 1_073_741_823.0);
     }
 
-    #[test]
     /// `fragmented_row03`, cell `_277_`, at pin `7d490b8` — the reference's own numbers.
     ///
     /// The design has two one-site rows at DBU 28000 and 34460 with a 6080-DBU gap between them,
@@ -2164,6 +2163,7 @@ mod tests {
         assert_eq!(gx, 9, "round(8.5) is 9 away from zero, not 8");
     }
 
+    #[test]
     fn unplaced_and_non_core_instances_stay_out_of_the_model() {
         assert!(enters_model("PLACED", true));
         assert!(enters_model("FIRM", true));
@@ -2776,6 +2776,7 @@ pub struct SweepCtx<'a> {
     /// `horizontalWindowBounds`' `openAt` tests the footprint for `capacity == 0`, and
     /// `verticalWindowRows`' `rowUsable` tests it per square. A window built from die bounds
     /// alone cannot see a macro, and so never walks past one.
+    #[allow(clippy::type_complexity)]
     pub window: &'a dyn Fn(&SweepCell, i32, i32, &NegGrid) -> (i32, i32, Vec<i32>),
     /// Can this cell's footprint legally sit here, ignoring congestion?
     pub placeable: &'a dyn Fn(&SweepCell, i32, i32) -> bool,
@@ -2860,7 +2861,7 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
                         ctx: &mut SweepCtx) -> i32
 {
     // 1. Order the sweep — `sortByNegotiationOrder(activeCells)`, IN PLACE.
-    order_active(active, cells, &ctx.grid);
+    order_active(active, cells, ctx.grid);
     // The sweep walks that order; cells pulled in below join the list, not this pass.
     let order: Vec<usize> = active.clone();
 
@@ -3106,7 +3107,7 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
         update_drc_history_costs(&mut ctx.grid.pixels, &drc_footprints);
         // `sortByNegotiationOrder(activeCells)` again, on the costs just bumped: the order the
         // run's active list is LEFT in — which is the order a stall's `diamondRecovery` visits.
-        order_active(active, cells, &ctx.grid);
+        order_active(active, cells, ctx.grid);
     }
     violations
 }
@@ -3279,6 +3280,7 @@ impl Default for Options {
 /// 5. [`run_negotiation`] — two phases, [`negotiation_iter`] per iteration, history updated
 ///    after each, diamond recovery on a 3-iteration stall;
 /// 6. sync back: grid units → absolute DBU, ⚠️ **orientation from the row landed in**.
+///
 /// Where `commitNegotiationPosToDpl` writes a cell — **legal or not**.
 ///
 /// ```text
@@ -3694,7 +3696,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             let b = db.master_placement_boundary(m).unwrap_or_default();
             let bbox = if b.len() == 4 { (b[0], b[1], b[2], b[3]) } else { (0, 0, 0, 0) };
             let rows = grid.grid_height(db.master_get_height(m) as i32,
-                                        db.row_pattern(&db.master_get_site(m)).map_or(0, |p| p.len())) as i32;
+                                        db.row_pattern(&db.master_get_site(m)).map_or(0, |p| p.len()));
             let spacer = crate::drc::is_core_spacer(&db.master_get_type(m).unwrap_or_default());
             let lef = db.master_edge_types(m).unwrap_or_default();
             master_edge_list.insert(m.clone(), (bbox, crate::drc::master_edges(bbox, &lef, rows, &edge_table, spacer)));
@@ -3914,6 +3916,8 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
 
     // 5. Run it. ⚠️ The window is rebuilt per candidate anchor, as upstream does — hoisting it
     //    out of the loop would freeze the reach at the cell's start position.
+    // `ngrid = run.grid` hands the grid back after the run; nothing reads it afterwards.
+    #[allow(unused_assignments)]
     let outcome = if active.is_empty() {
         Outcome::Converged { phase: 1, iter: 0 }
     } else {
@@ -3971,7 +3975,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
         // core edge is clean here and a violation there. See [`crate::drc::EdgeReading`].
         // `Node::getGroup` per cell: set by `setUpPlacementGroups` for a group's network cells.
         let cell_group: Vec<Option<usize>> = cells.iter().map(|c| {
-            groups.iter().position(|g| g.cells.iter().any(|n| *n == c.name))
+            groups.iter().position(|g| g.cells.contains(&c.name))
         }).collect();
         let region_rtree = crate::regions::Regions::from_groups(&groups, &|_| None);
         let can_be_placed = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {

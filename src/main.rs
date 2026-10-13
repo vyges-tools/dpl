@@ -515,7 +515,7 @@ fn legalize(args: &[String]) -> ExitCode {
     let mut master_pads: Vec<(String, (i32, i32))> = Vec::new();
     // `-max_displacement disp|{disp_x disp_y}`: ONE value sets both axes, two set them
     // separately. Upstream accepts a Tcl list; the shell equivalent is `X` or `X,Y`.
-    let mut num = |i: &mut usize, what: &str| -> Option<String> {
+    let num = |i: &mut usize, what: &str| -> Option<String> {
         *i += 1;
         match args.get(*i) {
             Some(v) => Some(v.clone()),

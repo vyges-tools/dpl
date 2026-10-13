@@ -151,6 +151,7 @@ pub fn pair_rule(a: Class, b: Class) -> PairRule {
 /// missing it lets a cell sit in another's spacing.
 ///
 /// ℹ️ A pixel off the grid (`None`) is skipped, not failed — that is the core edge.
+#[allow(clippy::type_complexity)]
 pub fn check_padding(
     x: i32, x_end: i32, y: i32, y_end: i32, left_pad: i32, right_pad: i32,
     cell: Class,
@@ -1314,8 +1315,8 @@ mod power_tests {
     #[test]
     fn a_multi_row_cell_on_the_wrong_parity_is_refused_unless_flipping_fixes_it() {
         // Rows alternate: even rows VSS at the bottom, VDD on top; odd rows the reverse.
-        let bot = |r: usize| if r % 2 == 0 { Vss } else { Vdd };
-        let top = |r: usize| if r % 2 == 0 { Vdd } else { Vss };
+        let bot = |r: usize| if r.is_multiple_of(2) { Vss } else { Vdd };
+        let top = |r: usize| if r.is_multiple_of(2) { Vdd } else { Vss };
         // A double-height cell VSS-bottom / VSS-top spanning rows 0..1: row 0 bottom is VSS ✓,
         // row 1 top is VSS ✓.
         assert_eq!(power_compatible(Vss, Vss, 0, 2, 4, &bot, &top), (true, false));
