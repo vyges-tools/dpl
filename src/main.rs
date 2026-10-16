@@ -3,6 +3,64 @@
 use std::process::ExitCode;
 use vyges_opendb::Db;
 
+/// One reference line (`[SEVERITY DPL-nnnn] text`): an event under its code, and the plain line
+/// still on stderr — the correlation scorers read it there.
+fn ref_line_out(sev: &str, code: &str, text: String) {
+    use vyges_events::{emit, Event, Severity};
+    let severity = match sev {
+        "WARNING" => Severity::Warn,
+        "ERROR" => Severity::Error,
+        _ => Severity::Info,
+    };
+    emit(&Event::new("vyges-dpl", severity, text.clone()).with_code(code));
+    eprintln!("[{sev} {code}] {text}");
+}
+
+macro_rules! ref_line {
+    ($sev:expr, $code:expr, $($t:tt)*) => { ref_line_out($sev, $code, format!($($t)*)) };
+}
+
+/// A line of the optimizer's log as the reference prints it: a reference line when it is one,
+/// else plain text (an event either way).
+fn log_line(l: &str) {
+    let parsed = l.strip_prefix('[').and_then(|r| r.split_once("] ")).and_then(|(tag, text)| tag.split_once(' ').map(|(sev, code)| (sev, code, text)));
+    match parsed {
+        Some((sev, code, text)) => ref_line_out(sev, code, text.to_string()),
+        None => {
+            vyges_events::emit(&vyges_events::Event::new("vyges-dpl", vyges_events::Severity::Info, l.to_string()));
+            eprintln!("{l}");
+        }
+    }
+}
+
+/// Our diagnostic: an event (`DPL-ERROR`); text after a blank line (the usage) stays plain help.
+fn diag_out(msg: String) {
+    let (head, help) = match msg.split_once("\n\n") {
+        Some((h, rest)) => (h.to_string(), Some(rest.to_string())),
+        None => (msg, None),
+    };
+    let text = head.strip_prefix("vyges-dpl: ").unwrap_or(&head).to_string();
+    vyges_events::emit(&vyges_events::Event::new("vyges-dpl", vyges_events::Severity::Error, text).with_code("DPL-ERROR"));
+    if let Some(h) = help {
+        eprintln!("{h}");
+    }
+}
+
+macro_rules! diag {
+    ($($t:tt)*) => { diag_out(format!($($t)*)) };
+}
+
+/// A run's summary line: an event (`DPL-SUMMARY`) and the plain line (scripts read it).
+fn summary_out(text: String) {
+    vyges_events::emit(&vyges_events::Event::new("vyges-dpl", vyges_events::Severity::Info, text.clone()).with_code("DPL-SUMMARY"));
+    eprintln!("{text}");
+}
+
+macro_rules! summary {
+    ($($t:tt)*) => { summary_out(format!($($t)*)) };
+}
+
+
 /// The machine-readable contract `vyges mcp` and the docs generator read.
 ///
 /// ⛔ **`maturity` has exactly THREE legal values** — `discovered`, `structured`,
@@ -242,17 +300,17 @@ fn main() -> ExitCode {
         Some("improve-placement") => improve_placement(&args[1..]),
         // A diagnostic, not a command anyone should need in a flow.
         Some("grid-facts") => {
-            let Some(p) = args.get(1) else { eprintln!("need <design.odb>"); return ExitCode::from(2) };
+            let Some(p) = args.get(1) else { diag!("vyges-dpl: need <design.odb>"); return ExitCode::from(2) };
             match Db::open(p) {
                 Ok(db) => {
                     println!("{}", serde_json::to_string_pretty(&vyges_dpl::check::grid_facts(&db)).unwrap());
                     ExitCode::SUCCESS
                 }
-                Err(e) => { eprintln!("cannot open {p}: {e}"); ExitCode::from(2) }
+                Err(e) => { diag!("vyges-dpl: cannot open {p}: {e}"); ExitCode::from(2) }
             }
         }
         Some(other) => {
-            eprintln!("vyges-dpl: unknown command `{other}`\n\n{USAGE}");
+            diag!("vyges-dpl: unknown command `{other}`\n\n{USAGE}");
             ExitCode::from(2)
         }
     }
@@ -277,34 +335,34 @@ fn fill(args: &[String]) -> ExitCode {
         i += 1;
     }
     let Some(path) = odb else {
-        eprintln!("vyges-dpl: filler-placement needs <design.odb> PATTERN…\n\n{USAGE}");
+        diag!("vyges-dpl: filler-placement needs <design.odb> PATTERN…\n\n{USAGE}");
         return ExitCode::from(2);
     };
     // `sta::check_argc_eq1`: exactly one master list — here one or more patterns.
     if patterns.is_empty() {
-        eprintln!("vyges-dpl: filler-placement needs at least one master PATTERN");
+        diag!("vyges-dpl: filler-placement needs at least one master PATTERN");
         return ExitCode::from(2);
     }
     let mut db = match Db::open(&path) {
         Ok(d) => d,
-        Err(e) => { eprintln!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
+        Err(e) => { diag!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
     };
     let res = match vyges_dpl::fillers::filler_placement(&mut db, &patterns, &prefix) {
         Ok(r) => r,
         Err(e) => {
             println!("{}", serde_json::json!({ "tool": "vyges-dpl", "command": "filler-placement",
                                                "status": "error", "error": e.to_string() }));
-            eprintln!("vyges-dpl: {e}");
+            diag!("vyges-dpl: {e}");
             return ExitCode::from(1);
         }
     };
     for p in &res.unmatched_patterns {
-        eprintln!("[WARNING DPL-0028] {p} did not match any masters.");
+        ref_line!("WARNING", "DPL-0028", "{p} did not match any masters.");
     }
-    eprintln!("[INFO DPL-0001] Placed {} filler instances.", res.fillers.len());
+    ref_line!("INFO", "DPL-0001", "Placed {} filler instances.", res.fillers.len());
     if let Some(o) = out_odb.as_deref() {
         if let Err(e) = db.write(o) {
-            eprintln!("vyges-dpl: cannot write {o}: {e}");
+            diag!("vyges-dpl: cannot write {o}: {e}");
             return ExitCode::from(2);
         }
     }
@@ -325,27 +383,27 @@ fn remove_fillers(args: &[String]) -> ExitCode {
             "--out-odb" => { i += 1; out_odb = args.get(i).cloned(); }
             a if odb.is_none() => odb = Some(a.to_string()),
             a => {
-                eprintln!("vyges-dpl: remove-fillers: unexpected argument {a}\n\n{USAGE}");
+                diag!("vyges-dpl: remove-fillers: unexpected argument {a}\n\n{USAGE}");
                 return ExitCode::from(2);
             }
         }
         i += 1;
     }
     let Some(path) = odb else {
-        eprintln!("vyges-dpl: remove-fillers needs <design.odb>\n\n{USAGE}");
+        diag!("vyges-dpl: remove-fillers needs <design.odb>\n\n{USAGE}");
         return ExitCode::from(2);
     };
     let mut db = match Db::open(&path) {
         Ok(d) => d,
-        Err(e) => { eprintln!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
+        Err(e) => { diag!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
     };
     let removed = match vyges_dpl::fillers::remove_fillers(&mut db) {
         Ok(r) => r,
-        Err(e) => { eprintln!("vyges-dpl: {e}"); return ExitCode::from(1); }
+        Err(e) => { diag!("vyges-dpl: {e}"); return ExitCode::from(1); }
     };
     if let Some(o) = out_odb.as_deref() {
         if let Err(e) = db.write(o) {
-            eprintln!("vyges-dpl: cannot write {o}: {e}");
+            diag!("vyges-dpl: cannot write {o}: {e}");
             return ExitCode::from(2);
         }
     }
@@ -365,38 +423,38 @@ fn optimize_mirroring(args: &[String]) -> ExitCode {
             "--out-odb" => { i += 1; out_odb = args.get(i).cloned(); }
             a if odb.is_none() => odb = Some(a.to_string()),
             a => {
-                eprintln!("vyges-dpl: optimize-mirroring: unexpected argument {a}\n\n{USAGE}");
+                diag!("vyges-dpl: optimize-mirroring: unexpected argument {a}\n\n{USAGE}");
                 return ExitCode::from(2);
             }
         }
         i += 1;
     }
     let Some(path) = odb else {
-        eprintln!("vyges-dpl: optimize-mirroring needs <design.odb>\n\n{USAGE}");
+        diag!("vyges-dpl: optimize-mirroring needs <design.odb>\n\n{USAGE}");
         return ExitCode::from(2);
     };
     let mut db = match Db::open(&path) {
         Ok(d) => d,
-        Err(e) => { eprintln!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
+        Err(e) => { diag!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
     };
     let rep = match vyges_dpl::mirror::optimize_mirroring(&mut db) {
         Ok(r) => r,
-        Err(e) => { eprintln!("vyges-dpl: {e}"); return ExitCode::from(1); }
+        Err(e) => { diag!("vyges-dpl: {e}"); return ExitCode::from(1); }
     };
     if !rep.mirrored.is_empty() {
-        eprintln!("[INFO DPL-0020] Mirrored {} instances", rep.mirrored.len());
+        ref_line!("INFO", "DPL-0020", "Mirrored {} instances", rep.mirrored.len());
     }
     if !rep.edge_spacing_rejected.is_empty() {
-        eprintln!("[INFO DPL-0024] Skipped {} instances that would violate cell edge spacing rules when mirrored",
+        ref_line!("INFO", "DPL-0024", "Skipped {} instances that would violate cell edge spacing rules when mirrored",
                   rep.edge_spacing_rejected.len());
     }
     if !rep.blocked_layers_rejected.is_empty() {
-        eprintln!("[INFO DPL-0040] Skipped {} instances that would short pins to power via metal when mirrored",
+        ref_line!("INFO", "DPL-0040", "Skipped {} instances that would short pins to power via metal when mirrored",
                   rep.blocked_layers_rejected.len());
     }
     if let Some(o) = out_odb.as_deref() {
         if let Err(e) = db.write(o) {
-            eprintln!("vyges-dpl: cannot write {o}: {e}");
+            diag!("vyges-dpl: cannot write {o}: {e}");
             return ExitCode::from(2);
         }
     }
@@ -440,27 +498,27 @@ fn improve_placement(args: &[String]) -> ExitCode {
             }
             a if odb.is_none() => odb = Some(a.to_string()),
             a => {
-                eprintln!("vyges-dpl: improve-placement: unexpected argument {a}\n\n{USAGE}");
+                diag!("vyges-dpl: improve-placement: unexpected argument {a}\n\n{USAGE}");
                 return ExitCode::from(2);
             }
         }
         i += 1;
     }
     let Some(path) = odb else {
-        eprintln!("vyges-dpl: improve-placement needs <design.odb>\n\n{USAGE}");
+        diag!("vyges-dpl: improve-placement needs <design.odb>\n\n{USAGE}");
         return ExitCode::from(2);
     };
     let mut db = match Db::open(&path) {
         Ok(d) => d,
-        Err(e) => { eprintln!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
+        Err(e) => { diag!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
     };
     let mut setup = match vyges_dpl::improve::setup_with(&db, &vyges_dpl::negotiate::Padding::default(), seed, max_disp) {
         Ok(s) => s,
-        Err(e) => { eprintln!("vyges-dpl: {e}"); return ExitCode::from(1); }
+        Err(e) => { diag!("vyges-dpl: {e}"); return ExitCode::from(1); }
     };
     if dump {
         for l in &setup.log {
-            eprintln!("{l}");
+            log_line(l);
         }
         for l in setup.dump() {
             println!("{l}");
@@ -469,7 +527,7 @@ fn improve_placement(args: &[String]) -> ExitCode {
     }
     let rep = vyges_dpl::improve_opt::improve(&mut setup, &opts);
     for l in &setup.log {
-        eprintln!("{l}");
+        log_line(l);
     }
     let rep = match rep {
         Ok(r) => r,
@@ -485,11 +543,11 @@ fn improve_placement(args: &[String]) -> ExitCode {
     // ⚠️ `set_inst_location` also stamps PLACED; only movable (already placed) cells are written.
     let moved = match vyges_dpl::improve_opt::write_back(&setup, &mut db) {
         Ok(m) => m,
-        Err(e) => { eprintln!("vyges-dpl: {e}"); return ExitCode::from(2); }
+        Err(e) => { diag!("vyges-dpl: {e}"); return ExitCode::from(2); }
     };
     if let Some(o) = out_odb.as_deref() {
         if let Err(e) = db.write(o) {
-            eprintln!("vyges-dpl: cannot write {o}: {e}");
+            diag!("vyges-dpl: cannot write {o}: {e}");
             return ExitCode::from(2);
         }
     }
@@ -519,7 +577,7 @@ fn legalize(args: &[String]) -> ExitCode {
         *i += 1;
         match args.get(*i) {
             Some(v) => Some(v.clone()),
-            None => { eprintln!("vyges-dpl: {what} needs a value"); None }
+            None => { diag!("vyges-dpl: {what} needs a value"); None }
         }
     };
     let mut bad = false;
@@ -540,7 +598,7 @@ fn legalize(args: &[String]) -> ExitCode {
                     (Some(l), Some(r), None) => padding.global = (l, r),
                     (Some(l), Some(r), Some(k)) if flag == "--padding-master" => { master_pads.push((k, (l, r))); }
                     (Some(l), Some(r), Some(k)) => { padding.insts.insert(k, (l, r)); }
-                    _ => { eprintln!("vyges-dpl: {flag} needs [NAME] LEFT RIGHT (sites)"); bad = true; }
+                    _ => { diag!("vyges-dpl: {flag} needs [NAME] LEFT RIGHT (sites)"); bad = true; }
                 }
                 i += 2;
             }
@@ -554,7 +612,7 @@ fn legalize(args: &[String]) -> ExitCode {
                             opts.max_displacement_y = y;
                         }
                         _ => {
-                            eprintln!("vyges-dpl: --max-displacement wants SITES or SITES,ROWS \
+                            diag!("vyges-dpl: --max-displacement wants SITES or SITES,ROWS \
                                        (non-negative), got `{v}`");
                             bad = true;
                         }
@@ -568,7 +626,7 @@ fn legalize(args: &[String]) -> ExitCode {
                         else { opts.row_search_window = n }
                     }
                     Some((_, v)) => {
-                        eprintln!("vyges-dpl: {o} wants a non-negative integer, got `{v}`");
+                        diag!("vyges-dpl: {o} wants a non-negative integer, got `{v}`");
                         bad = true;
                     }
                     None => bad = true,
@@ -577,7 +635,7 @@ fn legalize(args: &[String]) -> ExitCode {
             "--drc-penalty" => match num(&mut i, "--drc-penalty").map(|v| (v.trim().parse::<f64>(), v)) {
                 Some((Ok(n), _)) if n >= 0.0 => opts.drc_penalty = n,
                 Some((_, v)) => {
-                    eprintln!("vyges-dpl: --drc-penalty wants a non-negative number, got `{v}`");
+                    diag!("vyges-dpl: --drc-penalty wants a non-negative number, got `{v}`");
                     bad = true;
                 }
                 None => bad = true,
@@ -586,13 +644,13 @@ fn legalize(args: &[String]) -> ExitCode {
             // (DPL-3) because the value is derived from `hasOneSiteMaster`; a flag that cannot
             // change the answer must not look as though it did.
             "--disallow-one-site-gaps" => {
-                eprintln!("vyges-dpl: --disallow-one-site-gaps is not accepted: upstream \
+                diag!("vyges-dpl: --disallow-one-site-gaps is not accepted: upstream \
                            deprecated it and derives the setting from hasOneSiteMaster(), so \
                            the flag cannot change the result");
                 bad = true;
             }
             a if a.starts_with('-') => {
-                eprintln!("vyges-dpl: unknown option `{a}`");
+                diag!("vyges-dpl: unknown option `{a}`");
                 return ExitCode::from(2);
             }
             a => odb = Some(a.to_string()),
@@ -603,25 +661,25 @@ fn legalize(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let Some(path) = odb else {
-        eprintln!("vyges-dpl: detailed-placement needs <design.odb>\n\n{USAGE}");
+        diag!("vyges-dpl: detailed-placement needs <design.odb>\n\n{USAGE}");
         return ExitCode::from(2);
     };
     let mut db = match Db::open(&path) {
         Ok(d) => d,
-        Err(e) => { eprintln!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
+        Err(e) => { diag!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
     };
     resolve_master_pads(&db, &mut padding, &master_pads);
     // ⚠️ The tunables belong to the NEGOTIATION legalizer — upstream's setters are on
     // `NegotiationLegalizer`, and `diamondDPL` reads only the displacement caps.
     let padded = padding.global != (0, 0) || !padding.masters.is_empty() || !padding.insts.is_empty();
     if diamond && padded {
-        eprintln!("vyges-dpl: placement padding with the diamond legalizer is not modelled");
+        diag!("vyges-dpl: placement padding with the diamond legalizer is not modelled");
         return ExitCode::from(2);
     }
     let res = match if diamond { vyges_dpl::place::legalize(&db) }
                     else { vyges_dpl::negotiate::legalize_padded(&db, opts, &padding) } {
         Ok(r) => r,
-        Err(e) => { eprintln!("vyges-dpl: {e}"); return ExitCode::from(2); }
+        Err(e) => { diag!("vyges-dpl: {e}"); return ExitCode::from(2); }
     };
     let moved = res.placed.iter().filter(|p| p.moved).count();
     if !dry {
@@ -645,7 +703,7 @@ fn legalize(args: &[String]) -> ExitCode {
             }
             if db.inst_location(&p.name) != (p.x, p.y) {
                 if let Err(e) = db.set_inst_location(&p.name, p.x, p.y) {
-                    eprintln!("vyges-dpl: cannot move {}: {e}", p.name);
+                    diag!("vyges-dpl: cannot move {}: {e}", p.name);
                     return ExitCode::from(2);
                 }
             }
@@ -653,7 +711,7 @@ fn legalize(args: &[String]) -> ExitCode {
         }
         if let Some(o) = out_odb.as_deref() {
             if let Err(e) = db.write(o) {
-                eprintln!("vyges-dpl: cannot write {o}: {e}");
+                diag!("vyges-dpl: cannot write {o}: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -678,11 +736,11 @@ fn legalize(args: &[String]) -> ExitCode {
         // be debugged — the first bug here was invisible in a summary that said "1 moved".
         "placed": res.placed,
     })).expect("valid JSON"));
-    eprintln!("detailed-placement: {} cell(s), {moved} moved, {} failed, status {status}",
+    summary!("detailed-placement: {} cell(s), {moved} moved, {} failed, status {status}",
               res.placed.len(), res.failures.len());
     if !res.filtered_out.is_empty() {
         let n: usize = res.filtered_out.values().sum();
-        eprintln!("detailed-placement: {n} instance(s) outside the model: {:?}", res.filtered_out);
+        summary!("detailed-placement: {n} instance(s) outside the model: {:?}", res.filtered_out);
     }
     match status { "legalized" => ExitCode::SUCCESS, "vacuous" => ExitCode::from(3),
                    _ => ExitCode::from(1) }
@@ -723,12 +781,12 @@ fn check(args: &[String]) -> ExitCode {
                     (Some(l), Some(r), None) => padding.global = (l, r),
                     (Some(l), Some(r), Some(k)) if flag == "--padding-master" => { master_pads.push((k, (l, r))); }
                     (Some(l), Some(r), Some(k)) => { padding.insts.insert(k, (l, r)); }
-                    _ => { eprintln!("vyges-dpl: {flag} needs [NAME] LEFT RIGHT (sites)"); return ExitCode::from(2); }
+                    _ => { diag!("vyges-dpl: {flag} needs [NAME] LEFT RIGHT (sites)"); return ExitCode::from(2); }
                 }
                 i += 2;
             }
             a if a.starts_with('-') => {
-                eprintln!("vyges-dpl: unknown option `{a}`");
+                diag!("vyges-dpl: unknown option `{a}`");
                 return ExitCode::from(2);
             }
             a => odb = Some(a.to_string()),
@@ -736,13 +794,13 @@ fn check(args: &[String]) -> ExitCode {
         i += 1;
     }
     let Some(path) = odb else {
-        eprintln!("vyges-dpl: check-placement needs <design.odb>\n\n{USAGE}");
+        diag!("vyges-dpl: check-placement needs <design.odb>\n\n{USAGE}");
         return ExitCode::from(2);
     };
     let db = match Db::open(&path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("vyges-dpl: cannot open {path}: {e}");
+            diag!("vyges-dpl: cannot open {path}: {e}");
             return ExitCode::from(2);
         }
     };
@@ -774,13 +832,13 @@ fn check(args: &[String]) -> ExitCode {
     match out {
         Some(p) => {
             if let Err(e) = std::fs::write(&p, format!("{text}\n")) {
-                eprintln!("vyges-dpl: cannot write {p}: {e}");
+                diag!("vyges-dpl: cannot write {p}: {e}");
                 return ExitCode::from(2);
             }
         }
         None => println!("{text}"),
     }
-    eprintln!("check-placement: {} cell(s), {} violation(s), status {status}",
+    summary!("check-placement: {} cell(s), {} violation(s), status {status}",
               report.cells_checked, report.failures.len());
     // Upstream errors (DPL-33) when any family has failures; the exit code is the verdict.
     match status {
