@@ -183,7 +183,6 @@ pub type Holder = (String, Option<i64>);
 /// obstructions when the master has any, its placed box otherwise. `[row][site]`.
 pub fn set_grid_cells(db: &Db, grid: &Grid) -> Result<Vec<Vec<Option<Holder>>>, String> {
     let mut cells: Vec<Vec<Option<Holder>>> = vec![vec![None; grid.row_site_count]; grid.row_count];
-    let (cx, cy) = (grid.core.0, grid.core.1);
     let paint = |cells: &mut Vec<Vec<Option<Holder>>>, (xlo, ylo, xhi, yhi): (i64, i64, i64, i64), h: &Holder| {
         for gy in ylo.max(0)..yhi.min(grid.row_count as i64) {
             for gx in xlo.max(0)..xhi.min(grid.row_site_count as i64) {
@@ -194,30 +193,43 @@ pub fn set_grid_cells(db: &Db, grid: &Grid) -> Result<Vec<Vec<Option<Holder>>>, 
     for inst in db.inst_names() {
         let master = db.inst_get_master(&inst);
         let holder: Holder = (inst.clone(), master_implant(db, &master));
-        let overlap: Vec<(i32, i32, i32, i32)> = db
-            .master_obstruction_boxes(&master)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter(|b| db.layer_get_type(&db.layer_name_by_number(b.0)).is_ok_and(|t| t == "OVERLAP"))
-            .map(|b| (b.1, b.2, b.3, b.4))
-            .collect();
-        if overlap.is_empty() {
-            let b = db.inst_bbox(&inst).map_err(|e| e.to_string())?;
-            if b.len() < 4 {
-                continue;
-            }
-            paint(&mut cells, grid.covering(b[0] - cx, b[1] - cy, b[2] - b[0], b[3] - b[1]), &holder);
-        } else {
-            // `inst->getTransform().apply(rect)`: the orientation about the ORIGIN, then the offset.
-            let orient = db.inst_get_orient(&inst);
-            let origin = (db.inst_get_origin_x(&inst), db.inst_get_origin_y(&inst));
-            for r in overlap {
-                let (x0, y0, x1, y1) = transform(&orient, origin, r);
-                paint(&mut cells, grid.covering_rect(x0 - cx, y0 - cy, x1 - cx, y1 - cy), &holder);
-            }
+        for r in cell_pixel_rects(db, grid, &inst)? {
+            paint(&mut cells, r, &holder);
         }
     }
     Ok(cells)
+}
+
+/// `Grid::visitCellPixels(cell, false, …)` — the grid rectangles `[xlo, xhi) × [ylo, yhi)` an
+/// instance's body covers: its OVERLAP-layer obstructions when the master has any (each through the
+/// instance transform), its placed box otherwise.
+pub fn cell_pixel_rects(db: &Db, grid: &Grid, inst: &str) -> Result<Vec<(i64, i64, i64, i64)>, String> {
+    let (cx, cy) = (grid.core.0, grid.core.1);
+    let master = db.inst_get_master(inst);
+    let overlap: Vec<(i32, i32, i32, i32)> = db
+        .master_obstruction_boxes(&master)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|b| db.layer_get_type(&db.layer_name_by_number(b.0)).is_ok_and(|t| t == "OVERLAP"))
+        .map(|b| (b.1, b.2, b.3, b.4))
+        .collect();
+    if overlap.is_empty() {
+        let b = db.inst_bbox(inst).map_err(|e| e.to_string())?;
+        if b.len() < 4 {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![grid.covering(b[0] - cx, b[1] - cy, b[2] - b[0], b[3] - b[1])]);
+    }
+    // `inst->getTransform().apply(rect)`: the orientation about the ORIGIN, then the offset.
+    let orient = db.inst_get_orient(inst);
+    let origin = (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst));
+    Ok(overlap
+        .into_iter()
+        .map(|r| {
+            let (x0, y0, x1, y1) = transform(&orient, origin, r);
+            grid.covering_rect(x0 - cx, y0 - cy, x1 - cx, y1 - cy)
+        })
+        .collect())
 }
 
 /// `dbTransform::apply` on a rectangle.

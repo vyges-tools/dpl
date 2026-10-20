@@ -108,6 +108,83 @@ pub struct Grid {
     site_heights: Vec<i32>,
 }
 
+/// One fixed network node, as `pointOffMacro` reads it: `Node::isBlock`, and its core-relative
+/// bounding box `(x0, y0, x1, y1)` (`getLeft`/`getBottom` plus `getWidth`/`getHeight`).
+#[derive(Debug, Clone)]
+pub struct FixedCell {
+    pub name: String,
+    pub is_block: bool,
+    pub bbox: (i32, i32, i32, i32),
+}
+
+/// `setFixedGridCells` after `initMacrosAndGrid` — which FIXED node owns each square
+/// (`pixel->cell`, LAST writer in network order), for [`Grid::point_off_macro`]. Movable cells are
+/// not painted: rsz's grid holds only what `importDb` fixed.
+#[derive(Debug, Clone, Default)]
+pub struct FixedCells {
+    owner: Vec<Vec<Option<u32>>>,
+    pub cells: Vec<FixedCell>,
+}
+
+impl FixedCells {
+    /// `importDb` then `setFixedGridCells`: the network's nodes (`createNetwork`'s order) that are
+    /// fixed — `dbInst::isFixed`, or a placed BLOCK, which `importDb` forces fixed (DPL-0404) —
+    /// each painted over its `visitCellPixels(cell, true, …)` body (padding squares only reserve).
+    pub fn build(db: &Db, grid: &Grid) -> Result<FixedCells, String> {
+        let mut f = FixedCells { owner: vec![vec![None; grid.row_site_count]; grid.row_count], cells: Vec::new() };
+        let (cx, cy) = (grid.core.0, grid.core.1);
+        for inst in crate::network::network_insts(db) {
+            let master = db.inst_get_master(&inst);
+            // `Node::isBlock`: the master type IS `BLOCK` — not `dbMaster::isBlock`, which also
+            // takes BLOCK BLACKBOX and BLOCK SOFT.
+            let is_block = db.master_get_type(&master).is_ok_and(|t| t == "BLOCK");
+            let status = db.inst_get_placement_status(&inst);
+            if is_block && matches!(status.as_str(), "NONE" | "UNPLACED" | "") {
+                return Err(format!("[ERROR DPL-0405] Macro {inst} is neither placed nor fixed. Place and fix macros before detailed placement."));
+            }
+            if !(crate::negotiate::status_is_fixed(&status) || is_block) {
+                continue;
+            }
+            let b = db.inst_bbox(&inst).map_err(|e| e.to_string())?;
+            if b.len() < 4 {
+                continue;
+            }
+            let id = f.cells.len() as u32;
+            f.cells.push(FixedCell { name: inst.clone(), is_block, bbox: (b[0] - cx, b[1] - cy, b[2] - cx, b[3] - cy) });
+            for (xlo, ylo, xhi, yhi) in crate::fillers::cell_pixel_rects(db, grid, &inst)? {
+                for gy in ylo.max(0)..yhi.min(grid.row_count as i64) {
+                    for gx in xlo.max(0)..xhi.min(grid.row_site_count as i64) {
+                        f.owner[gy as usize][gx as usize] = Some(id);
+                    }
+                }
+            }
+        }
+        Ok(f)
+    }
+
+    /// `grid_->gridPixel(x, y)->cell` — `None` off the grid (`gridPixel` → null) or unowned.
+    pub fn owner(&self, grid: &Grid, x: i64, y: i64) -> Option<&FixedCell> {
+        if x < 0 || y < 0 || x as usize >= grid.row_site_count || y as usize >= grid.row_count {
+            return None;
+        }
+        let id = (*self.owner.get(y as usize)?.get(x as usize)?)?;
+        self.cells.get(id as usize)
+    }
+
+    /// A one-block map for tests: `bbox` core-relative, painted over its grid covering.
+    pub fn one_block_for_test(grid: &Grid, bbox: (i32, i32, i32, i32)) -> FixedCells {
+        let mut f = FixedCells { owner: vec![vec![None; grid.row_site_count]; grid.row_count], cells: Vec::new() };
+        f.cells.push(FixedCell { name: "block".into(), is_block: true, bbox });
+        let (xlo, ylo, xhi, yhi) = grid.covering(bbox.0, bbox.1, bbox.2 - bbox.0, bbox.3 - bbox.1);
+        for gy in ylo.max(0)..yhi.min(grid.row_count as i64) {
+            for gx in xlo.max(0)..xhi.min(grid.row_site_count as i64) {
+                f.owner[gy as usize][gx as usize] = Some(0);
+            }
+        }
+        f
+    }
+}
+
 impl Grid {
     /// `Grid::initGrid` — allocate, mark valid from the rows, then subtract hard blockages.
     ///
@@ -403,32 +480,81 @@ impl Grid {
     /// `Opendp::legalCellPos(db_inst)` — what the resizer runs on each instance it makes or resizes
     /// under global-route parasitics, "for accurate parasitic estimation". `(x, y)` the instance's
     /// location (absolute dbu), `(w, h)` its bounding box (`getBbox`: the master's, swapped for a
-    /// quarter-turn orientation). The new location when it moved, `None` when it was already legal.
+    /// quarter-turn orientation); `fixed` what `initMacrosAndGrid` painted. The new location when it
+    /// moved, `None` when it was already legal. (The fixed-instance early return is the caller's.)
     ///
-    /// Upstream, in order: `initialLocation` (core-relative); `pointOffMacro` — ⛔ not here: it reads
-    /// the grid's BLOCK pixels, and the caller refuses a design with a block; `legalPt(cell, pt)` —
-    /// x clamped into the core then ROUNDED to a site (`divRound`), y clamped then `gridRoundY`; when
-    /// that is the initial location, nothing; else snapped again (`gridX`, `gridSnapDownY`),
-    /// `setGridLoc`, and written back as the core's corner plus the cell's left and bottom.
-    ///
-    /// ⚠️ Unlike [`Grid::legal_start`], `legalPt` does not clamp the column to the last site.
-    pub fn legal_cell_pos(&self, x: i32, y: i32, w: i32, h: i32) -> Option<(i32, i32)> {
+    /// Upstream, in order: `initialLocation` (core-relative); [`Grid::point_off_macro`];
+    /// [`Grid::legal_pt`]; when that is the initial location, nothing; else snapped again (`gridX`,
+    /// `gridSnapDownY`), `setGridLoc`, and written back as the core's corner plus the cell's left
+    /// and bottom.
+    pub fn legal_cell_pos(&self, fixed: &FixedCells, x: i32, y: i32, w: i32, h: i32) -> Option<(i32, i32)> {
         let init = (x - self.core.0, y - self.core.1);
-        // legalPt(cell, pt): move inside the core, align with a row site.
-        let max_x = (self.row_site_count as i32 * self.site_width - w).max(0);
-        let core_x = init.0.clamp(0, max_x);
-        let grid_x = (f64::from(core_x) / f64::from(self.site_width)).round() as i32;
-        let legal_x = grid_x * self.site_width;
-        let core_dy = self.core.3 - self.core.1;
-        let core_y = init.1.clamp(0, (core_dy - h).max(0));
-        let legal_y = *self.row_y.get(self.grid_round_y(core_y))?;
-        if (legal_x, legal_y) == init {
+        let legal_pt = self.point_off_macro(fixed, init, w, h)?;
+        let new_pos = self.legal_pt(legal_pt, w, h)?;
+        if new_pos == init {
             return None;
         }
         // To grid, then back: `gridX` (C++ division) and `gridSnapDownY`.
-        let gx = legal_x / self.site_width;
-        let gy = self.grid_snap_down_y(legal_y)?;
+        let gx = new_pos.0 / self.site_width;
+        let gy = self.grid_snap_down_y(new_pos.1)?;
         Some((self.core.0 + gx * self.site_width, self.core.1 + *self.row_y.get(gy)?))
+    }
+
+    /// `Opendp::pointOffMacro(cell)` — the cell's core-relative `init` moved to the nearest edge of
+    /// a BLOCK it sits on, else `init` unchanged.
+    ///
+    /// ⛔ **Only the four CORNER pixels of `gridCovering(bbox)` are read, and the "high" corners are
+    /// END indices** (`gridEndX` = `divCeil`, `gridEndY` = `lower_bound`): one past the cell, off the
+    /// grid entirely (`gridPixel` → null) at the core's top or right. The first corner, in the order
+    /// (lo, lo), (hi, lo), (lo, hi), (hi, hi), whose owner is a block decides.
+    pub fn point_off_macro(&self, fixed: &FixedCells, init: (i32, i32), w: i32, h: i32) -> Option<(i32, i32)> {
+        let sw = f64::from(self.site_width);
+        let xlo = i64::from(init.0 / self.site_width);
+        let ylo = self.grid_snap_down_y(init.1).unwrap_or(0) as i64;
+        let xhi = (f64::from(init.0 + w) / sw).ceil() as i64;
+        let yhi = self.grid_end_y_dbu(init.1 + h) as i64;
+        let block = [(xlo, ylo), (xhi, ylo), (xlo, yhi), (xhi, yhi)]
+            .into_iter()
+            .filter_map(|(gx, gy)| fixed.owner(self, gx, gy))
+            .find(|c| c.is_block);
+        match block {
+            Some(b) => self.nearest_block_edge(init, w, h, b.bbox),
+            None => Some(init),
+        }
+    }
+
+    /// `Opendp::nearestBlockEdge(cell, legal_pt, block_bbox)` — the smallest of the four distances
+    /// from the cell's edges to the block's, ties in the order left, right, below, above; the point
+    /// just outside that edge, through [`Grid::legal_pt`]. `block` is `(x0, y0, x1, y1)`.
+    pub fn nearest_block_edge(&self, pt: (i32, i32), w: i32, h: i32, block: (i32, i32, i32, i32)) -> Option<(i32, i32)> {
+        let x_min_dist = (pt.0 - block.0).abs();
+        let x_max_dist = (block.2 - (pt.0 + w)).abs();
+        let y_min_dist = (pt.1 - block.1).abs();
+        let y_max_dist = (block.3 - (pt.1 + h)).abs();
+        let min_dist = x_min_dist.min(x_max_dist).min(y_min_dist).min(y_max_dist);
+        if min_dist == x_min_dist {
+            return self.legal_pt((block.0 - w, pt.1), w, h);
+        }
+        if min_dist == x_max_dist {
+            return self.legal_pt((block.2, pt.1), w, h);
+        }
+        if min_dist == y_min_dist {
+            return self.legal_pt((pt.0, block.1 - h), w, h);
+        }
+        self.legal_pt((pt.0, block.3), w, h)
+    }
+
+    /// `Opendp::legalPt(cell, pt)` — x clamped into the core then ROUNDED to a site (`divRound`), y
+    /// clamped then `gridRoundY`. Core-relative.
+    ///
+    /// ⚠️ Unlike [`Grid::legal_start`], `legalPt` does not clamp the column to the last site.
+    pub fn legal_pt(&self, pt: (i32, i32), w: i32, h: i32) -> Option<(i32, i32)> {
+        let max_x = (self.row_site_count as i32 * self.site_width - w).max(0);
+        let core_x = pt.0.clamp(0, max_x);
+        let grid_x = (f64::from(core_x) / f64::from(self.site_width)).round() as i32;
+        let core_dy = self.core.3 - self.core.1;
+        let core_y = pt.1.clamp(0, (core_dy - h).max(0));
+        Some((grid_x * self.site_width, *self.row_y.get(self.grid_round_y(core_y))?))
     }
 
     /// `Grid::gridRoundY` — snap DOWN to a row boundary, then take the NEXT one when it is at least
@@ -1087,11 +1213,41 @@ mod legal_cell_pos_tests {
         let row_y: Vec<i32> = (0..=177).map(|k| k * 2720).collect();
         let g = super::Grid::uniform_for_test((9660, 8160, 9660 + 1044 * 460, 8160 + 177 * 2720), 460, row_y);
         let (w, h) = (3680, 2720);
-        assert_eq!(g.legal_cell_pos(41193, 38868, w, h), Some((41400, 38080)));
-        assert_eq!(g.legal_cell_pos(90731, 41510, w, h), Some((90620, 40800)));
+        let none = super::FixedCells::default();
+        assert_eq!(g.legal_cell_pos(&none, 41193, 38868, w, h), Some((41400, 38080)));
+        assert_eq!(g.legal_cell_pos(&none, 90731, 41510, w, h), Some((90620, 40800)));
         // Already on a site and a row: untouched.
-        assert_eq!(g.legal_cell_pos(41400, 38080, w, h), None);
+        assert_eq!(g.legal_cell_pos(&none, 41400, 38080, w, h), None);
         // Left of the core: clamped to its first site.
-        assert_eq!(g.legal_cell_pos(100, 38080, w, h), Some((9660, 38080)));
+        assert_eq!(g.legal_cell_pos(&none, 100, 38080, w, h), Some((9660, 38080)));
+    }
+    /// Rule (`Opendp::pointOffMacro` → `nearestBlockEdge`): a cell whose `gridCovering` corner pixel
+    /// is owned by a BLOCK moves just outside the block edge nearest to it, ties in the order left,
+    /// right, below, above, then `legalPt`. Block (4600, 5440)-(9200, 10880) on 460 x 2720 sites.
+    #[test]
+    fn a_cell_on_a_block_moves_to_its_nearest_edge() {
+        let row_y: Vec<i32> = (0..=10).map(|k| k * 2720).collect();
+        let g = super::Grid::uniform_for_test((0, 0, 40 * 460, 10 * 2720), 460, row_y);
+        let f = super::FixedCells::one_block_for_test(&g, (4600, 5440, 9200, 10880));
+        let (w, h) = (920, 2720);
+        // On the block's bottom edge, 100 in: below (distance 0) beats left (100).
+        assert_eq!(g.legal_cell_pos(&f, 4700, 5440, w, h), Some((4600, 2720)));
+        // In its bottom-left corner: left and below both 0 — left first.
+        assert_eq!(g.legal_cell_pos(&f, 4600, 5440, w, h), Some((3680, 5440)));
+        // Off the block entirely: only legalPt.
+        assert_eq!(g.legal_cell_pos(&f, 13800, 0, w, h), None);
+    }
+
+    /// Rule (`pointOffMacro` reads the "high" corners at END indices — `gridEndX` = `divCeil`): a cell
+    /// that only ABUTS a block's left edge reads the block's first column through its (hi, lo)
+    /// corner and is moved off it; here below, the nearest edge (y_min 0).
+    #[test]
+    fn a_cell_abutting_a_block_reads_it_through_its_end_corner() {
+        let row_y: Vec<i32> = (0..=10).map(|k| k * 2720).collect();
+        let g = super::Grid::uniform_for_test((0, 0, 40 * 460, 10 * 2720), 460, row_y);
+        let f = super::FixedCells::one_block_for_test(&g, (4600, 5440, 9200, 10880));
+        assert_eq!(g.legal_cell_pos(&f, 3680, 5440, 920, 2720), Some((3680, 2720)));
+        // One site further left, the end corner is clear: untouched.
+        assert_eq!(g.legal_cell_pos(&f, 3220, 5440, 920, 2720), None);
     }
 }
