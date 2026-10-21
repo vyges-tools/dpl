@@ -118,70 +118,146 @@ pub fn improve(s: &mut Setup, opts: &Options) -> Result<Report, String> {
     }
     s.run_checks();
     if s.rt.disallow_gaps {
-        // ⬜ The REPAIR (`fixOneSiteGapViolations`) is not built: it moves nothing on the only
-        // upstream case that reaches it (`gcd_no_one_site_gaps-opt`, final DEF identical without
-        // it), so a transcription would have no witness. What IS built is the detection, so the
-        // repair is named as not done exactly when a design has a gap it would have acted on.
-        let v = one_site_gap_violations(s).len();
-        if v > 0 {
-            rep.not_done.push(format!(
-                "one-site-gap repair (fixOneSiteGapViolations): {v} violation(s) left unrepaired"));
+        // After the checks: the move limit raised to 10000 for the repair, restored after; one
+        // DPL-0323 per segment still holding a violation.
+        // ⚠️ The raise is UNWITNESSED: a mutant keeping the limit still matches the one-site-gap
+        // variant (aes, ibex, gcd), where no repair shifts more cells than the default allows.
+        let limit = s.rt.move_limit;
+        s.rt.move_limit = 10000;
+        let left = one_site_gap_violations_per_segment(s, true);
+        for (seg, ids) in left.iter().enumerate() {
+            if !ids.is_empty() {
+                s.log.push(format!("[WARNING DPL-0323] One site gap violation in segment {seg} nodes: {}",
+                                   gap_id_list(ids)));
+            }
         }
+        s.rt.move_limit = limit;
     }
     rep.hpwl_after = s.total_hpwl();
     Ok(rep)
 }
 
-/// `getOneSiteGapViolationsPerSegment(v, false)` — `(segment, node id)` per cell it would record
-/// (or, with `fix_violations`, try to fix).
-///
-/// Per segment of two or more cells (re-sorted by centre, as `resortSegment` leaves it): a cell
-/// whose left edge is exactly one site (ROW 0's site width) from the previous distinct right edge,
-/// and whose Y span overlaps a cell at that edge — spans CLOSED at both ends, so abutting rows
-/// overlap; or a cell with a blockage one site beyond either edge and none at the edge itself.
-/// ⚠️ `lastNode` starts as the segment's first cell, so the first cell never compares.
+/// `getOneSiteGapViolationsPerSegment(v, false)` — `(segment, node id)` per cell it records.
 pub(crate) fn one_site_gap_violations(s: &mut Setup) -> Vec<(usize, usize)> {
-    s.resort_segments();
-    let one_site = s.arch.rows[0].site_width;
+    let per = one_site_gap_violations_per_segment(s, false);
+    per.into_iter().enumerate().flat_map(|(seg, ids)| ids.into_iter().map(move |id| (seg, id))).collect()
+}
+
+/// `getOneSiteGapViolationsPerSegment` — per segment (one list more than there are segments), the
+/// node ids it records; with `fix`, a cell is recorded only when `fixOneSiteGapViolations` fails.
+///
+/// Per segment of two or more cells, re-sorted by centre (`resortSegment`) when it is reached: a
+/// cell whose left edge is exactly one site (ROW 0's site width) from the previous distinct right
+/// edge, and whose Y span overlaps a cell at that edge — spans CLOSED at both ends, so abutting
+/// rows overlap; or a cell with a blockage one site beyond either edge and none at the edge itself.
+/// ⚠️ `lastNode` starts as the segment's first cell, so the first cell never compares.
+/// ⚠️ The scan is an INDEX loop over the LIVE segment, its length re-read every pass: a repair
+/// moves cells out of and back into the segment (`addToMoveList`), and the scan goes on over the
+/// order that leaves.
+pub(crate) fn one_site_gap_violations_per_segment(s: &mut Setup, fix: bool) -> Vec<Vec<usize>> {
     let overlap = |b1: i32, t1: i32, b2: i32, t2: i32| (b2 <= b1 && b1 <= t2) || (b1 <= b2 && b2 <= t1);
-    let mut out = Vec::new();
+    let mut out = vec![Vec::new(); s.segments.len() + 1];
     for seg in 0..s.segments.len() {
-        let cells = &s.cells_in_seg[seg];
-        if cells.len() < 2 {
+        if s.cells_in_seg[seg].len() < 2 {
             continue;
         }
-        let mut last = cells[0];
-        let mut at_last_x = vec![cells[0]];
-        for &nd in cells {
-            let n = &s.nodes[nd];
-            if n.right() != s.nodes[last].right() {
-                if (n.left - s.nodes[last].right()).abs() == one_site {
+        s.resort_segment(seg);
+        let one_site = s.arch.rows[0].site_width;
+        let mut last = s.cells_in_seg[seg][0];
+        let mut at_last_x = vec![last];
+        let mut i = 0;
+        while i < s.cells_in_seg[seg].len() {
+            let nd = s.cells_in_seg[seg][i];
+            if s.nodes[nd].right() != s.nodes[last].right() {
+                if (s.nodes[nd].left - s.nodes[last].right()).abs() == one_site {
                     for &c in &at_last_x {
-                        if !overlap(s.nodes[c].bottom, s.nodes[c].top(), n.bottom, n.top()) {
+                        let (n, cn) = (&s.nodes[nd], &s.nodes[c]);
+                        if !overlap(cn.bottom, cn.top(), n.bottom, n.top()) {
                             continue;
                         }
-                        out.push((seg, n.id));
+                        let id = n.id;
                         // A fixed/terminal cell (DPL-0339) or a multi-height one (DPL-0340) is
                         // recorded and the scan CONTINUES — once per overlapping cell; the fix
                         // is tried on the first overlap only.
-                        if !(n.kind == Kind::Terminal || n.fixed || s.arch.height_in_rows(n) != 1) {
-                            break;
+                        if n.kind == Kind::Terminal || n.fixed {
+                            if fix {
+                                s.log.push(format!("[WARNING DPL-0339] One-site gap violation detected \
+                                    with a Fixed/Terminal cell {id}"));
+                            }
+                            out[seg].push(id);
+                            continue;
                         }
+                        if s.arch.height_in_rows(n) != 1 {
+                            if fix {
+                                s.log.push(format!("[WARNING DPL-0340] One-site gap violation detected \
+                                    with a multi-height cell {id}"));
+                            }
+                            out[seg].push(id);
+                            continue;
+                        }
+                        if !fix || !fix_one_site_gap_violations(s, c, one_site, seg, nd) {
+                            out[seg].push(id);
+                        }
+                        break;
                     }
                 }
                 at_last_x.clear();
             }
+            let n = &s.nodes[nd];
+            let (l, r) = (n.left, n.right());
             let blocked = |x| is_inside_a_blockage(s, nd, x);
-            if (blocked(n.left - one_site) && !blocked(n.left))
-                || (blocked(n.right() + one_site) && !blocked(n.right()))
-            {
-                out.push((seg, n.id));
+            if (blocked(l - one_site) && !blocked(l)) || (blocked(r + one_site) && !blocked(r)) {
+                // ⚠️ upstream passes the violating cell as BOTH the cell and the violator here.
+                // ⚠️ This repair is UNWITNESSED: recording the cell without trying it still
+                // matches the variant.
+                if !fix || !fix_one_site_gap_violations(s, nd, one_site, seg, nd) {
+                    out[seg].push(s.nodes[nd].id);
+                }
             }
             at_last_x.push(nd);
             last = nd;
+            i += 1;
         }
     }
     out
+}
+
+/// DPL-0323's node list: `[` then each id followed by `]` when it EQUALS the last id, else `,` —
+/// a test of the value, not the position, so an id repeated earlier in the list closes it early.
+fn gap_id_list(ids: &[usize]) -> String {
+    let last = ids.last().copied();
+    let mut l = String::from("[");
+    for &id in ids {
+        l.push_str(&format!("{id}{}", if Some(id) == last { ']' } else { ',' }));
+    }
+    l
+}
+
+/// `fixOneSiteGapViolations` — shift the violator and everything to its left so its RIGHT edge
+/// lands one site left of where it was; failing that, shift from `cell` rightward as if a cell were
+/// inserted two sites right of `cell`'s left edge. Each attempt must pass `verifyMove` (which undoes
+/// on failure) and is accepted at once; a failed helper is undone before the next try.
+///
+/// Witness: the one-site-gap variant (`gcd`, `aes`, `ibex` with no one-site master) — 1, 29 and
+/// 51 cells moved, all identical; without the shift-left try, all three differ. ⚠️ The shift-RIGHT
+/// fallback and its `2 * gap` insert point are UNWITNESSED: mutants without them still match, as
+/// no shift-left there fails.
+fn fix_one_site_gap_violations(s: &mut Setup, cell: usize, gap: i32, seg: usize, viol: usize) -> bool {
+    let xj = s.nodes[viol].right() - gap;
+    if s.shift_left_helper(viol, xj, seg, viol) && s.verify_move() {
+        s.accept_move();
+        s.clear_move_list();
+        return true;
+    }
+    s.reject_move();
+    let xj = s.nodes[cell].left + 2 * gap;
+    if s.shift_right_helper(cell, xj, seg, viol) && s.verify_move() {
+        s.accept_move();
+        s.clear_move_list();
+        return true;
+    }
+    s.reject_move();
+    false
 }
 
 /// `isInsideABlockage` — a blockage covering `x` (ends inclusive) in the rows the cell spans.
@@ -1478,4 +1554,19 @@ pub fn write_back(s: &Setup, db: &mut vyges_opendb::Db) -> Result<usize, String>
         }
     }
     Ok(moved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gap_id_list;
+
+    /// DPL-0323 closes the list on every id EQUAL to the last one: upstream indexes `",]"` with
+    /// `nodeId == violations.back()`, so a cell recorded twice (once per overlapping neighbour
+    /// with a fixed or multi-height cell) prints `]` mid-list.
+    #[test]
+    fn the_gap_list_closes_on_the_last_value_not_the_last_position() {
+        assert_eq!(gap_id_list(&[7]), "[7]");
+        assert_eq!(gap_id_list(&[3, 9, 4]), "[3,9,4]");
+        assert_eq!(gap_id_list(&[4, 9, 4]), "[4]9,4]");
+    }
 }

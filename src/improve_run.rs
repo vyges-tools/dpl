@@ -385,10 +385,15 @@ impl Setup {
     /// `resortSegment` — a STABLE sort by centre, utilization recomputed.
     pub(crate) fn resort_segments(&mut self) {
         for s in 0..self.segments.len() {
-            let nodes = &self.nodes;
-            self.cells_in_seg[s].sort_by_key(|&c| nodes[c].center_x());
-            self.rt.seg_util[s] = self.cells_in_seg[s].iter().map(|&c| self.nodes[c].width as i64).sum();
+            self.resort_segment(s);
         }
+    }
+
+    /// `resortSegment` for one segment.
+    pub(crate) fn resort_segment(&mut self, s: usize) {
+        let nodes = &self.nodes;
+        self.cells_in_seg[s].sort_by_key(|&c| nodes[c].center_x());
+        self.rt.seg_util[s] = self.cells_in_seg[s].iter().map(|&c| self.nodes[c].width as i64).sum();
     }
 
     /// `alignPos` — the site-aligned left edge nearest `xi` with the cell inside `[xl, xr]`, using
@@ -434,7 +439,7 @@ impl Setup {
         g.site_orient_at((x / self.sw()) as i64, gy as i64, &self.rt.sites[nd]).is_some()
     }
 
-    fn clear_move_list(&mut self) {
+    pub(crate) fn clear_move_list(&mut self) {
         self.rt.journal.clear();
         self.rt.affected_nodes.clear();
         self.rt.affected_edges.clear();
@@ -519,7 +524,7 @@ impl Setup {
     }
 
     /// `verifyMove` — every affected node DRC-clean, else the move is rejected.
-    fn verify_move(&mut self) -> bool {
+    pub(crate) fn verify_move(&mut self) -> bool {
         let nodes: Vec<usize> = self.rt.affected_nodes.iter().copied().collect();
         for nd in nodes {
             if self.has_placement_violation(nd) {
@@ -757,7 +762,7 @@ impl Setup {
 
     /// `shiftRightHelper`. ⛔ Upstream computes the site as `(xj - originX / siteSpacing)` —
     /// DIVISION FIRST — and the "aligned" position from it; transcribed as written.
-    fn shift_right_helper(&mut self, ndi: usize, mut xj: i32, sj: usize, ndr: usize) -> bool {
+    pub(crate) fn shift_right_helper(&mut self, ndi: usize, mut xj: i32, sj: usize, ndr: usize) -> bool {
         let Some(mut ix) = self.cells_in_seg[sj].iter().position(|&c| c == ndr) else { return false };
         let n = self.cells_in_seg[sj].len() - 1;
         let row = &self.arch.rows[self.segments[sj].row];
@@ -797,7 +802,7 @@ impl Setup {
     }
 
     /// `shiftLeftHelper`, with the same division-first site computation.
-    fn shift_left_helper(&mut self, ndi: usize, mut xj: i32, sj: usize, ndl: usize) -> bool {
+    pub(crate) fn shift_left_helper(&mut self, ndi: usize, mut xj: i32, sj: usize, ndl: usize) -> bool {
         let Some(mut ix) = self.cells_in_seg[sj].iter().position(|&c| c == ndl) else { return false };
         let row = &self.arch.rows[self.segments[sj].row];
         let (origin, sp) = (row.left, row.site_spacing);
