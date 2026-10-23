@@ -7,14 +7,14 @@ vyges physical dpl check-placement    design.odb
 vyges physical dpl detailed-placement design.odb --out-odb out.odb
 ```
 
-`detailed-placement` takes upstream's own tunables — `--max-displacement`,
+`detailed-placement` takes the reference's own tunables — `--max-displacement`,
 `--site-search-window`, `--row-search-window`, `--drc-penalty`,
-`--disable-window-extension`, `--use-diamond-legalizer` — with upstream's defaults. Run
+`--disable-window-extension`, `--use-diamond-legalizer` — with the reference's defaults. Run
 `--help` for the full list, and `--describe` for the machine-readable contract.
 
-ℹ️ Two of upstream's options are deliberately absent. `-disallow_one_site_gaps` is **deprecated
+ℹ️ Two of the reference's options are deliberately absent. `-disallow_one_site_gaps` is **deprecated
 there** (it warns DPL-3 and ignores the flag, because the setting is derived from
-`hasOneSiteMaster()`), so accepting it would promise a control that cannot change the answer;
+whether the library has a one-site master), so accepting it would promise a control that cannot change the answer;
 this engine refuses it with that explanation rather than accepting it silently. `-incremental`
 is unimplemented and named in `not_done`.
 
@@ -27,10 +27,10 @@ complete one, so those fields are emitted whether or not they are empty.
 
 ### Legalization
 
-Two legalizers, and **the default is the one upstream defaults to**: negotiated congestion, in
+Two legalizers, and **the default is the one the reference defaults to**: negotiated congestion, in
 which cells are allowed to overlap, contested sites accumulate a history cost, and each iteration
 rips up and re-places until nobody overlaps. `--use-diamond-legalizer` selects the other — a
-diamond search outward from each cell's own position — mirroring upstream's flag of the same name.
+diamond search outward from each cell's own position — mirroring the reference's flag of the same name.
 
 ⚠️ The two produce **different placements**, so the report says which one ran. Comparing one
 legalizer's output against the other's expected result measures nothing.
@@ -40,11 +40,11 @@ padded CORE classes only) is modelled on the negotiation path: `--padding-global
 `--padding-master M L R`, `--padding-inst I L R`, in sites. Padding lives in opendp's memory, not
 the database, so a caller that set it must pass it. With the diamond legalizer it is refused.
 
-⬜ Not implemented, and named in `not_done` on every run: groups and regions, incremental placement, and two of `countDRCViolations`' four terms — `checkEdgeSpacing`
-(needs each master's LEF58 cell-edge list) and `checkBlockedLayers`.
+⬜ Not implemented, and named in `not_done` on every run: groups and regions, incremental placement, and two of the legalizer's four DRC terms — edge spacing
+(needs each master's LEF58 cell-edge list) and blocked layers.
 
 ⚠️ **Nothing in the comparable corpus exercises those two DRC terms**, so their absence is
-invisible to the score rather than shown to be harmless. `checkPadding` was in exactly that
+invisible to the score rather than shown to be harmless. The padding term was in exactly that
 position until it was built, and wiring it moved `aes` by 5,700 cells.
 
 Every run also names, in `filtered_out`, each instance the model filter excluded — a filter that
@@ -52,7 +52,7 @@ drops instances silently is indistinguishable from a design that has none of the
 
 ### Checking
 
-**Seven of upstream's nine check families are evaluated:** site alignment, placed, overlap, in
+**Seven of the reference's nine check families are evaluated:** site alignment, placed, overlap, in
 rows, padding, blocked layers and one-site gaps.
 
 | family | status |
@@ -60,42 +60,41 @@ rows, padding, blocked layers and one-site gaps.
 | site alignment · placed · overlap · in rows | ✅ evaluated |
 | padding | ✅ evaluated by `check-placement` with **zero padding** — the checker takes no padding values yet (the legalizer does), so only class-pair conflicts are caught |
 | blocked layers | ✅ evaluated where the design has a vertical M2/M3 special wire; where it has none the mask is empty and a pass would be vacuous, so it is reported as unchecked instead |
-| one-site gaps | ✅ evaluated when the technology has no one-site master — the condition upstream derives it from, not a user option |
+| one-site gaps | ✅ evaluated when the technology has no one-site master — the condition the reference derives it from, not a user option |
 | region placement | ⬜ needs a region model |
 | edge spacing | ⬜ the LEF58 cell-edge rule is implemented and tested; what is missing is each master's edge list |
 
 🔑 The checker came first on purpose. It is the oracle — it needs no legalizer to be correct in
-order to be useful — and upstream's own suite leans on it harder: **77 of 92 `.tcl` tests call
+order to be useful — and the reference suite leans on it harder: **77 of 92 tests call
 `check_placement`, 68 call `detailed_placement`**.
 
 ## Status
 
 At pin `27288f5c90265ae5296b2f5a9fa6e8714fa191ad` (2026-10-12), `detailed_placement` matches the reference on
-76 of 78 comparable cases and `check-placement` agrees on 77 of 78; the cases that differ are new upstream cases
+76 of 78 comparable cases and `check-placement` agrees on 77 of 78; the cases that differ are new reference cases
 for pins under power-via-stack metal (`blocked_via_layers`, `blocked_via_pins`), which the blocked-layers rule
 does not yet evaluate.
 
 At pin `da9f29f18b6487825aa880597176e0fa97110b31` (2026-09-22), with padding modelled:
 **46 of 46 comparable cases match** the reference component for component, with filler
 placement (`filler-placement`) scored on eight of them — `obstruction1` alone is 19,768 components —
-and the sweep trace (upstream's `negotiationIter` debug line) identical for the whole run on
+and the sweep trace (the reference's per-iteration debug line) identical for the whole run on
 `cell_on_block2` (16,176 lines), `obstruction2` (248) and `edge_spacing`, among others.
 `edge_spacing` needed LEF58 cell-edge spacing in the legalizer's DRC term: each master's edges
-(`Network::addMaster`) and the technology's table, read through new `vyges-opendb` accessors, and
-`checkEdgeSpacing` transcribed — with `Rect::overlaps` STRICT, as odb defines it, so edges that
-meet only at a corner are not compared.
+and the technology's table, read through new `vyges-opendb` accessors, with rectangle overlap
+STRICT, as odb defines it, so edges that meet only at a corner are not compared.
 
 The last three defects, each found by printing every candidate of the first diverging
-`findBestLocation` call on both sides (`VYGES_DPL_CELL` / `VYGES_DPL_ITER`, and the reference
-patch `dpl-candidate-trace.py`):
+location search on both sides (`VYGES_DPL_CELL` / `VYGES_DPL_ITER`, and an instrumented
+reference run):
 
-- the search window was built from the raw base site window, not `effectiveSiteWindow(cell)` =
+- the search window was built from the raw base site window, not the effective site window =
   `max(base, cell width)` (`cell_on_block2`);
-- the stall recovery's `canBePlaced` read negotiation CAPACITY where upstream reads the DPL
-  grid's `is_valid` — they differ under a fixed cell `initFromDb` clamped, where the negotiation
+- the stall recovery's placement test read negotiation CAPACITY where the reference reads the DPL
+  grid's validity — they differ under a fixed cell clamped at load, where the negotiation
   grid is blockaded from the clamped x but the DPL pixels carry the macro at its real position
-  (`obstruction2`: 0 of 31 stuck cells recovered, upstream 31);
-- `sortByNegotiationOrder` sorts the run's active list IN PLACE, and the recovery visits cells in
+  (`obstruction2`: 0 of 31 stuck cells recovered, reference 31);
+- the negotiation-order sort reorders the run's active list IN PLACE, and the recovery visits cells in
   that order; ours sorted a private copy (`obstruction2`).
 
 The earlier statement, kept for its history:
@@ -103,19 +102,19 @@ The earlier statement, kept for its history:
 ✅ **Legalization matches the reference on every comparable case in its own regression suite** —
 **28 of 28**, at pin `7d490b8ecd357199c0c0e9f3e32becd5eb507c34`.
 
-🔑 **The agreement is SWEEP-LEVEL, not final-placement only.** Upstream's own per-iteration debug
+🔑 **The agreement is SWEEP-LEVEL, not final-placement only.** The reference's own per-iteration debug
 trace and this engine's match line for line — same cell, same order, same chosen position, every
 iteration — on `simple05`, `simple07`, `gcd` (574 lines) and `hybrid_cells`.
 
 ℹ️ **It read 18 of 28 when the pin first moved** from `945a9f48dc6e5cc91d865daa92c45a1094cb682c`,
-because upstream reworked the negotiation legalizer's initial snapping across seven commits and
+because the reference reworked the negotiation legalizer's initial snapping across seven commits and
 refreshed 24 of its own goldens. Four mechanisms recovered it:
 
 | mechanism | what it changed |
 | --- | --- |
-| `Grid::gridRoundX` | the initial x **rounds** to the nearest site rather than truncating |
-| `displacementInSites` / `rowDispInSites` | displacement is **site widths on both axes**, so a row jump is no longer priced as one step — and the search wavefront reorders with it |
-| `initialSnap()`'s diamond search | replaces a four-direction scan that could not see a diagonal |
+| initial x snap | the initial x **rounds** to the nearest site rather than truncating |
+| displacement units | displacement is **site widths on both axes**, so a row jump is no longer priced as one step — and the search wavefront reorders with it |
+| the initial snap's diamond search | replaces a four-direction scan that could not see a diagonal |
 | **the snap runs as its own pass** | after every fixed cell is blockaded, testing grid **capacity** rather than merely whether a site exists |
 
 ⚠️ **The last one is a CALL SEQUENCE fix, not a logic one** — the function was right and was being
@@ -130,39 +129,39 @@ The three large designs, at the current pin:
 | `gcd` | 549 | identical |
 | the other 25 cases | — | identical |
 
-⚠️ **And the denominator is short.** Upstream ships **69** `.tcl` cases calling
+⚠️ **And the denominator is short.** The reference suite ships **69** cases calling
 `detailed_placement`, not 63: five (`report_failures`, `fragmented_row03`, `pad02`, `fillers8`,
 `obstruction2`) wrap it as `catch { detailed_placement }`, so the harness's command filter does not
 see them and they are scored by nothing. All five are error-path cases.
 
-🔑 **The agreement is sweep-level, not final-placement only.** Upstream's own per-iteration debug
+🔑 **The agreement is sweep-level, not final-placement only.** The reference's own per-iteration debug
 trace and this engine's match line for line — same cell, same order, same chosen position, every
 iteration. A matching output can be coincidence; a matching decision sequence is the algorithm.
 
-⛔ **That is a claim about what this corpus asks, not about every design.** 35 of upstream's 63
+⛔ **That is a claim about what this corpus asks, not about every design.** 35 of the reference's 63
 `detailed_placement` cases are outside it and are not scored at all: 12 ship no golden, 8 need
 filler placement, 7 declare regions or groups, 7 need placement padding values, 1 needs both.
 
-⚠️ **Every score is scoped to one upstream commit.** A score quoted without its pin says nothing:
+⚠️ **Every score is scoped to one reference commit.** A score quoted without its pin says nothing:
 the reference moves.
 
 ## Correctness
 
-Correlated against OpenROAD at pin `945a9f48dc6e5cc91d865daa92c45a1094cb682c`, **in both
+Correlated against the reference at pin `945a9f48dc6e5cc91d865daa92c45a1094cb682c`, **in both
 directions** — a checker that cannot fail proves nothing:
 
 | design | reference | this engine |
 | --- | --- | --- |
-| `aes.defok` (legal) | clean | 21,340 cells, **0 violations** |
-| `cell_on_block1.def` (illegal) | *"Site aligned check failed (4)"* | **4** site-align failures |
+| `aes` (legal) | clean | 21,340 cells, **0 violations** |
+| `cell_on_block1` (illegal) | *"Site aligned check failed (4)"* | **4** site-align failures |
 
 Four behaviours that are easy to get wrong and are pinned as tests at their sites:
 
-- **Site alignment is core-relative.** Upstream compares `cell->getLeft() % siteWidth`, and
-  `getLeft()` is relative to `core_.xMin()`. Read as an absolute coordinate it reports every cell
+- **Site alignment is core-relative.** The reference measures a cell's x offset modulo the
+  site width relative to the core's lower-left corner. Read as an absolute coordinate it reports every cell
   of a clean design as misaligned — measured, 21,340 of 21,340.
 - **A site-alignment failure removes the cell from the overlap comparison entirely.** That is a
-  side effect of upstream's `continue`, not a separate rule: `checkOverlap` is what paints a cell
+  side effect of the reference's early exit, not a separate rule: the overlap check is what paints a cell
   into its pixels, so a skipped cell is never there to collide with.
 - **A cell's height in ROWS comes from its master, not from where the cell currently sits.** A
   cell resting a few database units above its row covers two row bands; it is still a
@@ -173,15 +172,15 @@ Four behaviours that are easy to get wrong and are pinned as tests at their site
   test that stops before the final footprint loop calls a cell inside a blockage perfectly legal.
 
 ℹ️ The overlap **acceleration** differs deliberately — a rectangle sweep here, a pixel walk
-upstream. The predicate is identical and the failing set matches; which partner is reported can
-differ, because upstream names whichever cell already owns the pixel.
+in the reference. The predicate is identical and the failing set matches; which partner is reported can
+differ, because the reference names whichever cell already owns the pixel.
 
 ## Status
 
 `--describe` reports `maturity: partial`, and a test fails if that word is left behind when the
 unimplemented families listed above are filled in.
 
-⚠️ **Correlation against upstream's corpus is ongoing and the engine is not yet a drop-in
+⚠️ **Correlation against the reference corpus is ongoing and the engine is not yet a drop-in
 replacement.** The scope section above is the honest boundary; `not_done`, `not_checked` and
 `limitations` in the run output are the machine-readable version of it, and they are what to trust
 over any prose here.
