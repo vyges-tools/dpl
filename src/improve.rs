@@ -363,7 +363,7 @@ pub struct Setup {
     /// `DPL-0310` movement, and whether the snap or shift moved anything (`DPL-0200`).
     pub movement: (i64, i64),
     pub displaced: bool,
-    pub log: Vec<String>,
+    pub log: vyges_events::logger::Logger,
     pub rt: crate::improve_run::Runtime,
 }
 
@@ -403,7 +403,7 @@ pub fn setup_with(db: &Db, padding: &crate::negotiate::Padding, seed: u32, max_d
         arch, nodes, fixed: Vec::new(), single: Vec::new(), multi: Vec::new(), wide: Vec::new(),
         blockages: Vec::new(), segments: Vec::new(), segs_in_row: Vec::new(),
         cells_in_seg: Vec::new(), cell_segs: Vec::new(), checks: Checks::default(),
-        movement: (0, 0), displaced: false, log: Vec::new(), rt,
+        movement: (0, 0), displaced: false, log: vyges_events::logger::Logger::new(), rt,
     };
     s.cell_segs = vec![Vec::new(); s.nodes.len()];
     // The node orients, then `initGrid` + `setFixedGridCells`, then the manager's constructor.
@@ -412,13 +412,13 @@ pub fn setup_with(db: &Db, padding: &crate::negotiate::Padding, seed: u32, max_d
     // The manager's constructor (`limit` both ways), `setSeed`, `setMaxDisplacement`: a non-zero
     // request is in ROW-0 HEIGHTS on BOTH axes — upstream multiplies x by the row height too.
     let limit = (s.arch.max_x - s.arch.min_x).max(s.arch.max_y - s.arch.min_y) << 1;
-    s.log.push(format!("[INFO DPL-0401] Setting random seed to {seed}."));
+    s.log.info("DPL", 401, format!("Setting random seed to {seed}."));
     s.rt.rng = crate::improve_run::Mt19937::new(seed);
     let h = s.arch.rows[0].height;
     let dx = if max_disp.0 != 0 { max_disp.0 * h } else { limit }.min(limit);
     let dy = if max_disp.1 != 0 { max_disp.1 * h } else { limit }.min(limit);
     s.rt.max_disp = (dx, dy);
-    s.log.push(format!("[INFO DPL-0402] Setting maximum displacement {} {} to {dx} {dy} units.",
+    s.log.info("DPL", 402, format!("Setting maximum displacement {} {} to {dx} {dy} units.",
                        max_disp.0, max_disp.1));
 
     // `ShiftLegalizer::legalize`.
@@ -445,7 +445,7 @@ impl Setup {
     /// `collectFixedCells` — every fixed node: instances, terminals and fillers alike.
     fn collect_fixed_cells(&mut self) {
         self.fixed = self.nodes.iter().filter(|n| n.fixed).map(|n| n.id).collect();
-        self.log.push(format!("[INFO DPL-0320] Collected {} fixed cells.", self.fixed.len()));
+        self.log.info("DPL", 320, format!("Collected {} fixed cells.", self.fixed.len()));
     }
 
     /// `collectSingleHeightCells`.
@@ -454,7 +454,7 @@ impl Setup {
         self.single = self.nodes.iter()
             .filter(|n| n.kind != Kind::Terminal && !n.fixed && arch.height_in_rows(n) == 1)
             .map(|n| n.id).collect();
-        self.log.push(format!("[INFO DPL-0318] Collected {} single height cells.", self.single.len()));
+        self.log.info("DPL", 318, format!("Collected {} single height cells.", self.single.len()));
     }
 
     /// `collectMultiHeightCells` — by rows spanned; the matrix is at least 2 long.
@@ -472,8 +472,8 @@ impl Setup {
         }
         for (i, m) in self.multi.iter().enumerate() {
             if !m.is_empty() {
-                self.log.push(format!(
-                    "[INFO DPL-0319] Collected {} multi-height cells spanning {} rows.", m.len(), i));
+                self.log.info("DPL", 319, format!(
+                    "Collected {} multi-height cells spanning {} rows.", m.len(), i));
             }
         }
     }
@@ -489,7 +489,7 @@ impl Setup {
                 }
             }
         }
-        self.log.push(format!("[INFO DPL-0321] Collected {} wide cells.", self.wide.len()));
+        self.log.info("DPL", 321, format!("Collected {} wide cells.", self.wide.len()));
     }
 
     /// `findBlockages(false)` — fixed non-terminal nodes (padded by `getCellSpacing` with no
@@ -558,7 +558,7 @@ impl Setup {
     /// snapped to sites.
     fn find_segments(&mut self, groups: &[crate::regions::Group], core: (i32, i32, i32, i32)) {
         let a = &self.arch;
-        self.log.push(format!("[INFO DPL-0322] Image ({}, {}) - ({}, {})",
+        self.log.info("DPL", 322, format!("Image ({}, {}) - ({}, {})",
             a.min_x + core.0, a.min_y + core.1, a.max_x + core.0, a.max_y + core.1));
         let mut segs: Vec<Segment> = Vec::new();
         let mut in_row: Vec<Vec<usize>> = vec![Vec::new(); a.rows.len()];
@@ -893,8 +893,8 @@ impl Setup {
                     self.paint_in_grid(nd);
                 }
             }
-            self.log.push(format!(
-                "[INFO DPL-0310] Assigned {} cells into segments.  Movement in X-direction is {:.6}, movement in Y-direction is {:.6}.",
+            self.log.info("DPL", 310, format!(
+                "Assigned {} cells into segments.  Movement in X-direction is {:.6}, movement in Y-direction is {:.6}.",
                 n_assigned, mx as f64, my as f64));
             self.movement.0 += mx;
             self.movement.1 += my;
@@ -1037,7 +1037,7 @@ impl Setup {
         for (s, seg) in self.segments.iter().enumerate() {
             wrong += self.cells_in_seg[s].iter().filter(|&&c| self.nodes[c].group != seg.reg).count();
         }
-        self.log.push(format!("[INFO DPL-0313] Found {wrong} cells in wrong regions."));
+        self.log.info("DPL", 313, format!("Found {wrong} cells in wrong regions."));
 
         // `checkRowAlignment`.
         let mut row_err = 0;
@@ -1052,7 +1052,7 @@ impl Setup {
                 row_err += 1;
             }
         }
-        self.log.push(format!("[INFO DPL-0315] Found {row_err} row alignment problems."));
+        self.log.info("DPL", 315, format!("Found {row_err} row alignment problems."));
 
         // `checkSiteAlignment` — only cells in segments.
         let mut site_err = 0;
@@ -1076,7 +1076,7 @@ impl Setup {
                 }
             }
         }
-        self.log.push(format!("[INFO DPL-0314] Found {site_err} site alignment problems."));
+        self.log.info("DPL", 314, format!("Found {site_err} site alignment problems."));
 
         // `checkOverlapInSegments` — adjacent cells by centre, and cells outside the segment.
         let mut overlaps = 0;
@@ -1094,7 +1094,7 @@ impl Setup {
                 }
             }
         }
-        self.log.push(format!("[INFO DPL-0311] Found {overlaps} overlaps between adjacent cells."));
+        self.log.info("DPL", 311, format!("Found {overlaps} overlaps between adjacent cells."));
 
         // `checkEdgeSpacingInSegments` — `checkDRC` on the LEFT cell of every adjacent pair (the
         // last cell of a segment is never checked), and the padding gap.
@@ -1114,8 +1114,8 @@ impl Setup {
                 }
             }
         }
-        self.log.push(format!(
-            "[INFO DPL-0312] Found {err_n} edge spacing violations and {err_p} padding violations."));
+        self.log.info("DPL", 312, format!(
+            "Found {err_n} edge spacing violations and {err_p} padding violations."));
 
         self.checks = Checks { wrong_region: wrong, row_alignment: row_err, site_alignment: site_err,
                                overlaps, edge_spacing: err_n, padding: err_p };

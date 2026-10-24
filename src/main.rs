@@ -517,7 +517,7 @@ fn improve_placement(args: &[String]) -> ExitCode {
         Err(e) => { diag!("vyges-dpl: {e}"); return ExitCode::from(1); }
     };
     if dump {
-        for l in &setup.log {
+        for l in setup.log.lines() {
             log_line(l);
         }
         for l in setup.dump() {
@@ -526,7 +526,7 @@ fn improve_placement(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let rep = vyges_dpl::improve_opt::improve(&mut setup, &opts);
-    for l in &setup.log {
+    for l in setup.log.lines() {
         log_line(l);
     }
     let rep = match rep {

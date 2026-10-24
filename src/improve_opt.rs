@@ -84,7 +84,7 @@ pub fn improve(s: &mut Setup, opts: &Options) -> Result<Report, String> {
             "ro" => "reordering",
             _ => "random improvement",
         };
-        s.log.push(format!("[INFO DPL-0303] Running algorithm for {name}."));
+        s.log.info("DPL", 303, format!("Running algorithm for {name}."));
         stage_line(s, opts, &mut rep, args[0], "begin");
         match args[0] {
             "default" => random_improver(s, args),
@@ -104,7 +104,7 @@ pub fn improve(s: &mut Setup, opts: &Options) -> Result<Report, String> {
     // master: `doDetailedCommand` announces it, prints the stage's begin, and runs NOTHING — the
     // command falls through to `else { return; }` before any end.
     if s.rt.disallow_gaps && opts.stop_stage.is_none() {
-        s.log.push("[INFO DPL-0303] Running algorithm for disallow_one_site_gaps.".into());
+        s.log.info("DPL", 303, "Running algorithm for disallow_one_site_gaps.");
         stage_line(s, opts, &mut rep, "disallow_one_site_gaps", "begin");
     }
     stage_line(s, opts, &mut rep, "orient", "begin");
@@ -127,7 +127,7 @@ pub fn improve(s: &mut Setup, opts: &Options) -> Result<Report, String> {
         let left = one_site_gap_violations_per_segment(s, true);
         for (seg, ids) in left.iter().enumerate() {
             if !ids.is_empty() {
-                s.log.push(format!("[WARNING DPL-0323] One site gap violation in segment {seg} nodes: {}",
+                s.log.warn("DPL", 323, format!("One site gap violation in segment {seg} nodes: {}",
                                    gap_id_list(ids)));
             }
         }
@@ -181,7 +181,7 @@ pub(crate) fn one_site_gap_violations_per_segment(s: &mut Setup, fix: bool) -> V
                         // is tried on the first overlap only.
                         if n.kind == Kind::Terminal || n.fixed {
                             if fix {
-                                s.log.push(format!("[WARNING DPL-0339] One-site gap violation detected \
+                                s.log.warn("DPL", 339, format!("One-site gap violation detected \
                                     with a Fixed/Terminal cell {id}"));
                             }
                             out[seg].push(id);
@@ -189,7 +189,7 @@ pub(crate) fn one_site_gap_violations_per_segment(s: &mut Setup, fix: bool) -> V
                         }
                         if s.arch.height_in_rows(n) != 1 {
                             if fix {
-                                s.log.push(format!("[WARNING DPL-0340] One-site gap violation detected \
+                                s.log.warn("DPL", 340, format!("One-site gap violation detected \
                                     with a multi-height cell {id}"));
                             }
                             out[seg].push(id);
@@ -364,16 +364,16 @@ fn random_improver(s: &mut Setup, args: &[&str]) {
     }
     let tol = tol.max(0.01);
     let passes = passes.max(1);
-    s.log.push("[INFO DPL-0324] Random improver is using random generator.".into());
-    s.log.push("[INFO DPL-0325] Random improver is using hpwl objective.".into());
-    s.log.push("[INFO DPL-0326] Random improver cost string is (a).".into());
+    s.log.info("DPL", 324, "Random improver is using random generator.");
+    s.log.info("DPL", 325, "Random improver is using hpwl objective.");
+    s.log.info("DPL", 326, "Random improver cost string is (a).");
     let mut obj = Hpwl { edge: vec![0; s.rt.edges.len()], pending: Vec::new() };
     let i_cost = obj.curr(s);
     let mut gen = (0u64, 0u64, 0u64); // attempts, moves, swaps — cumulative, as the object lives on
     for p in 1..=passes {
         s.resort_segments();
         let change = go(s, &mut obj, per_candidate, &mut gen);
-        s.log.push(format!("[INFO DPL-0327] Pass {p:3} of random improver; improvement in cost is {:.2} percent.", change * 100.0));
+        s.log.info("DPL", 327, format!("Pass {p:3} of random improver; improvement in cost is {:.2} percent.", change * 100.0));
         if change < tol {
             break;
         }
@@ -381,7 +381,7 @@ fn random_improver(s: &mut Setup, args: &[&str]) {
     s.resort_segments();
     let f_cost = obj.curr(s);
     let imp = (i_cost - f_cost) / i_cost * 100.0;
-    s.log.push(format!("[INFO DPL-0328] End of random improver; improvement is {imp:.6} percent."));
+    s.log.info("DPL", 328, format!("End of random improver; improvement is {imp:.6} percent."));
 }
 
 /// `DetailedRandom::go` — one pass.
@@ -391,7 +391,7 @@ fn go(s: &mut Setup, obj: &mut Hpwl, per_candidate: f64, gen: &mut (u64, u64, u6
         candidates.extend(m.iter().copied());
     }
     if candidates.is_empty() {
-        s.log.push("[INFO DPL-0203] No movable cells found".into());
+        s.log.info("DPL", 203, "No movable cells found");
         return 0.0;
     }
     let max_attempts = (per_candidate * candidates.len() as f64).ceil() as i64;
@@ -415,14 +415,14 @@ fn go(s: &mut Setup, obj: &mut Hpwl, per_candidate: f64, gen: &mut (u64, u64, u6
             s.reject_move();
         }
     }
-    s.log.push(format!("[INFO DPL-0332] End of pass, Generator random called {calls} times."));
-    s.log.push(format!("[INFO DPL-0335] Generator random, Cumulative attempts {}, swaps {}, moves {:5} since last reset.",
+    s.log.info("DPL", 332, format!("End of pass, Generator random called {calls} times."));
+    s.log.info("DPL", 335, format!("Generator random, Cumulative attempts {}, swaps {}, moves {:5} since last reset.",
                        gen.0, gen.2, gen.1));
     let scratch = obj.curr(s);
     let mismatch = if (scratch - curr).abs() > 1.0e-3 { 'Y' } else { 'N' };
-    s.log.push(format!("[INFO DPL-0333] End of pass, Objective hpwl, Initial cost {}, Scratch cost {}, Incremental cost {}, Mismatch? {mismatch}",
+    s.log.info("DPL", 333, format!("End of pass, Objective hpwl, Initial cost {}, Scratch cost {}, Incremental cost {}, Mismatch? {mismatch}",
                        sci(init), sci(scratch), sci(curr)));
-    s.log.push(format!("[INFO DPL-0338] End of pass, Total cost is {}.", sci(scratch)));
+    s.log.info("DPL", 338, format!("End of pass, Total cost is {}.", sci(scratch)));
     (init - curr) / init
 }
 
@@ -520,13 +520,13 @@ fn global_swap(s: &mut Setup, args: &[&str]) {
         let last = curr;
         global_swap_pass(s);
         curr = s.total_hpwl_xy() as i64;
-        s.log.push(format!("[INFO DPL-0306] Pass {p:3} of global swaps; hpwl is {}.", sci(curr as f64)));
+        s.log.info("DPL", 306, format!("Pass {p:3} of global swaps; hpwl is {}.", sci(curr as f64)));
         if last == 0 || (curr - last).abs() as f64 / last as f64 <= tol {
             break;
         }
     }
     let imp = (init - curr) as f64 / init as f64 * 100.0;
-    s.log.push(format!("[INFO DPL-0307] End of global swaps; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
+    s.log.info("DPL", 307, format!("End of global swaps; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
 }
 
 /// `globalSwap` — every single-height cell once, in shuffled order, toward its nets' median box.
@@ -661,13 +661,13 @@ fn vertical_swap(s: &mut Setup, args: &[&str]) {
         let last = curr;
         vertical_swap_pass(s);
         curr = s.total_hpwl_xy() as i64;
-        s.log.push(format!("[INFO DPL-0308] Pass {p:3} of vertical swaps; hpwl is {}.", sci(curr as f64)));
+        s.log.info("DPL", 308, format!("Pass {p:3} of vertical swaps; hpwl is {}.", sci(curr as f64)));
         if last == 0 || (curr - last).abs() as f64 / last as f64 <= tol {
             break;
         }
     }
     let imp = (init - curr) as f64 / init as f64 * 100.0;
-    s.log.push(format!("[INFO DPL-0309] End of vertical swaps; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
+    s.log.info("DPL", 309, format!("End of vertical swaps; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
 }
 
 /// `verticalSwap` — as `globalSwap`, each cell once in shuffled order.
@@ -748,7 +748,7 @@ struct Mis {
 /// `DetailedMis::run` (wirelength objective).
 fn mis(s: &mut Setup, args: &[&str]) {
     let (passes, tol) = passes_tol(args);
-    s.log.push("[INFO DPL-0300] Set matching objective is wirelength.".into());
+    s.log.info("DPL", 300, "Set matching objective is wirelength.");
     s.resort_segments();
     let mut curr = s.total_hpwl_xy() as i64;
     let init = curr;
@@ -761,13 +761,13 @@ fn mis(s: &mut Setup, args: &[&str]) {
         m.candidates.extend(mh.iter().copied());
     }
     if m.candidates.is_empty() {
-        s.log.push("[INFO DPL-0202] No movable cells found".into());
+        s.log.info("DPL", 202, "No movable cells found");
         return;
     }
     mis_color(s, &mut m);
     mis_build_grid(s, &mut m);
     for p in 1..=passes {
-        s.log.push(format!("[INFO DPL-0301] Pass {p:3} of matching; objective is {}.", sci(curr as f64)));
+        s.log.info("DPL", 301, format!("Pass {p:3} of matching; objective is {}.", sci(curr as f64)));
         mis_place(s, &mut m);
         let last = curr;
         curr = s.total_hpwl_xy() as i64;
@@ -777,7 +777,7 @@ fn mis(s: &mut Setup, args: &[&str]) {
     }
     s.resort_segments();
     let imp = (init - curr) as f64 / init as f64 * 100.0;
-    s.log.push(format!("[INFO DPL-0302] End of matching; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
+    s.log.info("DPL", 302, format!("End of matching; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
 }
 
 /// `colorCells` — `ColorGraph` over every network node, an edge between two movable cells that
@@ -1099,14 +1099,14 @@ fn reorder(s: &mut Setup, args: &[&str]) {
         let last = curr;
         reorder_pass(s, window);
         curr = s.total_hpwl_xy() as i64;
-        s.log.push(format!("[INFO DPL-0304] Pass {p:3} of reordering; objective is {}.", sci(curr as f64)));
+        s.log.info("DPL", 304, format!("Pass {p:3} of reordering; objective is {}.", sci(curr as f64)));
         if last == 0 || (curr - last).abs() as f64 / last as f64 <= tol {
             break;
         }
     }
     s.resort_segments();
     let imp = (init - curr) as f64 / init as f64 * 100.0;
-    s.log.push(format!("[INFO DPL-0305] End of reordering; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
+    s.log.info("DPL", 305, format!("End of reordering; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
 }
 
 /// `reorder()` — per segment, over each run of single-height cells. ⛔ The window loop runs while
@@ -1336,23 +1336,23 @@ fn is_legal_sym(sym: (bool, bool, bool), o: &str) -> bool {
 
 /// `DetailedOrient::run(mgr, "orient -f")`.
 fn orient(s: &mut Setup, flip: bool) {
-    s.log.push("[INFO DPL-0380] Cell flipping.".into());
+    s.log.info("DPL", 380, "Cell flipping.");
     let init = s.total_hpwl_xy();
     if init == 0 {
         return;
     }
     let (errors, changed) = orient_cells(s);
     if errors != 0 {
-        s.log.push(format!("[WARNING DPL-0381] Encountered {errors} issues when orienting cells for rows."));
+        s.log.warn("DPL", 381, format!("Encountered {errors} issues when orienting cells for rows."));
     }
-    s.log.push(format!("[INFO DPL-0382] Changed {changed} cell orientations for row compatibility."));
+    s.log.info("DPL", 382, format!("Changed {changed} cell orientations for row compatibility."));
     if flip {
         let n = flip_cells(s);
-        s.log.push(format!("[INFO DPL-0383] Performed {n} cell flips."));
+        s.log.info("DPL", 383, format!("Performed {n} cell flips."));
     }
     let curr = s.total_hpwl_xy();
     let imp = (init as f64 - curr as f64) / init as f64 * 100.0;
-    s.log.push(format!("[INFO DPL-0384] End of flipping; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
+    s.log.info("DPL", 384, format!("End of flipping; objective is {}, improvement is {imp:.2} percent.", sci(curr as f64)));
 }
 
 /// `orientCells` — every movable cell oriented for the lowest row it is in.
