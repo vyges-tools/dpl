@@ -676,6 +676,23 @@ fn legalize(args: &[String]) -> ExitCode {
         diag!("vyges-dpl: placement padding with the diamond legalizer is not modelled");
         return ExitCode::from(2);
     }
+    // `detailedPlacement`'s opening lines, before the legalizer runs.
+    {
+        let insts: Vec<vyges_dpl::report::Inst> = db.inst_names().iter().map(|n| {
+            let m = db.inst_master(n);
+            let b = db.inst_bbox(n).unwrap_or_default();
+            vyges_dpl::report::Inst {
+                master_type: db.master_get_type(&m).unwrap_or_default(),
+                status: db.inst_get_placement_status(n),
+                size: (db.master_get_width(&m) as i64, db.master_get_height(&m) as i64),
+                bbox: match b[..] { [a, b, c, d] => (a as i64, b as i64, c as i64, d as i64), _ => (0, 0, 0, 0) },
+            }
+        }).collect();
+        let core = (db.block_get_core_area_x_min() as i64, db.block_get_core_area_y_min() as i64, db.block_get_core_area_x_max() as i64, db.block_get_core_area_y_max() as i64);
+        for (id, text) in vyges_dpl::report::header(core, &insts, db.dbu_per_micron() as i64, (opts.max_displacement_x, opts.max_displacement_y), diamond) {
+            ref_line_out("INFO", &format!("DPL-{id:04}"), text);
+        }
+    }
     let res = match if diamond { vyges_dpl::place::legalize(&db) }
                     else { vyges_dpl::negotiate::legalize_padded(&db, opts, &padding) } {
         Ok(r) => r,
