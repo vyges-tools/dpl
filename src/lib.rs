@@ -28,6 +28,10 @@
 // refactored away.
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
+// The crate's own name inside it: the command-line entry ([`cli_main`]) is built into the
+// library too, and its `vyges_dpl::…` paths resolve here.
+extern crate self as vyges_dpl;
+
 pub mod check;
 pub mod drc;
 pub mod edges;
@@ -50,3 +54,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The copyright line `--version` prints.
 pub const COPYRIGHT: &str = "© 2026 Vyges. All Rights Reserved.  https://vyges.com";
+
+/// The `vyges-dpl` command-line entry (the binary's `main`), built into the library too so a
+/// suite binary can link every engine and run the one it is invoked as.
+#[cfg(feature = "suite")]
+#[doc(hidden)]
+#[path = "main.rs"]
+pub mod cli_main;
