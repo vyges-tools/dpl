@@ -299,10 +299,41 @@ pub struct Placed {
     pub footprint: Option<(i32, i32)>,
 }
 
+/// One line the legalizer prints, in its order: a reference line (`level`, `code`) or, with
+/// `code` 0, a plain report line (`logger_->report`); `quiet` when `-quiet` suppresses it.
+#[derive(serde::Serialize, Debug, Clone, PartialEq)]
+pub struct LogLine {
+    pub level: &'static str,
+    pub code: u16,
+    pub text: String,
+    pub quiet: bool,
+}
+
+impl LogLine {
+    pub fn info(code: u16, text: String) -> LogLine {
+        LogLine { level: "INFO", code, text, quiet: true }
+    }
+    pub fn report(text: String) -> LogLine {
+        LogLine { level: "", code: 0, text, quiet: true }
+    }
+}
+
 /// The result of a legalization run.
 #[derive(serde::Serialize, Debug, Default)]
 pub struct Legalized {
+    /// The legalizer's own lines (`NegotiationLegalizer`), in order. Not in the JSON report: the
+    /// caller prints them where the reference does.
+    #[serde(skip)]
+    pub log: Vec<LogLine>,
+    /// `total_moves_`: under negotiation, every cell a sweep re-placed, summed over the run
+    /// (`NegotiationLegalizer::totalMoves`); under diamond search, each cell `place` moved.
+    #[serde(skip)]
+    pub total_moves: i64,
     pub placed: Vec<Placed>,
+    /// Cells the negotiation legalizer swept but never writes back (a placed-not-fixed macro):
+    /// name and the ABSOLUTE position its network node ends at. Only the displacement reads it.
+    #[serde(skip)]
+    pub discarded: Vec<(String, i32, i32)>,
     pub failures: Vec<String>,
     pub not_done: Vec<String>,
     /// Instances the MODEL FILTER excluded, counted by `"<master type>/<placement status>"`.
@@ -562,6 +593,10 @@ impl Diamond {
 
     /// `place` — every cell not in a group and not yet placed, sorted, each `diamondMove`d from
     /// its `legalGridPt`.
+    ///
+    /// `total_moves_` counts here and only here (and in `ripUpAndReplace`, not built): a cell
+    /// whose DPL location after a successful `diamondMove` differs from where it sat before. The
+    /// group passes before this loop move cells without counting them.
     fn place(&mut self) {
         let mut order: Vec<usize> = (0..self.cells.len())
             .filter(|&i| self.group_of[i].is_none() && !self.placed[i])
@@ -573,6 +608,8 @@ impl Diamond {
             let start = self.grid.legal_start(m.x, m.y, m.w, m.h);
             if !self.diamond_move(i, start) {
                 self.out.failures.push(self.cells[i].name.clone());
+            } else if self.out.placed.last().is_some_and(|p| p.moved) {
+                self.out.total_moves += 1;
             }
         }
     }

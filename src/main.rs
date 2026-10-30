@@ -684,6 +684,13 @@ fn legalize(args: &[String]) -> ExitCode {
         diag!("vyges-dpl: placement padding with the diamond legalizer is not modelled");
         return ExitCode::from(2);
     }
+    let started = std::time::Instant::now();
+    // `importDb` reads the network's instances once; DPL-37 is the first line `detailedPlacement`
+    // prints, before the areas.
+    let network = vyges_dpl::network::network_insts(&db);
+    if vyges_dpl::report::has_fillers(&db, &network) {
+        ref_line_out("WARNING", "DPL-0037", "Use remove_fillers before detailed placement.".into());
+    }
     // `detailedPlacement`'s opening lines, before the legalizer runs.
     {
         let insts: Vec<vyges_dpl::report::Inst> = db.inst_names().iter().map(|n| {
@@ -701,14 +708,34 @@ fn legalize(args: &[String]) -> ExitCode {
             ref_line_out("INFO", &format!("DPL-{id:04}"), text);
         }
     }
+    let hpwl_before = vyges_dpl::report::odb_hpwl(&db);
     let res = match if diamond { vyges_dpl::place::legalize(&db) }
                     else { vyges_dpl::negotiate::legalize_padded(&db, opts, &padding) } {
         Ok(r) => r,
         Err(e) => { diag!("vyges-dpl: {e}"); return ExitCode::from(2); }
     };
+    // The legalizer's own lines (DPL-1103 on), where `NegotiationLegalizer::legalize` prints them.
+    for l in &res.log {
+        if l.code == 0 { log_line(&l.text) } else { ref_line_out(l.level, &format!("DPL-{:04}", l.code), l.text.clone()) }
+    }
     let moved = res.placed.iter().filter(|p| p.moved).count();
-    if !dry {
+    // `findDisplacementStats`: each cell's |x − x0| + |y − y0|, x0/y0 read from the database
+    // between the orientation write and the location write (below).
+    let mut disps = Vec::with_capacity(res.placed.len());
+    // ⚠️ The in-memory database takes the placement even under --dry-run: the legalized HPWL is
+    // measured on it. Only the FILE write is skipped.
+    {
         for p in &res.placed {
+            // ⛔ The negotiation legalizer's displacement is NOT the physical move. Its `legalize`
+            // ends by setting every cell's database orientation to its row's — `setOrient`, which
+            // keeps the ORIGIN, so a flipped cell's box shifts by its height — and only THEN does
+            // `findDisplacementStats` read the "initial" location. Upstream `simple02`: a cell
+            // moved 0.01 um and flipped N → FS reports 1.4 um, one Nangate45 row. The diamond
+            // legalizer sets no orientation first and measures the real move.
+            if diamond {
+                let (x0, y0) = db.inst_location(&p.name);
+                disps.push((p.x as i64 - x0 as i64).abs() + (p.y as i64 - y0 as i64).abs());
+            }
             // ⛔ **ORIENTATION FIRST, THEN LOCATION**, and the order is not a preference.
             // `dbInst::setOrient` re-derives the origin so the cell's bbox stays put, so setting
             // it AFTER a move undoes the move. Measured: the planner chose y=2800 and the written
@@ -726,6 +753,10 @@ fn legalize(args: &[String]) -> ExitCode {
                     let _ = db.set_inst_orient(&p.name, orient);
                 }
             }
+            if !diamond {
+                let (x0, y0) = db.inst_location(&p.name);
+                disps.push((p.x as i64 - x0 as i64).abs() + (p.y as i64 - y0 as i64).abs());
+            }
             if db.inst_location(&p.name) != (p.x, p.y) {
                 if let Err(e) = db.set_inst_location(&p.name, p.x, p.y) {
                     diag!("vyges-dpl: cannot move {}: {e}", p.name);
@@ -734,12 +765,24 @@ fn legalize(args: &[String]) -> ExitCode {
             }
             let _ = db.inst_set_placement_status(&p.name, "PLACED");
         }
-        if let Some(o) = out_odb.as_deref() {
+        // A swept macro the write-back discards still counts: its node holds the negotiated spot.
+        for (name, x, y) in &res.discarded {
+            let (x0, y0) = db.inst_location(name);
+            disps.push((*x as i64 - x0 as i64).abs() + (*y as i64 - y0 as i64).abs());
+        }
+        if let Some(o) = out_odb.as_deref().filter(|_| !dry) {
             if let Err(e) = db.write(o) {
                 diag!("vyges-dpl: cannot write {o}: {e}");
                 return ExitCode::from(2);
             }
         }
+    }
+    let disp = vyges_dpl::report::displacement(disps, network.len());
+    ref_line_out("INFO", "DPL-0500", format!("Runtime: {:.2}s", started.elapsed().as_secs_f64()));
+    // `report_legalization_stats`, which the Tcl command runs after the placement.
+    for l in vyges_dpl::report::legalization_stats(diamond, res.total_moves, disp, hpwl_before,
+                                                   vyges_dpl::report::odb_hpwl(&db), db.dbu_per_micron() as i64) {
+        log_line(&l);
     }
     // ⛔ Upstream errors DPL-36 when any cell could not be seated. A legalizer that reports
     // success having left cells illegal is worse than one that fails.

@@ -226,6 +226,15 @@ pub fn is_std_cell(master_type: &str) -> bool {
     t.starts_with("CORE") || t.starts_with("ENDCAP")
 }
 
+/// Does a swept cell the write-back skips still end with its network NODE at the negotiated spot?
+///
+/// `commitNegotiationPosToDpl` guards on `cell.fixed` — the dbInst status — and nothing else, so a
+/// placed-not-fixed macro's node takes its grid position even though `updateDbInstLocations`
+/// (node fixed, not a std cell) never writes it. `findDisplacementStats` then counts the gap.
+pub fn node_takes_discarded_position(status_fixed: bool) -> bool {
+    !status_fixed
+}
+
 /// A cell's width in SITES — `initFromDb`'s sizing.
 ///
 /// ⛔ **`round(width / site_width)`, floored at 1 — NOT `divCeil`.** `Grid::gridWidth` uses
@@ -1239,32 +1248,128 @@ pub fn run_negotiation<S>(
     mut iterate: impl FnMut(&mut S, i32) -> i32,
     mut diamond_recovery: impl FnMut(&mut S),
 ) -> Outcome {
+    let mut log = Vec::new();
+    run_negotiation_logged(
+        max_iter_neg, max_iter_neg2, state,
+        |s, i| IterStats { violations: iterate(s, i), ..Default::default() },
+        |s| { diamond_recovery(s); (0, 0) },
+        true, &mut log,
+    ).0
+}
+
+/// One `negotiationIter`'s counts: the violations it returns, and the illegal cells, illegal
+/// sites and moves it records for the iteration table and `totalMoves`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IterStats {
+    pub violations: i32,
+    pub illegal_cells: i32,
+    pub illegal_sites: i32,
+    pub moves: i32,
+}
+
+/// What [`run_negotiation_logged`] counted: `phase1Iterations`, `phase2Iterations`, `totalMoves`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunCounts {
+    pub phase1_iterations: i32,
+    pub phase2_iterations: i32,
+    pub total_moves: i64,
+}
+
+/// `shouldPrintIteration`: the first ten iterations, then every tenth.
+pub fn should_print_iteration(quiet: bool, iter: i32) -> bool {
+    !quiet && (iter < 10 || iter % 10 == 0)
+}
+
+/// [`run_negotiation`] with `runNegotiation`'s lines: the iteration table (header, a row per
+/// printed iteration, the last row when it was skipped), each phase's convergence, the phase-2
+/// banner, DPL-700 / DPL-702 on a stall and `diamondRecovery`'s count after it.
+///
+/// `diamond_recovery` returns `(illegal, recovered)`: the illegal active cells it was handed —
+/// counted BEFORE any is moved, as upstream collects them before calling it — and how many it
+/// seated.
+///
+/// ⚠️ Phase 2 numbers its rows from `max_iter_neg` (`actual_iter`) but its convergence line with
+/// the phase-local `iter`, as upstream does. ⛔ The stall warnings and the recovery count are NOT
+/// quiet-gated upstream; everything else is.
+pub fn run_negotiation_logged<S>(
+    max_iter_neg: i32,
+    max_iter_neg2: i32,
+    state: &mut S,
+    mut iterate: impl FnMut(&mut S, i32) -> IterStats,
+    mut diamond_recovery: impl FnMut(&mut S) -> (usize, usize),
+    quiet: bool,
+    log: &mut Vec<LogLine>,
+) -> (Outcome, RunCounts) {
+    let mut counts = RunCounts::default();
     let mut stalled_phase_1 = None;
     let mut final_violations = -1;
+    // `last_iter_` / `last_printed_iter_` and the row they print.
+    let mut last: Option<(i32, IterStats)> = None;
+    let mut last_printed = -1;
+    let row = |iter: i32, s: &IterStats| {
+        LogLine::report(format!("{:>9} | {:>10} | {:>9} | {:>9}", iter, s.violations, s.illegal_cells, s.illegal_sites))
+    };
+    let print_last_if_needed = |log: &mut Vec<LogLine>, last: &Option<(i32, IterStats)>, last_printed: &mut i32| {
+        if let Some((iter, s)) = last {
+            if !quiet && *iter != *last_printed {
+                log.push(row(*iter, s));
+                *last_printed = *iter;
+            }
+        }
+    };
+    if !quiet {
+        log.push(LogLine::report("          |      Total |  Illegal |  Illegal".into()));
+        log.push(LogLine::report("Iteration | Violations |    Cells |    Sites".into()));
+        log.push(LogLine::report("---------------------------------------------".into()));
+    }
     for (phase, (start, count)) in [(0, max_iter_neg), (max_iter_neg, max_iter_neg2)]
         .into_iter()
         .enumerate()
     {
+        if phase == 1 && !quiet {
+            log.push(LogLine::report(format!(
+                "Negotiation phase 2: isolation point active, {max_iter_neg2} iterations.")));
+        }
         let mut prev = -1;
         let mut stall = 0;
-        let mut last = -1;
+        let mut last_violations = -1;
         for i in 0..count {
             let actual = start + i;
-            let violations = iterate(state, actual);
-            last = violations;
+            let s = iterate(state, actual);
+            let violations = s.violations;
+            counts.total_moves += s.moves as i64;
+            if phase == 0 { counts.phase1_iterations = i + 1 } else { counts.phase2_iterations = i + 1 }
+            last = Some((actual, s));
+            if should_print_iteration(quiet, actual) {
+                log.push(row(actual, &s));
+                last_printed = actual;
+            }
+            last_violations = violations;
             if violations == 0 {
-                return Outcome::Converged { phase: phase as u8 + 1, iter: i };
+                print_last_if_needed(log, &last, &mut last_printed);
+                if !quiet {
+                    log.push(LogLine::report(format!("Negotiation phase {} converged at iteration {i}.", phase + 1)));
+                }
+                return (Outcome::Converged { phase: phase as u8 + 1, iter: i }, counts);
             }
             if violations == prev {
                 stall += 1;
                 if stall == 3 {
-                    diamond_recovery(state);
+                    print_last_if_needed(log, &last, &mut last_printed);
+                    // The warning names the illegal count, which the recovery collects; it is
+                    // printed before the recovery's own line.
+                    let (illegal, recovered) = diamond_recovery(state);
+                    let text = if phase == 0 {
+                        format!("Negotiation phase 1: violations stuck at {violations} for 3 consecutive iterations.\nUsing old diamond search for {illegal} remaining illegal cells.")
+                    } else {
+                        format!("Negotiation phase 2: violations stuck at {violations} for 3 consecutive iterations. Using diamond search for {illegal} remaining illegal cells.")
+                    };
+                    log.push(LogLine { level: "WARNING", code: if phase == 0 { 700 } else { 702 }, text, quiet: false });
+                    log.push(LogLine { level: "", code: 0, text: format!("diamond recovery: recovered {recovered}/{illegal} stuck cells."), quiet: false });
                     // ⛔ BREAK, not return. Phase 1 falls through into phase 2; only a phase-2
                     // stall ends the run.
                     if phase == 1 {
-                        return Outcome::StalledIntoRecovery {
-                            phase: 2, iter: i, violations,
-                        };
+                        return (Outcome::StalledIntoRecovery { phase: 2, iter: i, violations }, counts);
                     }
                     stalled_phase_1 = Some((i, violations));
                     break;
@@ -1274,14 +1379,19 @@ pub fn run_negotiation<S>(
             }
             prev = violations;
         }
-        final_violations = last;
+        if phase == 0 {
+            print_last_if_needed(log, &last, &mut last_printed);
+        }
+        final_violations = last_violations;
     }
-    match stalled_phase_1 {
+    print_last_if_needed(log, &last, &mut last_printed);
+    let outcome = match stalled_phase_1 {
         // Phase 1 stalled, recovery ran, and phase 2 then used up its iterations without
         // converging. Both facts are reported — the stall is why, the exhaustion is what.
         Some((iter, violations)) => Outcome::StalledIntoRecovery { phase: 1, iter, violations },
         None => Outcome::Exhausted { violations: final_violations },
-    }
+    };
+    (outcome, counts)
 }
 
 /// A candidate location and the rank that breaks cost ties.
@@ -1385,6 +1495,55 @@ pub fn enumerate_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn texts(log: &[LogLine]) -> Vec<String> {
+        log.iter().map(|l| if l.code == 0 { l.text.clone() } else { format!("[{} DPL-{:04}] {}", l.level, l.code, l.text) }).collect()
+    }
+
+    /// Rules (runNegotiation): rows for iterations < 10 and every tenth, the last iteration's row
+    /// when it was skipped, phase 2 numbered from `max_iter_neg` with a phase-LOCAL convergence
+    /// index; moves summed across both phases.
+    #[test]
+    fn negotiation_table_rows_and_phase_two() {
+        let mut log = Vec::new();
+        let script = |_: &mut (), it: i32| IterStats { violations: if it < 12 { 50 - it } else { 0 }, illegal_cells: 2, illegal_sites: 3, moves: 1 };
+        let (out, counts) = run_negotiation_logged(11, 5, &mut (), script, |_| unreachable!(), false, &mut log);
+        assert_eq!(out, Outcome::Converged { phase: 2, iter: 1 });
+        assert_eq!((counts.phase1_iterations, counts.phase2_iterations, counts.total_moves), (11, 2, 13));
+        let t = texts(&log);
+        assert_eq!(t[..3], ["          |      Total |  Illegal |  Illegal",
+                            "Iteration | Violations |    Cells |    Sites",
+                            "---------------------------------------------"]);
+        assert_eq!(t[3], "        0 |         50 |         2 |         3");
+        assert_eq!(t[12], "        9 |         41 |         2 |         3");
+        assert_eq!(t[13], "       10 |         40 |         2 |         3");
+        // Phase 2's first iteration (11) is neither < 10 nor a tenth: no row. The converging
+        // iteration (12) gets one only through print_last_if_needed.
+        assert_eq!(t[14], "Negotiation phase 2: isolation point active, 5 iterations.");
+        assert_eq!(t[15], "       12 |          0 |         2 |         3");
+        assert_eq!(t[16], "Negotiation phase 2 converged at iteration 1.");
+        assert_eq!(t.len(), 17);
+        // Quiet: no table, no banner.
+        let mut q = Vec::new();
+        run_negotiation_logged(11, 5, &mut (), script, |_| unreachable!(), true, &mut q);
+        assert!(q.is_empty());
+    }
+
+    /// Rule: a 3-iteration stall prints the last row, DPL-700 with the illegal count the recovery
+    /// was handed, then the recovery line — and both of THOSE also print under quiet.
+    #[test]
+    fn negotiation_stall_lines_not_quiet_gated() {
+        for quiet in [false, true] {
+            let mut log = Vec::new();
+            run_negotiation_logged(20, 0, &mut (), |_, it| IterStats { violations: if it < 1 { 9 } else { 7 }, ..Default::default() },
+                                   |_| (4, 3), quiet, &mut log);
+            let t = texts(&log);
+            let w = t.iter().position(|l| l.starts_with("[WARNING DPL-0700]")).unwrap();
+            assert_eq!(t[w], "[WARNING DPL-0700] Negotiation phase 1: violations stuck at 7 for 3 consecutive iterations.\nUsing old diamond search for 4 remaining illegal cells.");
+            assert_eq!(t[w + 1], "diamond recovery: recovered 3/4 stuck cells.");
+            if quiet { assert_eq!(t.len(), 2) } else { assert_eq!(t[w - 1], "        4 |          7 |         0 |         0") }
+        }
+    }
 
     /// Rows exactly ONE SITE tall, so `row_disp_in_sites` returns the raw row delta.
     ///
@@ -1550,6 +1709,15 @@ mod tests {
         for t in ["BLOCK", "BLOCK_BLACKBOX", "BLOCK_SOFT", "PAD", "COVER", "RING"] {
             assert!(!is_std_cell(t), "{t} is not, however it was negotiated");
         }
+    }
+
+    #[test]
+    fn a_discarded_macro_still_counts_its_displacement() {
+        // Upstream rule: commitNegotiationPosToDpl skips only NegCell.fixed (dbInst status), so a
+        // PLACED macro's node moves to its snapped spot while the db does not; findDisplacementStats
+        // measures node vs db. Reference on macro_placed_not_fixed: block1 adds 540 dbu (66.6 u).
+        assert!(node_takes_discarded_position(status_is_fixed("PLACED")));
+        assert!(!node_takes_discarded_position(status_is_fixed("FIRM")));
     }
 
     #[test]
@@ -2860,6 +3028,15 @@ pub type FixedPaint = (usize, i32, i32, i32, i32);
 pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: i32,
                         ctx: &mut SweepCtx) -> i32
 {
+    negotiation_iter_stats(cells, active, iter, ctx).violations
+}
+
+/// [`negotiation_iter`], with the counts its table row and `totalMoves` read: illegal sites are
+/// the overused squares under the active cells, illegal cells those failing `isCellLegal`
+/// (bystanders pulled in included), moves the cells swept.
+pub fn negotiation_iter_stats(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: i32,
+                              ctx: &mut SweepCtx) -> IterStats
+{
     // 1. Order the sweep — `sortByNegotiationOrder(activeCells)`, IN PLACE.
     order_active(active, cells, ctx.grid);
     // The sweep walks that order; cells pulled in below join the list, not this pass.
@@ -3005,6 +3182,7 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
     // `multi_height_one_site_gap_disallow`: a genuine one-site gap between two cells, one sweep,
     // "converged", gap still there.
     let mut violations = 0;
+    let (mut illegal_cells, mut illegal_sites) = (0, 0);
     for &i in active.iter() {
         if cells[i].fixed {
             continue;
@@ -3014,13 +3192,18 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
             for dx in 0..c.width {
                 if let (Ok(gx), Ok(gy)) = (usize::try_from(c.x + dx), usize::try_from(c.y + dy)) {
                     if gx < ctx.grid.width && gy < ctx.grid.height {
-                        violations += ctx.grid.at(gx, gy).overuse();
+                        let overuse = ctx.grid.at(gx, gy).overuse();
+                        violations += overuse;
+                        if overuse > 0 {
+                            illegal_sites += 1;
+                        }
                     }
                 }
             }
         }
         if !cell_is_legal(c, ctx) {
             violations += 1;
+            illegal_cells += 1;
         }
     }
 
@@ -3035,6 +3218,7 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
         if !cell_is_legal(&cells[i], ctx) {
             active.push(i);
             violations += 1;
+            illegal_cells += 1;
         }
     }
 
@@ -3109,7 +3293,7 @@ pub fn negotiation_iter(cells: &mut [SweepCell], active: &mut Vec<usize>, iter: 
         // run's active list is LEFT in — which is the order a stall's `diamondRecovery` visits.
         order_active(active, cells, ctx.grid);
     }
-    violations
+    IterStats { violations, illegal_cells, illegal_sites, moves: moves_count }
 }
 
 /// `sortByNegotiationOrder(activeCells)` — the run's active list, sorted IN PLACE.
@@ -3205,7 +3389,7 @@ fn footprint_is_legal(c: &SweepCell, x: i32, y: i32, grid: &NegGrid) -> bool {
 // ── the driver ───────────────────────────────────────────────────────────────────────────────
 
 use crate::grid::Grid;
-use crate::place::{Legalized, Placed};
+use crate::place::{Legalized, LogLine, Placed};
 use vyges_opendb::Db;
 
 /// Families of behaviour the NEGOTIATION legalizer does not implement.
@@ -3364,6 +3548,25 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
         not_done: NOT_DONE.iter().map(|s| s.to_string()).collect(),
         ..Default::default()
     };
+    // `legalize`'s opening lines. The displacement caps are Opendp's, after `detailedPlacement`
+    // turned a 0 on either axis into the defaults.
+    let (cap_x, cap_y) = if opts.max_displacement_x == 0 || opts.max_displacement_y == 0 {
+        (500, 100)
+    } else {
+        (opts.max_displacement_x, opts.max_displacement_y)
+    };
+    out.log.push(LogLine::info(1103, format!(
+        "Negotiation base search window: +/-{} sites horizontally, +/-{} rows vertically ",
+        opts.site_search_window, opts.row_search_window)));
+    out.log.push(LogLine::report(format!("\tAutomatic search window extension {}.",
+        if opts.disable_window_extension { "disabled" } else { "enabled" })));
+    if !opts.disable_window_extension {
+        out.log.push(LogLine::report(format!(
+            "\tSearch window extendable up to the max displacement cap of +/-{cap_x} sites, +/-{cap_y} rows near walls.")));
+    }
+    out.log.push(LogLine::info(1104, format!("NegotiationLegalizer DRC penalty: {}.", opts.drc_penalty)));
+    // `initFromDb`'s closing lines: every cell in the model, fixed ones too, by height in rows.
+    let mut heights: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
 
     // 2. The grid. A site is valid where the row model says a cell may sit.
     let valid = |x: usize, y: usize| grid.pixel(x as i64, y as i64).is_some_and(|p| p.is_valid);
@@ -3453,6 +3656,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
                 &grid.row_y, fw, fh, gw, gh,
             );
             ngrid.blockade(fx, fy, fw, fh);
+            *heights.entry(fh).or_default() += 1;
             // ⚠️ The occupancy stamp keeps `covering`'s footprint: `paintPixel(node)` is
             // `gridX(cell)`, `gridSnapDownY(cell)` and `gridWidth`, read off the node's own DBU
             // position, which for a fixed cell is where the DEF put it.
@@ -3487,6 +3691,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
         // ⛔ Seeded where the cell IS — but NOT yet: see the usage pass below. `init_x/init_y`
         // are this point and never move again; `targetCost` measures displacement from them for
         // the whole run.
+        *heights.entry(ch).or_default() += 1;
         cells.push(SweepCell {
             name: name.clone(), x: gx, y: gy, init_x: gx, init_y: gy,
             width: cw, height: ch,
@@ -3506,6 +3711,12 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             db.master_get_symmetry_y(&master),
             db.master_get_symmetry_r90(&master),
         ));
+    }
+
+    out.log.push(LogLine::info(392, format!(
+        "Negotiation cell height distribution ({} unique row-count(s)):", heights.len())));
+    for (h, n) in &heights {
+        out.log.push(LogLine::info(393, format!("  height {h} row(s): {n} cells")));
     }
 
     // ⛔ **Seed movable usage only after EVERY fixed cell has been blockaded**, because
@@ -4098,7 +4309,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
                 }
             };
         }
-        let outcome = run_negotiation(
+        let (outcome, counts) = run_negotiation_logged(
             consts::MAX_ITER_NEG,
             consts::MAX_ITER_NEG2,
             &mut run,
@@ -4106,7 +4317,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
                 let mut ctx = ctx_for!(&mut r.grid);
                 // ⛔ The history update lives INSIDE the iteration, gated on the violation count,
                 // exactly where upstream puts it.
-                negotiation_iter(&mut r.cells, &mut r.active, iter, &mut ctx)
+                negotiation_iter_stats(&mut r.cells, &mut r.active, iter, &mut ctx)
             },
             |r| {
                 // `diamondRecovery` — the stall escape hatch, run once per phase.
@@ -4122,6 +4333,12 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
                 let tracing = std::env::var_os("DPL_TRACE_NEGOTIATION").is_some();
                 let (mut recovered, mut considered) = (0, 0);
                 let active = r.active.clone();
+                // The illegal cells upstream collects BEFORE recovering any — the count its
+                // stall warning and its recovery line print.
+                let illegal = {
+                    let ctx = ctx_for!(&mut r.grid);
+                    active.iter().filter(|&&i| !r.cells[i].fixed && !cell_is_legal(&r.cells[i], &ctx)).count()
+                };
                 for idx in active {
                     let c = r.cells[idx].clone();
                     if c.fixed {
@@ -4168,10 +4385,14 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
                 if tracing {
                     eprintln!("diamond recovery: recovered {recovered}/{considered} stuck cells.");
                 }
+                (illegal, recovered)
             },
+            false,
+            &mut out.log,
         );
         cells = run.cells;
         ngrid = run.grid;
+        out.total_moves = counts.total_moves;
         outcome
     };
 
@@ -4183,6 +4404,16 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
     // (20000, 20000) to (19760, 19600) purely by being snapped to the site grid.
     for (i, c) in cells.iter().enumerate() {
         if !is_std_cell(&cell_types[i]) {
+            // ⚠️ **Discarded from the database, NOT from the displacement.** `commitNegotiationPosToDpl`
+            // skips only `cell.fixed` (the dbInst status), so it still writes the swept macro's
+            // final grid position into its network NODE; `findDisplacementStats` then measures that
+            // node against the untouched dbInst. Instrumented on `macro_placed_not_fixed`: block1
+            // init (18100, 20000), node (18240, 19600), 540 dbu of the reference's 66.6 u.
+            if node_takes_discarded_position(c.fixed) {
+                if let Some(p) = committed_position(c.x, c.y, sw, &grid.row_y, (core.0, core.1)) {
+                    out.discarded.push((c.name.clone(), p.0, p.1));
+                }
+            }
             continue;
         }
         if !site_ok(i, c.x, c.y) {
