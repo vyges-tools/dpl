@@ -12,7 +12,10 @@ fn ref_line_out(sev: &str, code: &str, text: String) {
         "ERROR" => Severity::Error,
         _ => Severity::Info,
     };
-    emit(&Event::new("vyges-dpl", severity, text.clone()).with_code(code));
+    // In text the plain line IS the event's terminal form; emitting it too would print it twice.
+    if !vyges_events::text_mode() {
+        emit(&Event::new("vyges-dpl", severity, text.clone()).with_code(code));
+    }
     eprintln!("[{sev} {code}] {text}");
 }
 
@@ -27,7 +30,9 @@ fn log_line(l: &str) {
     match parsed {
         Some((sev, code, text)) => ref_line_out(sev, code, text.to_string()),
         None => {
-            vyges_events::emit(&vyges_events::Event::new("vyges-dpl", vyges_events::Severity::Info, l.to_string()));
+            if !vyges_events::text_mode() {
+                vyges_events::emit(&vyges_events::Event::new("vyges-dpl", vyges_events::Severity::Info, l.to_string()));
+            }
             eprintln!("{l}");
         }
     }
@@ -50,9 +55,12 @@ macro_rules! diag {
     ($($t:tt)*) => { diag_out(format!($($t)*)) };
 }
 
-/// A run's summary line: an event (`DPL-SUMMARY`) and the plain line (scripts read it).
+/// A run's summary line: an event (`DPL-DONE`, the run-outcome code every engine uses) and the
+/// plain line (scripts read it) — in text the plain line alone, which is the same message.
 fn summary_out(text: String) {
-    vyges_events::emit(&vyges_events::Event::new("vyges-dpl", vyges_events::Severity::Info, text.clone()).with_code("DPL-SUMMARY"));
+    if !vyges_events::text_mode() {
+        vyges_events::emit(&vyges_events::Event::new("vyges-dpl", vyges_events::Severity::Info, text.clone()).with_code("DPL-DONE"));
+    }
     eprintln!("{text}");
 }
 
