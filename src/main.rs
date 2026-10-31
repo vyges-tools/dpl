@@ -139,89 +139,14 @@ const DESCRIBE: &str = r#"{
   "invocation": {
     "args_template": ["check-placement", "{odb}"],
     "optional": [{ "arg": "out", "flag": "-o" }],
-    "emits_json": true
+    "emits_json": true,
+    "findings_exit_codes": [1]
   },
-  "commands": [
-    {
-      "name": "check-placement",
-      "summary": "report whether a placement is legal, family by family",
-      "args_template": ["check-placement", "{odb}"],
-      "optional": [{ "arg": "out", "flag": "-o" }],
-      "assertion": { "id": "placement-legal", "field": "status", "pass_when": { "eq": "clean" } }
-    },
-    {
-      "name": "detailed-placement",
-      "summary": "legalize the placement -- negotiated congestion by default",
-      "args_template": ["detailed-placement", "{odb}"],
-      "optional": [
-        { "arg": "out_odb", "flag": "--out-odb", "description": "write the legalized database here" },
-        { "arg": "dry_run", "flag": "--dry-run", "description": "legalize and report, write nothing" },
-        { "arg": "use_diamond_legalizer", "flag": "--use-diamond-legalizer", "description": "use the diamond search instead of negotiation" },
-        { "arg": "max_displacement", "flag": "--max-displacement", "description": "cap the move at N sites and M rows, 'N' or 'N,M' (default 500,100)" },
-        { "arg": "site_search_window", "flag": "--site-search-window", "description": "base search width along the row, in sites (default 20)" },
-        { "arg": "row_search_window", "flag": "--row-search-window", "description": "base search height, in rows (default 5)" },
-        { "arg": "drc_penalty", "flag": "--drc-penalty", "description": "cost added per DRC violation at a candidate site (default 5)" },
-        { "arg": "disable_window_extension", "flag": "--disable-window-extension", "description": "do not widen the search past a macro or a wall" }
-      ],
-      "assertion": { "id": "placement-legalized", "field": "status", "pass_when": { "eq": "legalized" } }
-    },
-    {
-      "name": "filler-placement",
-      "summary": "fill every empty site run with filler masters",
-      "args_template": ["filler-placement", "{odb}", "{patterns}"],
-      "optional": [
-        { "arg": "out_odb", "flag": "--out-odb", "description": "write the filled database here" },
-        { "arg": "prefix", "flag": "--prefix", "description": "filler instance name prefix (default FILLER_)" }
-      ],
-      "assertion": { "id": "placement-filled", "field": "status", "pass_when": { "eq": "filled" } }
-    },
-    {
-      "name": "remove-fillers",
-      "summary": "destroy every filler instance (an unlocked CORE_SPACER)",
-      "args_template": ["remove-fillers", "{odb}"],
-      "optional": [
-        { "arg": "out_odb", "flag": "--out-odb", "description": "write the database here" }
-      ],
-      "assertion": { "id": "fillers-removed", "field": "status", "pass_when": { "eq": "removed" } }
-    },
-    {
-      "name": "optimize-mirroring",
-      "summary": "flip placed cells about Y where that does not lengthen their nets",
-      "args_template": ["optimize-mirroring", "{odb}"],
-      "optional": [
-        { "arg": "out_odb", "flag": "--out-odb", "description": "write the database here" }
-      ],
-      "assertion": { "id": "mirroring-optimized", "field": "status", "pass_when": { "eq": "optimized" } }
-    },
-    {
-      "name": "improve-placement",
-      "summary": "detailed placement improvement (mis, global/vertical swap, reorder, random moves, orient)",
-      "args_template": ["improve-placement", "{odb}"],
-      "optional": [
-        { "arg": "dump_setup", "flag": "--dump-setup", "description": "print the manager state after the shift legalizer" },
-        { "arg": "out_odb", "flag": "--out-odb", "description": "write the improved database here" },
-        { "arg": "random_seed", "flag": "--random-seed", "description": "the optimizers' random seed (default 1)" },
-        { "arg": "max_displacement", "flag": "--max-displacement", "description": "move cap in ROW HEIGHTS, 'X' or 'X,Y' (the reference's -max_displacement)" },
-        { "arg": "trace_stages", "flag": "--trace-stages", "description": "print each stage's generator state and cell positions" },
-        { "arg": "report_one_site_gaps", "flag": "--report-one-site-gaps", "description": "print the cells the one-site-gap check would record, on any design" },
-        { "arg": "inject_stage", "flag": "--inject-stage", "description": "correlation aid: place the cells as FILE's VYGS begin record for the start stage says" },
-        { "arg": "start_stage", "flag": "--start-stage", "description": "correlation aid: skip the stages before this one" },
-        { "arg": "stop_stage", "flag": "--stop-stage", "description": "correlation aid: stop after this stage" },
-        { "arg": "rng_skip", "flag": "--rng-skip", "description": "correlation aid: discard N draws before the start stage" }
-      ],
-      "assertion": { "id": "placement-improved", "field": "status", "pass_when": { "eq": "improved" } }
-    }
-  ],
   "inputs": {
     "type": "object",
     "required": ["odb"],
     "properties": {
-      "odb": { "type": "string", "description": "the design database to check or legalize" },
-      "out_odb": { "type": "string", "description": "write the legalized database here" },
-      "max_displacement": { "type": "string", "description": "move cap, 'SITES' or 'SITES,ROWS'" },
-      "site_search_window": { "type": "integer", "description": "base search width in sites" },
-      "row_search_window": { "type": "integer", "description": "base search height in rows" },
-      "drc_penalty": { "type": "number", "description": "cost per DRC violation at a candidate" },
+      "odb": { "type": "string", "description": "the design database to check" },
       "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
     }
   },
@@ -231,7 +156,134 @@ const DESCRIBE: &str = r#"{
     { "role": "placement_check", "field": "report_path" },
     { "role": "odb", "field": "out_odb" }
   ],
-  "assertion": { "id": "placement-legal", "field": "status", "pass_when": { "eq": "clean" } }
+  "assertion": { "id": "placement-legal", "field": "status", "pass_when": { "eq": "clean" } },
+  "tools": [
+    {
+      "name": "dpl.detailed_placement",
+      "summary": "legalize the placement -- negotiated congestion by default",
+      "invocation": {
+        "args_template": ["detailed-placement", "{odb}"],
+        "optional": [
+          { "arg": "out_odb", "flag": "--out-odb" },
+          { "arg": "dry_run", "flag": "--dry-run" },
+          { "arg": "use_diamond_legalizer", "flag": "--use-diamond-legalizer" },
+          { "arg": "max_displacement", "flag": "--max-displacement" },
+          { "arg": "site_search_window", "flag": "--site-search-window" },
+          { "arg": "row_search_window", "flag": "--row-search-window" },
+          { "arg": "drc_penalty", "flag": "--drc-penalty" },
+          { "arg": "disable_window_extension", "flag": "--disable-window-extension" }
+        ],
+        "emits_json": true,
+        "findings_exit_codes": [1]
+      },
+      "inputs": {
+        "type": "object",
+        "required": ["odb"],
+        "properties": {
+          "odb": { "type": "string", "description": "the design database (.odb)" },
+          "out_odb": { "type": "string", "description": "write the legalized database here" },
+          "dry_run": { "type": "boolean", "description": "legalize and report, write nothing" },
+          "use_diamond_legalizer": { "type": "boolean", "description": "use the diamond search instead of negotiation" },
+          "max_displacement": { "type": "string", "description": "cap the move at N sites and M rows, 'N' or 'N,M' (default 500,100)" },
+          "site_search_window": { "type": "integer", "description": "base search width along the row, in sites (default 20)" },
+          "row_search_window": { "type": "integer", "description": "base search height, in rows (default 5)" },
+          "drc_penalty": { "type": "number", "description": "cost added per DRC violation at a candidate site (default 5)" },
+          "disable_window_extension": { "type": "boolean", "description": "do not widen the search past a macro or a wall" }
+        }
+      },
+      "assertion": { "id": "placement-legalized", "field": "status", "pass_when": { "eq": "legalized" } }
+    },
+    {
+      "name": "dpl.filler_placement",
+      "summary": "fill every empty site run with filler masters",
+      "invocation": {
+        "args_template": ["filler-placement", "{odb}", "{patterns}"],
+        "optional": [{ "arg": "out_odb", "flag": "--out-odb" }, { "arg": "prefix", "flag": "--prefix" }],
+        "emits_json": true
+      },
+      "inputs": {
+        "type": "object",
+        "required": ["odb", "patterns"],
+        "properties": {
+          "odb": { "type": "string", "description": "the design database (.odb)" },
+          "patterns": {
+            "type": ["string", "array"],
+            "items": { "type": "string" },
+            "description": "filler master name patterns, one per entry (glob, e.g. sky130_fd_sc_hd__fill_*)"
+          },
+          "out_odb": { "type": "string", "description": "write the filled database here" },
+          "prefix": { "type": "string", "description": "filler instance name prefix (default FILLER_)" }
+        }
+      },
+      "assertion": { "id": "placement-filled", "field": "status", "pass_when": { "eq": "filled" } }
+    },
+    {
+      "name": "dpl.remove_fillers",
+      "summary": "destroy every filler instance (an unlocked CORE_SPACER)",
+      "invocation": { "args_template": ["remove-fillers", "{odb}"], "optional": [{ "arg": "out_odb", "flag": "--out-odb" }], "emits_json": true },
+      "inputs": {
+        "type": "object",
+        "required": ["odb"],
+        "properties": {
+          "odb": { "type": "string", "description": "the design database (.odb)" },
+          "out_odb": { "type": "string", "description": "write the database here" }
+        }
+      },
+      "assertion": { "id": "fillers-removed", "field": "status", "pass_when": { "eq": "removed" } }
+    },
+    {
+      "name": "dpl.optimize_mirroring",
+      "summary": "flip placed cells about Y where that does not lengthen their nets",
+      "invocation": { "args_template": ["optimize-mirroring", "{odb}"], "optional": [{ "arg": "out_odb", "flag": "--out-odb" }], "emits_json": true },
+      "inputs": {
+        "type": "object",
+        "required": ["odb"],
+        "properties": {
+          "odb": { "type": "string", "description": "the design database (.odb)" },
+          "out_odb": { "type": "string", "description": "write the database here" }
+        }
+      },
+      "assertion": { "id": "mirroring-optimized", "field": "status", "pass_when": { "eq": "optimized" } }
+    },
+    {
+      "name": "dpl.improve_placement",
+      "summary": "detailed placement improvement (mis, global/vertical swap, reorder, random moves, orient)",
+      "invocation": {
+        "args_template": ["improve-placement", "{odb}"],
+        "optional": [
+          { "arg": "dump_setup", "flag": "--dump-setup" },
+          { "arg": "out_odb", "flag": "--out-odb" },
+          { "arg": "random_seed", "flag": "--random-seed" },
+          { "arg": "max_displacement", "flag": "--max-displacement" },
+          { "arg": "trace_stages", "flag": "--trace-stages" },
+          { "arg": "report_one_site_gaps", "flag": "--report-one-site-gaps" },
+          { "arg": "inject_stage", "flag": "--inject-stage" },
+          { "arg": "start_stage", "flag": "--start-stage" },
+          { "arg": "stop_stage", "flag": "--stop-stage" },
+          { "arg": "rng_skip", "flag": "--rng-skip" }
+        ],
+        "emits_json": true
+      },
+      "inputs": {
+        "type": "object",
+        "required": ["odb"],
+        "properties": {
+          "odb": { "type": "string", "description": "the design database (.odb)" },
+          "dump_setup": { "type": "boolean", "description": "print the manager state after the shift legalizer" },
+          "out_odb": { "type": "string", "description": "write the improved database here" },
+          "random_seed": { "type": "integer", "description": "the optimizers' random seed (default 1)" },
+          "max_displacement": { "type": "string", "description": "move cap in ROW HEIGHTS, 'X' or 'X,Y' (the reference's -max_displacement)" },
+          "trace_stages": { "type": "boolean", "description": "print each stage's generator state and cell positions" },
+          "report_one_site_gaps": { "type": "boolean", "description": "print the cells the one-site-gap check would record, on any design" },
+          "inject_stage": { "type": "string", "description": "correlation aid: place the cells as FILE's VYGS begin record for the start stage says" },
+          "start_stage": { "type": "string", "description": "correlation aid: skip the stages before this one" },
+          "stop_stage": { "type": "string", "description": "correlation aid: stop after this stage" },
+          "rng_skip": { "type": "integer", "description": "correlation aid: discard N draws before the start stage" }
+        }
+      },
+      "assertion": { "id": "placement-improved", "field": "status", "pass_when": { "eq": "improved" } }
+    }
+  ]
 }"#;
 
 const USAGE: &str = "\
@@ -657,6 +709,8 @@ fn legalize(args: &[String]) -> ExitCode {
                            the flag cannot change the result");
                 bad = true;
             }
+            // the report is always JSON; accepted because `vyges mcp` appends it (emits_json)
+            "--json" => {}
             a if a.starts_with('-') => {
                 diag!("vyges-dpl: unknown option `{a}`");
                 return ExitCode::from(2);
@@ -1059,5 +1113,43 @@ mod descriptor_tests {
         let d = json();
         assert_eq!(d["assertion"]["field"], "status");
         assert_eq!(d["assertion"]["pass_when"]["eq"], "clean");
+    }
+}
+
+#[cfg(test)]
+mod descriptor_args_tests {
+    use super::DESCRIBE;
+    /// Every advertised input reaches the command line, and every command-line token is
+    /// advertised -- for the main operation and each `tools[]` entry. `vyges mcp` builds the
+    /// argv from these and refuses an argument the template would drop; 0.1.51 shipped inputs
+    /// that never arrived (ifp's die area, ppl's layers, fin's rules).
+    #[test]
+    fn every_advertised_input_reaches_the_command_line() {
+        use std::collections::BTreeSet;
+        let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("descriptor is valid JSON");
+        let mut ops = vec![d.clone()];
+        ops.extend(d["tools"].as_array().cloned().unwrap_or_default());
+        for op in &ops {
+            let inv = &op["invocation"];
+            let mut used: BTreeSet<String> = inv["args_template"]
+                .as_array()
+                .expect("an args_template")
+                .iter()
+                .filter_map(|t| t.as_str())
+                .filter(|t| t.starts_with('{') && t.ends_with('}'))
+                .map(|t| t[1..t.len() - 1].to_string())
+                .collect();
+            if let Some(o) = inv.get("optional") {
+                let o = o.as_array().expect("invocation.optional is an array of {arg, flag}");
+                used.extend(o.iter().map(|x| x["arg"].as_str().expect("an arg").to_string()));
+            }
+            let props: BTreeSet<String> = op["inputs"]["properties"]
+                .as_object()
+                .expect("inputs.properties")
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(used, props, "{}: command line vs advertised inputs", op["name"]);
+        }
     }
 }
