@@ -100,7 +100,10 @@ pub struct Grid {
     /// `Grid::pin_blockages_` — per routing level (index = level, 0 unused), the power via / patch
     /// metal outside the stripes, grown by the layer's min spacing less one, core-relative. A pin
     /// shape TOUCHING one (closed test, as `bgi::intersects`) is a short the router cannot fix.
-    pub pin_blockages: Vec<Vec<crate::drc::EdgeBox>>,
+    ///
+    /// 🔑 Each carries the SPECIAL NET whose metal it is (upstream `102fa081cbd`, at `4155ac3`):
+    /// a pin connected to that same net may touch it — it is the pin's own power, not a short.
+    pub pin_blockages: Vec<Vec<(crate::drc::EdgeBox, String)>>,
     /// The SITE height of every row in the block, in the order the rows were read.
     ///
     /// ⛔ Kept because `uniform_row_height_` is derived from SITE heights, not from the spacing
@@ -354,41 +357,67 @@ impl Grid {
     /// questions about the UNION, and growing by a square distributes over a union.
     fn mark_pin_blockages(&mut self, db: &Db, levels: &std::collections::HashMap<String, i32>) {
         let max = crate::drc::MAX_PIN_LEVEL as usize;
-        let mut wire: Vec<Vec<crate::drc::EdgeBox>> = vec![Vec::new(); max + 1];
-        let mut via: Vec<Vec<crate::drc::EdgeBox>> = vec![Vec::new(); max + 1];
         let level_of = |layer_no: i64| -> Option<usize> {
             let l = *levels.get(&db.layer_name_by_number(layer_no))?;
             (1..=max as i32).contains(&l).then_some(l as usize)
         };
+        // Stripe metal is every special net's together: a via of one net is not exposed where
+        // ANOTHER net's stripe covers it either.
+        let mut wire: Vec<Vec<crate::drc::EdgeBox>> = vec![Vec::new(); max + 1];
         for (layer_no, x0, y0, x1, y1, shape) in db.special_wire_boxes().unwrap_or_default() {
             let Some(l) = level_of(layer_no) else { continue };
-            if shape == "DRCFILL" { via[l].push((x0, y0, x1, y1)) } else { wire[l].push((x0, y0, x1, y1)) }
-        }
-        for (layer_no, x0, y0, x1, y1) in db.special_via_boxes().unwrap_or_default() {
-            if let Some(l) = level_of(layer_no) {
-                via[l].push((x0, y0, x1, y1));
+            if shape != "DRCFILL" {
+                wire[l].push((x0, y0, x1, y1));
             }
+        }
+        // ⛔ Via metal is kept PER NET, in `getNets()` order (`via_metal` is a vector of
+        // `(net, per-level metal)`): the blockage a pin may touch is decided by whose it is.
+        let mut via: Vec<(String, Vec<Vec<crate::drc::EdgeBox>>)> = Vec::new();
+        for net in db.net_names() {
+            if !db.net_is_special(&net) {
+                continue;
+            }
+            let mut per = vec![Vec::new(); max + 1];
+            for (layer_no, from_via, x0, y0, x1, y1) in db.net_swire_expanded_boxes(&net).unwrap_or_default() {
+                if let (true, Some(l)) = (from_via, level_of(layer_no)) {
+                    per[l].push((x0, y0, x1, y1));
+                }
+            }
+            // DRCFILL patches count as via metal (type 11). A via box carrying that type is via
+            // metal already, so taking it twice changes nothing: both are unions.
+            for (layer_no, x0, y0, x1, y1, kind, _) in db.net_swire_shapes(&net).unwrap_or_default() {
+                if let (11, Some(l)) = (kind, level_of(layer_no)) {
+                    per[l].push((x0, y0, x1, y1));
+                }
+            }
+            via.push((net, per));
         }
         let names: std::collections::HashMap<i32, &String> = levels.iter().map(|(n, &l)| (l, n)).collect();
         for l in 1..=max {
             let bloat = names.get(&(l as i32)).map_or(0, |n| (db.layer_get_spacing(n) - 1).max(0));
-            for r in crate::drc::rects_minus(&via[l], &wire[l]) {
-                let b = (r.0 - bloat - self.core.0, r.1 - bloat - self.core.1, r.2 + bloat - self.core.0, r.3 + bloat - self.core.1);
-                let gx0 = (b.0 / self.site_width).max(0) as usize;
-                let gx1 = (((b.2 + self.site_width - 1) / self.site_width).max(0) as usize).min(self.row_site_count);
-                for gy in self.grid_rows_covering(b.1, b.3) {
-                    for gx in gx0..gx1 {
-                        self.pixels[gy][gx].blocked_pin_layers |= 1 << l;
+            for (net, per) in &via {
+                for r in crate::drc::rects_minus(&per[l], &wire[l]) {
+                    let b = (r.0 - bloat - self.core.0, r.1 - bloat - self.core.1, r.2 + bloat - self.core.0, r.3 + bloat - self.core.1);
+                    let gx0 = (b.0 / self.site_width).max(0) as usize;
+                    let gx1 = (((b.2 + self.site_width - 1) / self.site_width).max(0) as usize).min(self.row_site_count);
+                    for gy in self.grid_rows_covering(b.1, b.3) {
+                        for gx in gx0..gx1 {
+                            self.pixels[gy][gx].blocked_pin_layers |= 1 << l;
+                        }
                     }
+                    self.pin_blockages[l].push((b, net.clone()));
                 }
-                self.pin_blockages[l].push(b);
             }
         }
     }
 
-    /// `Grid::overlapsPinBlockage` — does `rect` (core-relative) touch any blockage on `level`?
-    pub fn overlaps_pin_blockage(&self, level: usize, rect: crate::drc::EdgeBox) -> bool {
-        self.pin_blockages.get(level).is_some_and(|v| v.iter().any(|&b| crate::drc::rects_touch(b, rect)))
+    /// `Grid::overlapsPinBlockage(level, rect, pin_net)` — does `rect` (core-relative) touch any
+    /// blockage on `level` that is NOT `pin_net`'s own metal? `pin_net` is the pin's net, `""` for
+    /// none (a pin on no net is exempt from nothing).
+    pub fn overlaps_pin_blockage(&self, level: usize, rect: crate::drc::EdgeBox, pin_net: &str) -> bool {
+        self.pin_blockages.get(level).is_some_and(|v| {
+            v.iter().any(|(b, net)| net != pin_net && crate::drc::rects_touch(*b, rect))
+        })
     }
 
     /// Whether `blocked_layers` was actually populated, and from how many squares.
@@ -1144,6 +1173,22 @@ mod site_orientation_tests {
         let g = two_sites_one_row();
         assert_eq!(g.site_orient_at(0, 0, "ABSENT"), None);
         assert_eq!(g.site_orient_at(0, 1, "SINGLE"), None, "off the grid vertically");
+    }
+
+    // Rule (Grid::overlapsPinBlockage, upstream 102fa081cbd at 4155ac3): a pin may touch the
+    // power metal of the net it is connected to; any other net's metal, or a pin on no net, is
+    // blocked as before.
+    #[test]
+    fn a_pin_may_touch_its_own_nets_power_metal() {
+        let mut g = two_sites_one_row();
+        g.pin_blockages[1].push(((0, 0, 10, 10), "VDD".to_string()));
+        let pin = (5, 5, 6, 6);
+        assert!(!g.overlaps_pin_blockage(1, pin, "VDD"), "its own net: no short");
+        assert!(g.overlaps_pin_blockage(1, pin, "VSS"), "another net: blocked");
+        assert!(g.overlaps_pin_blockage(1, pin, ""), "no net: blocked");
+        assert!(!g.overlaps_pin_blockage(1, (11, 11, 12, 12), "VSS"), "not touching");
+        g.pin_blockages[1].push(((4, 4, 7, 7), "VSS".to_string()));
+        assert!(g.overlaps_pin_blockage(1, pin, "VDD"), "a second net's metal still blocks");
     }
 
     #[test]

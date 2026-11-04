@@ -177,6 +177,14 @@ pub fn check_placement(db: &Db) -> Report {
 /// ℹ️ Exposed for tests, which need to exercise both settings on one design. Production callers
 /// want [`check_placement`], which derives it the way upstream does.
 pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &crate::negotiate::Padding) -> Report {
+    check_placement_pdn(db, disallow_one_site_gaps, padding, false)
+}
+
+/// [`check_placement_opts`] after a `detailed_placement -pdn_aware` on this block: upstream's
+/// `checkPlacement` runs `initGrid(isPdnAwareForCurrentBlock())`, which is that call's flag, so
+/// every cell is also checked against the fixed supply vias (`Fixed supply vias`, DPL-0013 family).
+pub fn check_placement_pdn(db: &Db, disallow_one_site_gaps: bool, padding: &crate::negotiate::Padding,
+                           pdn_aware: bool) -> Report {
     let ys = row_ys(db);
     let sw = site_width(db);
     let x0 = core_x_min(db);
@@ -287,6 +295,11 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
             "one_site_gap (the technology HAS a one-site master, so upstream does not apply it)"
                 .into());
     }
+    let supply = if pdn_aware {
+        drc_grid.as_ref().and_then(|g| crate::supplyvias::FixedSupplyVias::build(db, g))
+    } else {
+        None
+    };
     if let Some(g) = drc_grid.as_ref() {
         let n: usize = g.pin_blockages.iter().map(Vec::len).sum();
         if n > 0 {
@@ -440,10 +453,21 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
             // The pin stage places the master's pin shapes with its boundary's lower-left at
             // `gridToDbu(gridX)`, `gridYToDbu(gridRoundY)` in the cell's own orientation
             // (`cell_edges::transformEdgeRect`), core-relative like the blockages.
-            if !pin_models.of(db, &master).check(g, used, gx0 as i32, gx1 as i32, gy0 as i32, gy1 as i32, &orients[idx])
+            let model = pin_models.of(db, &master);
+            let nets = model.nets_of(db, name);
+            if !model.check(g, used, gx0 as i32, gx1 as i32, gy0 as i32, gy1 as i32, &orients[idx], &nets)
             {
                 out.failures.push(Failure { family: "blocked_layers".into(), cell: name.clone(),
                                             with: None });
+            }
+            // `checkFixedSupplyVias(cell)` — at `gridX(cell)`, `gridRoundY(cell)`, its orient.
+            if let Some(s) = &supply {
+                let gx = cx.div_euclid(g.site_width);
+                let gy = g.grid_round_y(cy) as i32;
+                if !s.check(name, &master, &s.nets_of(db, name, &master), gx, gy, &orients[idx]) {
+                    out.failures.push(Failure { family: "fixed_supply_vias".into(), cell: name.clone(),
+                                                with: None });
+                }
             }
         }
     }

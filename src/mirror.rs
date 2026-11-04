@@ -28,6 +28,9 @@ pub struct MirrorReport {
     /// `blocked_layers_reject_count_` — candidates whose flip would short a pin to power via metal
     /// (`fb9d98e5fe`: the via-metal test depends on orientation, so mirroring must re-ask it).
     pub blocked_layers_rejected: Vec<String>,
+    /// Candidates whose flip would bring a shape too close to a fixed supply via (`-pdn_aware`
+    /// only). Upstream keeps no counter for these; the list is ours.
+    pub fixed_supply_vias_rejected: Vec<String>,
     pub candidates: usize,
 }
 
@@ -126,6 +129,12 @@ fn inst_nets(db: &Db, inst: &str) -> Vec<String> {
 
 /// `OptimizeMirroring::run`.
 pub fn optimize_mirroring(db: &mut Db) -> Result<MirrorReport, String> {
+    optimize_mirroring_with(db, false)
+}
+
+/// [`optimize_mirroring`] after a `detailed_placement -pdn_aware` on this block: `initGrid(
+/// isPdnAwareForCurrentBlock())` builds the fixed-supply-via model and each flip is checked.
+pub fn optimize_mirroring_with(db: &mut Db, pdn_aware: bool) -> Result<MirrorReport, String> {
     // `importDb` → `adjustNodesOrient` → `initGrid` → `setGridCells`: the network's cells, each
     // painted in network order, in its own orientation.
     let mut grid = Grid::build(db)?;
@@ -154,6 +163,12 @@ pub fn optimize_mirroring(db: &mut Db) -> Result<MirrorReport, String> {
         .filter_map(|(ln, ..)| levels.get(&db.layer_name_by_number(ln)).copied()))).collect();
     let mut models = crate::viametal::PinModels::new(&levels);
     let pin_model: Vec<std::rc::Rc<crate::viametal::PinModel>> = masters.iter().map(|m| models.of(db, m)).collect();
+    let pin_nets: Vec<Vec<String>> = network.iter().enumerate().map(|(i, n)| pin_model[i].nets_of(db, n)).collect();
+    let supply = if pdn_aware { crate::supplyvias::FixedSupplyVias::build(db, &grid) } else { None };
+    let supply_nets: Vec<Vec<String>> = match &supply {
+        Some(s) => network.iter().zip(&masters).map(|(n, m)| s.nets_of(db, n, m)).collect(),
+        None => Vec::new(),
+    };
 
     // `findNetBoxes`, then the sort: HPWL descending, net id ascending — the block's net order
     // IS id order, so a stable sort on HPWL alone gives the tie-break.
@@ -186,9 +201,17 @@ pub fn optimize_mirroring(db: &mut Db) -> Result<MirrorReport, String> {
         // `isBlockedLayersLegal(cell, orient_my)` — `checkBlockedLayers` at `gridX(cell)`,
         // `gridRoundY(cell)` in the mirrored orientation: both stages, the stripe mask included.
         let (gx0, gy0, gx1, gy1) = grid.covering(b.0, b.1, b.2, b.3);
-        if !pin_model[i].check(&grid, used[i], gx0 as i32, gx1 as i32, gy0 as i32, gy1 as i32, orient_my) {
+        if !pin_model[i].check(&grid, used[i], gx0 as i32, gx1 as i32, gy0 as i32, gy1 as i32, orient_my, &pin_nets[i]) {
             report.blocked_layers_rejected.push(inst.clone());
             continue;
+        }
+        // `isFixedSupplyViasLegal(cell, orient_my)` — at `gridX(cell)`, `gridRoundY(cell)`.
+        if let Some(s) = &supply {
+            let (gx, gy) = (b.0.div_euclid(grid.site_width), grid.grid_round_y(b.1) as i32);
+            if !s.check(inst, &masters[i], &supply_nets[i], gx, gy, orient_my) {
+                report.fixed_supply_vias_rejected.push(inst.clone());
+                continue;
+            }
         }
         let before = inst_hpwl(db, inst, &boxes);
         let touched = inst_nets(db, inst);

@@ -122,7 +122,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
     "LEGALIZATION is implemented and is the default path: the NEGOTIATION legalizer, which is what the reference's `detailed_placement` runs when `-use_diamond_legalizer` is absent. `--use-diamond-legalizer` selects the other one. The two produce DIFFERENT placements, so the report names which ran.",
-    "At pin 27288f5c90265ae5296b2f5a9fa6e8714fa191ad, `detailed_placement` matches the reference on 78 of 78 comparable cases, including the 2 cases the reference added in that window for pins under power-via-stack metal (blocked_via_layers; blocked_via_pins, decided by `optimize_mirroring`): a pin shape that would touch power via or patch metal outside the stripes, grown by the layer's min spacing less one, is a blocked-layers violation in the legalizer, the checker and mirroring alike. Earlier, at pin da9f29f18b6487825aa880597176e0fa97110b31, with placement padding modelled, `detailed_placement` matched the reference on 67 of 67 comparable cases -- a case with no archived golden is scored against a fresh reference run of its own flow -- including aes (21340 components), cases followed by `filler_placement` or `remove_fillers` and scored with them, eight region (fence) designs on both legalizers, and every `optimize_mirroring` case (mirror1-3 on gcd, 138-140 cells flipped; mirror_edge_spacing, where the edge-spacing rule vetoes a flip). Skipped, and named: the 9 cases that run only `improve_placement` (NOT implemented), and 3 whose input file is not in the reference checkout. Earlier, at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34, it matched 28 of 28 comparable cases from its own regression suite, including aes (21340 components), ibex (34184) and gcd (549). The agreement is SWEEP-LEVEL, not final-placement only -- the reference's per-iteration debug trace and this engine's match line for line, every cell, every iteration, on simple05, simple07, gcd (574 lines) and hybrid_cells.",
+    "At pin 4155ac31, `detailed_placement` matches the reference on 83 of 83 comparable cases (log 71 of 71), including the six pdn_via cases run with -pdn_aware (fixed supply vias: a pin or obstruction of the cell may not come within the via layer's spacing of a supply via, unless the pin is on the via's own net). Earlier, at pin 27288f5c90265ae5296b2f5a9fa6e8714fa191ad, `detailed_placement` matched the reference on 78 of 78 comparable cases, including the 2 cases the reference added in that window for pins under power-via-stack metal (blocked_via_layers; blocked_via_pins, decided by `optimize_mirroring`): a pin shape that would touch power via or patch metal outside the stripes, grown by the layer's min spacing less one, is a blocked-layers violation in the legalizer, the checker and mirroring alike. Earlier, at pin da9f29f18b6487825aa880597176e0fa97110b31, with placement padding modelled, `detailed_placement` matched the reference on 67 of 67 comparable cases -- a case with no archived golden is scored against a fresh reference run of its own flow -- including aes (21340 components), cases followed by `filler_placement` or `remove_fillers` and scored with them, eight region (fence) designs on both legalizers, and every `optimize_mirroring` case (mirror1-3 on gcd, 138-140 cells flipped; mirror_edge_spacing, where the edge-spacing rule vetoes a flip). Skipped, and named: the 9 cases that run only `improve_placement` (NOT implemented), and 3 whose input file is not in the reference checkout. Earlier, at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34, it matched 28 of 28 comparable cases from its own regression suite, including aes (21340 components), ibex (34184) and gcd (549). The agreement is SWEEP-LEVEL, not final-placement only -- the reference's per-iteration debug trace and this engine's match line for line, every cell, every iteration, on simple05, simple07, gcd (574 lines) and hybrid_cells.",
     "It read 18 of 28 when the pin first moved from 945a9f48dc6e5cc91d865daa92c45a1094cb682c, because the reference reworked the negotiation legalizer's INITIAL SNAPPING across 7 commits and refreshed 24 of its own goldens. Four mechanisms were transcribed to recover it: `Grid::gridRoundX` (initial x ROUNDS to the nearest site rather than truncating), `displacementInSites`/`rowDispInSites` replacing the deleted `NegCell::displacement()` so displacement is site widths on BOTH axes, `initialSnap()`'s diamond search in place of a four-direction scan, and -- the one that mattered most -- running that snap as its OWN pass after every fixed cell is blockaded, testing grid CAPACITY rather than merely whether a site exists.",
     "BUT 35 of the reference's 63 `detailed_placement` cases are OUTSIDE that number and are not scored at all: 12 ship no golden, 8 need filler placement, 7 declare REGIONS/GROUPS, 7 need placement padding values, 1 needs both. `18 of 28` is a claim about what the corpus asks, not about every design.",
     "AND THE DENOMINATOR IS SHORT: the reference ships 69 .tcl cases calling `detailed_placement`, not 63. Five of them -- report_failures, fragmented_row03, pad02, fillers8, obstruction2 -- wrap the call as `catch { detailed_placement }`, so the harness's command filter does not see them and they are scored by nothing. All five are error-path cases.",
@@ -134,11 +134,11 @@ const DESCRIBE: &str = r#"{
     "A site-alignment failure removes the cell from the overlap comparison entirely. That is a side effect of the reference's `continue`, not a separate rule: checkOverlap is what paints a cell into its pixels, so a cell that was skipped is never there for a later cell to collide with.",
     "OVERLAP is the reference's pixel walk, in the reference's visit order (instances sorted by NAME): a cell fails only when a square it covers already holds an EARLIER cell it genuinely overlaps, so only the later cell of a pair is reported. An earlier rectangle sweep reported both, and its claim that the failing set matched was wrong -- the checker gate measured it on check2.",
     "status is one of clean, violations, vacuous or error. VACUOUS IS NOT CLEAN: it means the run examined no cell, and a design with no instances is an absent placement rather than a legal one.",
-    "check-placement is scored by a gate over every reference case that calls check_placement: the reference places the design, our checker reads that database, and its failing cells per family are compared with a fresh reference run's own warnings. At pin 27288f5c90265ae5296b2f5a9fa6e8714fa191ad, 77 of 78 comparable cases agree; in the one that differs, blocked_via_layers (added to the reference in that window), the reference reports 2 blocked-layer cells and this checker none, because the reference now also blocks pins under power-via-stack metal. At pin da9f29f18b6487825aa880597176e0fa97110b31, 76 of 76 comparable cases agreed, set_placement_padding passed as --padding-* flags. Skipped, and named: 3 whose input file is not in the reference checkout. Every case is legalized before it is checked, so a second run (--raw) checks the INPUT placement instead, where the families actually fail: 76 of 76 agree there too, region_placement failing on all 8 region designs. One-site gaps are checked in a second pass after every cell is painted, with the checker's own checkOneSiteGaps; no comparable case reports one, so that rule is pinned by constructed cases only. Earlier, at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c, it was correlated by hand on three designs."
+    "check-placement is scored by a gate over every reference case that calls check_placement: the reference places the design, our checker reads that database, and its failing cells per family are compared with a fresh reference run's own warnings. At pin 4155ac31, 85 of 85 comparable cases agree, and 85 of 85 with --raw; --pdn-aware adds the fixed supply vias family. At pin 27288f5c90265ae5296b2f5a9fa6e8714fa191ad, 77 of 78 comparable cases agree; in the one that differs, blocked_via_layers (added to the reference in that window), the reference reports 2 blocked-layer cells and this checker none, because the reference now also blocks pins under power-via-stack metal. At pin da9f29f18b6487825aa880597176e0fa97110b31, 76 of 76 comparable cases agreed, set_placement_padding passed as --padding-* flags. Skipped, and named: 3 whose input file is not in the reference checkout. Every case is legalized before it is checked, so a second run (--raw) checks the INPUT placement instead, where the families actually fail: 76 of 76 agree there too, region_placement failing on all 8 region designs. One-site gaps are checked in a second pass after every cell is painted, with the checker's own checkOneSiteGaps; no comparable case reports one, so that rule is pinned by constructed cases only. Earlier, at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c, it was correlated by hand on three designs."
   ],
   "invocation": {
     "args_template": ["check-placement", "{odb}"],
-    "optional": [{ "arg": "out", "flag": "-o" }],
+    "optional": [{ "arg": "out", "flag": "-o" }, { "arg": "pdn_aware", "flag": "--pdn-aware" }],
     "emits_json": true,
     "findings_exit_codes": [1]
   },
@@ -147,7 +147,8 @@ const DESCRIBE: &str = r#"{
     "required": ["odb"],
     "properties": {
       "odb": { "type": "string", "description": "the design database to check" },
-      "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
+      "out": { "type": "string", "description": "write the report to FILE instead of stdout" },
+      "pdn_aware": { "type": "boolean", "description": "also check every cell against the fixed supply (PDN) vias, as after detailed_placement -pdn_aware" }
     }
   },
   "consumes": ["odb"],
@@ -171,7 +172,8 @@ const DESCRIBE: &str = r#"{
           { "arg": "site_search_window", "flag": "--site-search-window" },
           { "arg": "row_search_window", "flag": "--row-search-window" },
           { "arg": "drc_penalty", "flag": "--drc-penalty" },
-          { "arg": "disable_window_extension", "flag": "--disable-window-extension" }
+          { "arg": "disable_window_extension", "flag": "--disable-window-extension" },
+          { "arg": "pdn_aware", "flag": "--pdn-aware" }
         ],
         "emits_json": true,
         "findings_exit_codes": [1]
@@ -188,7 +190,8 @@ const DESCRIBE: &str = r#"{
           "site_search_window": { "type": "integer", "description": "base search width along the row, in sites (default 20)" },
           "row_search_window": { "type": "integer", "description": "base search height, in rows (default 5)" },
           "drc_penalty": { "type": "number", "description": "cost added per DRC violation at a candidate site (default 5)" },
-          "disable_window_extension": { "type": "boolean", "description": "do not widen the search past a macro or a wall" }
+          "disable_window_extension": { "type": "boolean", "description": "do not widen the search past a macro or a wall" },
+          "pdn_aware": { "type": "boolean", "description": "keep cells clear of fixed supply (PDN) vias" }
         }
       },
       "assertion": { "id": "placement-legalized", "field": "status", "pass_when": { "eq": "legalized" } }
@@ -234,13 +237,14 @@ const DESCRIBE: &str = r#"{
     {
       "name": "dpl.optimize_mirroring",
       "summary": "flip placed cells about Y where that does not lengthen their nets",
-      "invocation": { "args_template": ["optimize-mirroring", "{odb}"], "optional": [{ "arg": "out_odb", "flag": "--out-odb" }], "emits_json": true },
+      "invocation": { "args_template": ["optimize-mirroring", "{odb}"], "optional": [{ "arg": "out_odb", "flag": "--out-odb" }, { "arg": "pdn_aware", "flag": "--pdn-aware" }], "emits_json": true },
       "inputs": {
         "type": "object",
         "required": ["odb"],
         "properties": {
           "odb": { "type": "string", "description": "the design database (.odb)" },
-          "out_odb": { "type": "string", "description": "write the database here" }
+          "out_odb": { "type": "string", "description": "write the database here" },
+          "pdn_aware": { "type": "boolean", "description": "also reject a flip that comes too close to a fixed supply (PDN) via" }
         }
       },
       "assertion": { "id": "mirroring-optimized", "field": "status", "pass_when": { "eq": "optimized" } }
@@ -290,11 +294,11 @@ const USAGE: &str = "\
 vyges physical dpl — detailed placement: legality checking and legalization over the design database
 
 USAGE:
-  vyges physical dpl check-placement    <design.odb> [--json] [-o FILE] [--padding-* ...]
+  vyges physical dpl check-placement    <design.odb> [--json] [-o FILE] [--padding-* ...] [--pdn-aware]
   vyges physical dpl detailed-placement <design.odb> [--out-odb FILE] [--dry-run] [OPTIONS]
   vyges physical dpl filler-placement   <design.odb> PATTERN... [--prefix P] [--out-odb FILE]
   vyges physical dpl remove-fillers     <design.odb> [--out-odb FILE]
-  vyges physical dpl optimize-mirroring <design.odb> [--out-odb FILE]
+  vyges physical dpl optimize-mirroring <design.odb> [--out-odb FILE] [--pdn-aware]
   vyges physical dpl improve-placement  <design.odb> [--out-odb FILE] [--random-seed N] [--max-displacement X[,Y]]
                                         (in progress: mis/gs/vs/ro not built; --rng-skip N stands in)
   vyges physical dpl --describe | --help | --version
@@ -308,6 +312,9 @@ OPTIONS:
   --row-search-window N     base search height, in rows (default: 5)
   --drc-penalty F           cost added per DRC violation at a candidate site (default: 5)
   --disable-window-extension  do not widen the search window past a macro or a wall
+  --pdn-aware               keep cells clear of fixed supply (PDN) vias; also accepted by
+                            check-placement and optimize-mirroring, which then check them too
+                            (the reference's -pdn_aware, which later commands inherit)
   -o FILE                   write the report to FILE instead of stdout
   --json                    emit JSON (the default)
   --describe                print a machine-readable JSON description of the command
@@ -476,11 +483,12 @@ fn remove_fillers(args: &[String]) -> ExitCode {
 
 /// `optimize_mirroring` — flip cells about Y where that does not lengthen their nets.
 fn optimize_mirroring(args: &[String]) -> ExitCode {
-    let (mut odb, mut out_odb) = (None, None);
+    let (mut odb, mut out_odb, mut pdn_aware) = (None, None, false);
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--out-odb" => { i += 1; out_odb = args.get(i).cloned(); }
+            "--pdn-aware" => pdn_aware = true,
             a if odb.is_none() => odb = Some(a.to_string()),
             a => {
                 diag!("vyges-dpl: optimize-mirroring: unexpected argument {a}\n\n{USAGE}");
@@ -497,7 +505,7 @@ fn optimize_mirroring(args: &[String]) -> ExitCode {
         Ok(d) => d,
         Err(e) => { diag!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
     };
-    let rep = match vyges_dpl::mirror::optimize_mirroring(&mut db) {
+    let rep = match vyges_dpl::mirror::optimize_mirroring_with(&mut db, pdn_aware) {
         Ok(r) => r,
         Err(e) => { diag!("vyges-dpl: {e}"); return ExitCode::from(1); }
     };
@@ -648,6 +656,7 @@ fn legalize(args: &[String]) -> ExitCode {
             "--dry-run" => dry = true,
             "--use-diamond-legalizer" => diamond = true,
             "--disable-window-extension" => opts.disable_window_extension = true,
+            "--pdn-aware" => opts.pdn_aware = true,
             // set_placement_padding, which lives in opendp's memory and not in the database:
             // --padding-global L R, --padding-master M L R, --padding-inst I L R (sites).
             "--padding-global" | "--padding-master" | "--padding-inst" => {
@@ -763,7 +772,7 @@ fn legalize(args: &[String]) -> ExitCode {
         }
     }
     let hpwl_before = vyges_dpl::report::odb_hpwl(&db);
-    let res = match if diamond { vyges_dpl::place::legalize(&db) }
+    let res = match if diamond { vyges_dpl::place::legalize_with(&db, opts.pdn_aware) }
                     else { vyges_dpl::negotiate::legalize_padded(&db, opts, &padding) } {
         Ok(r) => r,
         Err(e) => { diag!("vyges-dpl: {e}"); return ExitCode::from(2); }
@@ -887,10 +896,12 @@ fn check(args: &[String]) -> ExitCode {
     let mut padding = vyges_dpl::negotiate::Padding::default();
     // `-masters` patterns, in call order, resolved once the database is open.
     let mut master_pads: Vec<(String, (i32, i32))> = Vec::new();
+    let mut pdn_aware = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--json" => {}
+            "--pdn-aware" => pdn_aware = true,
             "-o" => {
                 i += 1;
                 out = args.get(i).cloned();
@@ -927,7 +938,7 @@ fn check(args: &[String]) -> ExitCode {
         }
     };
     resolve_master_pads(&db, &mut padding, &master_pads);
-    let report = vyges_dpl::check::check_placement_opts(&db, !db.has_one_site_master(), &padding);
+    let report = vyges_dpl::check::check_placement_pdn(&db, !db.has_one_site_master(), &padding, pdn_aware);
     // ⛔ `vacuous` is reserved across this suite: a run that examined no cell must not report
     // clean. A design with no instances is not a legal placement, it is an absent one.
     let status = if report.cells_checked == 0 {

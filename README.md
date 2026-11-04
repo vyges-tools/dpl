@@ -9,8 +9,8 @@ vyges physical dpl detailed-placement design.odb --out-odb out.odb
 
 `detailed-placement` takes the reference's own tunables — `--max-displacement`,
 `--site-search-window`, `--row-search-window`, `--drc-penalty`,
-`--disable-window-extension`, `--use-diamond-legalizer` — with the reference's defaults. Run
-`--help` for the full list, and `--describe` for the machine-readable contract.
+`--disable-window-extension`, `--use-diamond-legalizer`, `--pdn-aware` — with the reference's
+defaults. Run `--help` for the full list, and `--describe` for the machine-readable contract.
 
 ℹ️ Two of the reference's options are deliberately absent. `-disallow_one_site_gaps` is **deprecated
 there** (it warns DPL-3 and ignores the flag, because the setting is derived from
@@ -39,6 +39,19 @@ legalizer's output against the other's expected result measures nothing.
 padded CORE classes only) is modelled on the negotiation path: `--padding-global L R`,
 `--padding-master M L R`, `--padding-inst I L R`, in sites. Padding lives in opendp's memory, not
 the database, so a caller that set it must pass it. With the diamond legalizer it is refused.
+
+✅ **PDN-aware placement** (`--pdn-aware`, the reference's `-pdn_aware`): both legalizers keep
+every cell clear of the fixed supply vias, so that no cell shape (pin or obstruction, on a routing
+or cut layer) comes closer than the layer's spacing to a via of a supply net, measured as strict
+Euclidean distance. A pin connected to the via's own net is exempt. In the reference the flag is
+session state: `check_placement` and `optimize_mirroring` after a `-pdn_aware` placement on the
+same block check the vias too. This engine runs each command separately, so pass `--pdn-aware` to
+`check-placement` (new family `fixed_supply_vias`) and to `optimize-mirroring` as well. An
+unconnected supply pin cancels its same-net exemption and is warned about (DPL-0502).
+
+✅ **A pin may touch its own net's power metal.** The blocked-layers check skips via or patch
+metal of the special net the pin is connected to, so a signal pin tied to that supply is not a
+short.
 
 ⬜ Not implemented, and named in `not_done` on every run: groups and regions, incremental placement, and two of the legalizer's four DRC terms — edge spacing
 (needs each master's LEF58 cell-edge list) and blocked layers.
@@ -69,6 +82,12 @@ order to be useful — and the reference suite leans on it harder: **77 of 92 te
 `check_placement`, 68 call `detailed_placement`**.
 
 ## Status
+
+At pin `4155ac31` (2026-11-03), `detailed_placement` matches the reference on **83 of 83** comparable
+cases, its log on 71 of 71, and `check-placement` agrees on 85 of 85 (85 of 85 again with `--raw`).
+New in that window, and now modelled: `-pdn_aware` (fixed supply vias, all six `pdn_via*` cases), the
+same-net exemption for power-via metal over a pin, and fixed cells blockaded over their obstruction
+pixels in the negotiation legalizer (`obstruction2`).
 
 At pin `27288f5c90265ae5296b2f5a9fa6e8714fa191ad` (2026-10-12), `detailed_placement` matches the reference on
 76 of 78 comparable cases and `check-placement` agrees on 77 of 78; the cases that differ are new reference cases

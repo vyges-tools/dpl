@@ -2690,6 +2690,7 @@ mod tests {
             window: &|_c, _x, y, _g| (-4, 4, vec![y; 1].into_iter().map(|_| y).collect()),
             placeable: &|c, x, _y| x >= 0 && x + c.width <= 8,
             drc_violations: &|_, _, _, _| 0,
+            supply_vias_ok: &|_, _, _| true,
             fixed_paint: &[],
             row_y: TEST_ROW_Y,
             site_width: TEST_SITE_WIDTH,
@@ -2713,6 +2714,7 @@ mod tests {
             placeable: &|_, x, _| (0..6).contains(&x),
             // Always dirty, wherever it sits.
             drc_violations: &|_, _, _, _| 1,
+            supply_vias_ok: &|_, _, _| true,
             fixed_paint: &[],
             row_y: TEST_ROW_Y,
             site_width: TEST_SITE_WIDTH,
@@ -2740,6 +2742,7 @@ mod tests {
             placeable: &|_, x, _| (0..6).contains(&x),
             // Only the bystander is dirty — the active cell is fine.
             drc_violations: &|c, _, _, _| i32::from(c.name == "bystander"),
+            supply_vias_ok: &|_, _, _| true,
             fixed_paint: &[],
             row_y: TEST_ROW_Y,
             site_width: TEST_SITE_WIDTH,
@@ -2766,6 +2769,7 @@ mod tests {
             window: &|_c, x, y, _g| (-x, 3 - x, vec![y]),
             placeable: &|_, x, _| (0..4).contains(&x),
             drc_violations: &|_, _, _, _| 0,
+            supply_vias_ok: &|_, _, _| true,
             fixed_paint: &[],
             row_y: TEST_ROW_Y,
             site_width: TEST_SITE_WIDTH,
@@ -2794,6 +2798,7 @@ mod tests {
             window: &|_c, x, y, _g| (-x, 3 - x, vec![y]),
             placeable: &|c, x, _| x >= 0 && x + c.width <= 4,
             drc_violations: &|_, _, _, _| 0,
+            supply_vias_ok: &|_, _, _| true,
             fixed_paint: &[],
             row_y: TEST_ROW_Y,
             site_width: TEST_SITE_WIDTH,
@@ -2958,6 +2963,9 @@ pub struct SweepCtx<'a> {
     /// the cell being placed — which is what upstream's `ripUp` (an `erasePixel` on the DPL
     /// grid) arranges before `findBestLocation` runs.
     pub drc_violations: &'a dyn Fn(&SweepCell, i32, i32, &NegGrid) -> i32,
+    /// `checkFixedSupplyVias` at a candidate (`-pdn_aware`): `tryLocation` drops a candidate that
+    /// fails it right after the fence test, before pricing it.
+    pub supply_vias_ok: &'a dyn Fn(&SweepCell, i32, i32) -> bool,
     /// Fixed-cell footprints, repainted into the occupancy map after every re-sync.
     pub fixed_paint: &'a [FixedPaint],
     /// Per-row y origins in DBU, so a row jump can be priced in SITE WIDTHS.
@@ -3131,6 +3139,10 @@ pub fn negotiation_iter_stats(cells: &mut [SweepCell], active: &mut Vec<usize>, 
             }
             if !(ctx.placeable)(&c, cand.x, cand.y) {
                 say(&cand, "place", 0.0, 0);
+                continue;
+            }
+            if !(ctx.supply_vias_ok)(&c, cand.x, cand.y) {
+                say(&cand, "vias", 0.0, 0);
                 continue;
             }
             let mut cost = negotiation_cost(
@@ -3432,6 +3444,8 @@ pub struct Options {
     pub row_search_window: i32,
     pub drc_penalty: f64,
     pub disable_window_extension: bool,
+    /// `detailed_placement -pdn_aware`: keep cells clear of fixed supply vias.
+    pub pdn_aware: bool,
 }
 
 impl Default for Options {
@@ -3443,6 +3457,7 @@ impl Default for Options {
             row_search_window: consts::ROW_SEARCH_WINDOW,
             drc_penalty: consts::DRC_PENALTY,
             disable_window_extension: false,
+            pdn_aware: false,
         }
     }
 }
@@ -3635,27 +3650,21 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             // blockade that is one row too tall does not look like an off-by-one in the output;
             // it looks like a legalizer that will not move cells vertically.
             let (x0, y0, x1, y1) = grid.covering(x - core.0, y - core.1, w, h);
-            // ⛔ **A fixed cell has the SAME two footprints a movable one does, and the blockade
-            // takes the NEGOTIATION one.** `buildGrid` walks `cells_` and blockades
-            // `cell.x, cell.y, cell.width, cell.height` — the very fields `initFromDb` set for
-            // every cell alike: `gridX` and **`gridRoundY`** for the origin, `round(w/site)` for
-            // the width, `gridHeight(master)` for the height. `covering` answers a different
-            // question — snap-DOWN row, `divCeil` width — and that one belongs to the occupancy
-            // stamp below, which upstream reaches through `paintPixel(node)`.
-            //
-            // ⚠️ The rows differ whenever a fixed cell is not row-aligned, which in `gcd` is most
-            // of the 255 of them: `gridRoundY` puts a cell past its row's midpoint one row HIGHER
-            // than `gridSnapDownY` does, so the whole blockade lands on the wrong row.
-            let (fw, fh) = (
-                cell_width_in_sites(w as i64, sw as i64),
-                grid.grid_height(h, db.row_pattern(&db.master_get_site(&master))
-                                        .map_or(0, |p| p.len())),
-            );
-            let (fx, fy) = init_position(
-                x as i64, y as i64, core.0 as i64, core.1 as i64, sw as i64,
-                &grid.row_y, fw, fh, gw, gh,
-            );
-            ngrid.blockade(fx, fy, fw, fh);
+            // The cell's negotiation height (`gridHeight(master)`), which the height census
+            // below counts.
+            let fh = grid.grid_height(h, db.row_pattern(&db.master_get_site(&master))
+                                        .map_or(0, |p| p.len()));
+            // ⛔ **Upstream `142cb954632` (at `4155ac3`): the blockade is `visitCellPixels(cell,
+            // unpadded)` — the very squares `checkPlacement` tests for overlap.** For a master
+            // with OVERLAP obstructions that is the obstruction shapes, not the whole box, and
+            // for any other cell it is `gridCovering`, so an off-grid fixed cell's partly covered
+            // edge squares are blocked too. Before it, the blockade was the negotiation footprint
+            // (`gridX`/`gridRoundY` origin, rounded width), which is not what the grid checks.
+            // `obstruction2` (a macro whose OVERLAP shapes leave its box partly open) converges
+            // at iteration 0 by this rule and stalled at 467 violations without it.
+            for (x0, y0, x1, y1) in crate::fillers::cell_pixel_rects(db, &grid, &name)? {
+                ngrid.blockade(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32);
+            }
             *heights.entry(fh).or_default() += 1;
             // ⚠️ The occupancy stamp keeps `covering`'s footprint: `paintPixel(node)` is
             // `gridX(cell)`, `gridSnapDownY(cell)` and `gridWidth`, read off the node's own DBU
@@ -3966,10 +3975,26 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
     // grown via / patch metal.
     let mut pin_models = crate::viametal::PinModels::new(&levels);
     let pin_model: Vec<std::rc::Rc<crate::viametal::PinModel>> = masters.iter().map(|m| pin_models.of(db, m)).collect();
+    // Each movable cell's net per terminal: a pin may touch its own net's power metal.
+    let pin_nets: Vec<Vec<String>> = (0..masters.len()).map(|i| pin_model[i].nets_of(db, &cells[i].name)).collect();
     let blocked_ok = |i: usize, x: i32, y: i32| -> bool {
         let (cw, ch) = dpl_dims[i];
         let orient = grid.site_orient_at(x as i64, y as i64, &sites[i]).unwrap_or_else(|| init_orients[i].clone());
-        pin_model[i].check(&grid, used_layers[i], x, x + cw, y, y + ch, &orient)
+        pin_model[i].check(&grid, used_layers[i], x, x + cw, y, y + ch, &orient, &pin_nets[i])
+    };
+    // `checkFixedSupplyVias` (`-pdn_aware`, upstream PR 11120): `initGrid(pdn_aware_)` builds the
+    // model; without the flag it is cleared and the check passes everywhere.
+    let supply = if opts.pdn_aware { crate::supplyvias::FixedSupplyVias::build(db, &grid) } else { None };
+    // Names by value: `cells` moves into the run below, and the check outlives that.
+    let supply_names: Vec<String> = cells.iter().map(|c| c.name.clone()).collect();
+    let supply_nets: Vec<Vec<String>> = match &supply {
+        Some(s) => (0..masters.len()).map(|i| s.nets_of(db, &supply_names[i], &masters[i])).collect(),
+        None => Vec::new(),
+    };
+    let supply_ok = |i: usize, x: i32, y: i32| -> bool {
+        let Some(s) = &supply else { return true };
+        let orient = grid.site_orient_at(x as i64, y as i64, &sites[i]).unwrap_or_else(|| init_orients[i].clone());
+        s.check(&supply_names[i], &masters[i], &supply_nets[i], x, y, &orient)
     };
     let gap_ok = |i: usize, x: i32, y: i32, g: &NegGrid| -> bool {
         // `checkOneSiteGap` measures the cell with `grid_->gridWidth(cell)`.
@@ -4052,8 +4077,14 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
         if !gap_ok(i, x, y, g) {
             count += 1;
         }
+        // `include_fixed_supply_vias` (the default): legality and the history bump count it;
+        // `findBestLocation` rejects such a candidate before pricing it, so there it adds 0.
+        if !supply_ok(i, x, y) {
+            count += 1;
+        }
         count
     };
+    let supply_ok_cell = |c: &SweepCell, x: i32, y: i32| supply_ok(by_name[c.name.as_str()], x, y);
 
     // 4. Who starts illegal.
     //
@@ -4073,6 +4104,14 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             illegal.push(i);
         }
     }
+    // `DPL-0502` is printed by the first supply-via check that meets an unconnected supply pin,
+    // which on the reference is this seeding scan, after the height distribution.
+    let drain_supply = |log: &mut Vec<LogLine>| {
+        for text in supply.as_ref().map(|s| s.take_warnings()).unwrap_or_default() {
+            log.push(LogLine { level: "WARNING", code: 502, text, quiet: false });
+        }
+    };
+    drain_supply(&mut out.log);
 
     // ⛔ **The active set is the illegal cells PLUS every movable cell inside their search
     // windows** — upstream's comment: "so the loop can create space organically". A run that
@@ -4300,6 +4339,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
                 SweepCtx {
                     grid: $g, window: &window, placeable: &placeable,
                     drc_violations: &drc,
+                    supply_vias_ok: &supply_ok_cell,
                     fixed_paint: &fixed_paint,
                     row_y: &grid.row_y,
                     site_width: sw,
@@ -4502,6 +4542,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             ));
         }
     }
+    drain_supply(&mut out.log);
     Ok(out)
 }
 

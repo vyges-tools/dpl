@@ -154,6 +154,8 @@ pub struct Runtime {
     pub used_layers: Vec<u32>,
     /// Each node's master pin shapes for the via-metal stage of `checkBlockedLayers`.
     pub pin_models: Vec<std::rc::Rc<crate::viametal::PinModel>>,
+    /// Each node's net per terminal of its pin model (`""` none): its own power metal is no short.
+    pub pin_nets: Vec<Vec<String>>,
     pub classes: Vec<crate::drc::Class>,
     pub edge_model: crate::edges::EdgeModel,
     pub power: crate::negotiate::PowerModel,
@@ -193,6 +195,12 @@ impl Runtime {
             pin_models: {
                 let mut models = crate::viametal::PinModels::new(levels);
                 nodes.iter().map(|n| models.of(db, &n.master)).collect()
+            },
+            pin_nets: {
+                let mut models = crate::viametal::PinModels::new(levels);
+                nodes.iter().map(|n| if n.kind != Kind::Cell { Vec::new() } else {
+                    models.of(db, &n.master).nets_of(db, &n.name)
+                }).collect()
             },
             classes: nodes.iter().map(|n| crate::drc::classify(&mtype(n))).collect(),
             edge_model, power, seg_util: Vec::new(),
@@ -331,7 +339,8 @@ impl Setup {
         let y_end = g.grid_end_y(y, n.height) as i32;
         let y = y as i32;
         // `checkDRC(node)`: the node's own orientation.
-        let blocked = self.rt.pin_models[nd].check(g, self.rt.used_layers[nd], x, x_end, y, y_end, &n.orient);
+        let blocked = self.rt.pin_models[nd].check(g, self.rt.used_layers[nd], x, x_end, y, y_end, &n.orient,
+                                                   &self.rt.pin_nets[nd]);
         if !blocked {
             return true;
         }

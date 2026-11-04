@@ -220,15 +220,17 @@ pub fn check_blocked_layers(
 pub fn master_pin_shapes(
     terms: &[(String, String)],
     boxes_of: &dyn Fn(&str) -> Vec<(i32, EdgeBox)>,
-) -> (Vec<Vec<EdgeBox>>, u32) {
+) -> (Vec<Vec<(EdgeBox, usize)>>, u32) {
+    // Each shape keeps the index (into `terms`) of the terminal it belongs to — `PinShape`'s
+    // `mterm` (upstream `102fa081cbd`): the exact blockage test asks that terminal's net.
     let mut shapes = vec![Vec::new(); MAX_PIN_LEVEL as usize + 1];
-    for (term, sig) in terms {
+    for (k, (term, sig)) in terms.iter().enumerate() {
         if sig == "POWER" || sig == "GROUND" {
             continue;
         }
         for (level, b) in boxes_of(term) {
             if (1..=MAX_PIN_LEVEL).contains(&level) {
-                shapes[level as usize].push(b);
+                shapes[level as usize].push((b, k));
             }
         }
     }
@@ -797,8 +799,8 @@ mod tests {
             _ => vec![(2, (0, 0, 1, 1))],
         };
         let (shapes, mask) = master_pin_shapes(&terms, &boxes);
-        assert_eq!(shapes[3], vec![(1, 2, 3, 4)]);
-        assert_eq!(shapes[1], vec![(5, 6, 7, 8)]);
+        assert_eq!(shapes[3], vec![((1, 2, 3, 4), 0)], "A is terminal 0");
+        assert_eq!(shapes[1], vec![((5, 6, 7, 8), 3)], "Y is terminal 3");
         assert!(shapes[2].is_empty(), "M2 shapes belong to VDD/VSS only");
         assert_eq!(mask, (1 << 1) | (1 << 3));
     }

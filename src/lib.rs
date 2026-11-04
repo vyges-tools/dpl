@@ -47,6 +47,7 @@ pub mod network;
 pub mod place;
 pub mod regions;
 pub mod report;
+pub mod supplyvias;
 pub mod viametal;
 
 /// This crate's version, as Cargo knows it — the single number the whole suite is released on.

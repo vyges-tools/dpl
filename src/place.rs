@@ -361,6 +361,9 @@ pub struct Legalized {
 /// than it earned — the cells it could not seat would have been retried upstream.
 pub const NOT_DONE: &[&str] = &[
     "rip_up_and_replace", "padding", "one_site_gaps",
+    // `checkPixels`' tail: `checkMasterSym`, `checkRowPowerCompatible`, and `checkDRC`'s edge
+    // spacing and padding terms. Its blocked-layer and fixed-supply-via terms ARE checked.
+    "checkPixels: master symmetry, row power, checkDRC edge spacing/padding",
     "legalPt hopeless/block-edge refinement",
     // ⚠️ `placeGroups2`'s fallback when a group's cells do not all seat: its cells are reported as
     // failures instead. Never reached upstream on `diamond_regions` (traced: no `brick`).
@@ -391,7 +394,14 @@ pub const NOT_DONE: &[&str] = &[
 /// passes, then `placeCell`, which paints the pixels and ⚠️ **takes the ORIENTATION from the row
 /// it landed in**.
 pub fn legalize(db: &Db) -> Result<Legalized, String> {
+    legalize_with(db, false)
+}
+
+/// [`legalize`] with `-pdn_aware`: `diamondDPL` runs `initGrid(pdn_aware_)`, so `checkDRC` also
+/// keeps cells clear of fixed supply vias.
+pub fn legalize_with(db: &Db, pdn_aware: bool) -> Result<Legalized, String> {
     let mut d = Diamond::init(db)?;
+    d.init_drc(db, pdn_aware);
     d.group_init_pixels();
     if !d.groups.is_empty() {
         d.place_groups();
@@ -412,9 +422,43 @@ struct Diamond {
     placed: Vec<bool>,
     groups: Vec<crate::regions::Group>,
     regions: crate::regions::Regions,
+    /// `checkDRC`'s blocked-layer stage per cell: its master's pin model, `used_layers` mask and
+    /// net per terminal.
+    pin: Vec<std::rc::Rc<crate::viametal::PinModel>>,
+    used: Vec<u32>,
+    pin_nets: Vec<Vec<String>>,
+    /// `checkFixedSupplyVias` (`-pdn_aware` only) and each cell's net per terminal for it.
+    supply: Option<crate::supplyvias::FixedSupplyVias>,
+    supply_nets: Vec<Vec<String>>,
+    /// Each cell's master.
+    masters: Vec<String>,
 }
 
 impl Diamond {
+    /// The `checkDRC` models `canBePlaced` reads: blocked layers always, fixed supply vias under
+    /// `-pdn_aware` (`initGrid(pdn_aware_)` builds or clears them).
+    fn init_drc(&mut self, db: &Db, pdn_aware: bool) {
+        let types: Vec<(String, String)> = db.layers_with_direction().unwrap_or_default().iter()
+            .map(|(n, _)| (n.clone(), db.layer_get_type(n).unwrap_or_default())).collect();
+        let levels = crate::drc::routing_levels(&types);
+        let mut models = crate::viametal::PinModels::new(&levels);
+        for m in &self.cells {
+            let master = db.inst_master(&m.name);
+            let model = models.of(db, &master);
+            self.pin_nets.push(model.nets_of(db, &m.name));
+            self.used.push(crate::drc::used_layers(db.master_pin_boxes(&master).unwrap_or_default().into_iter()
+                .filter_map(|(ln, ..)| levels.get(&db.layer_name_by_number(ln)).copied())));
+            self.pin.push(model);
+            self.masters.push(master);
+        }
+        if pdn_aware {
+            self.supply = crate::supplyvias::FixedSupplyVias::build(db, &self.grid);
+        }
+        if let Some(s) = &self.supply {
+            self.supply_nets = self.cells.iter().zip(&self.masters).map(|(m, master)| s.nets_of(db, &m.name, master)).collect();
+        }
+    }
+
     /// `initGrid` + `setFixedGridCells`, and the movable cells with their place-order keys.
     fn init(db: &Db) -> Result<Diamond, String> {
         let mut grid = Grid::build(db)?;
@@ -467,6 +511,8 @@ impl Diamond {
         let mut d = Diamond {
             grid, out, index, group_of: vec![None; cells.len()], placed: vec![false; cells.len()],
             cells, groups, regions: Default::default(),
+            pin: Vec::new(), used: Vec::new(), pin_nets: Vec::new(),
+            supply: None, supply_nets: Vec::new(), masters: Vec::new(),
         };
         for (gi, g) in d.groups.iter().enumerate() {
             for n in &g.cells {
@@ -679,7 +725,26 @@ impl Diamond {
                 }
             }
         }
-        g.can_place(px, py, cells_wide as i64, m.h, &m.site)
+        if !g.can_place(px, py, cells_wide as i64, m.h, &m.site) {
+            return false;
+        }
+        // `checkDRC(cell, x, y, orient)` at the orientation the first row's site takes there.
+        // ⚠️ Two of its terms only: blocked layers and fixed supply vias. Edge spacing, padding,
+        // the master-symmetry and multi-row power tests that precede it are named in `NOT_DONE`.
+        let Some(orient) = g.site_orient_at(px, py, &m.site) else { return false };
+        let y_end = g.grid_end_y(py, m.h);
+        if let Some(model) = self.pin.get(i) {
+            if !model.check(g, self.used[i], px as i32, (px + cells_wide as i64) as i32, py as i32, y_end as i32,
+                            &orient, &self.pin_nets[i]) {
+                return false;
+            }
+        }
+        if let Some(s) = &self.supply {
+            if !s.check(&m.name, &self.masters[i], &self.supply_nets[i], px as i32, py as i32, &orient) {
+                return false;
+            }
+        }
+        true
     }
 
     /// `placeCell` — paint, mark placed, take the row's orientation.
