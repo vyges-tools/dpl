@@ -138,7 +138,7 @@ const DESCRIBE: &str = r#"{
   ],
   "invocation": {
     "args_template": ["check-placement", "{odb}"],
-    "optional": [{ "arg": "out", "flag": "-o" }, { "arg": "pdn_aware", "flag": "--pdn-aware" }],
+    "optional": [{ "arg": "out", "flag": "-o" }, { "arg": "pdn_aware", "flag": "--pdn-aware" }, { "arg": "fixed", "flag": "--fixed" }, { "arg": "placeable", "flag": "--placeable" }],
     "emits_json": true,
     "findings_exit_codes": [1]
   },
@@ -148,7 +148,9 @@ const DESCRIBE: &str = r#"{
     "properties": {
       "odb": { "type": "string", "description": "the design database to check" },
       "out": { "type": "string", "description": "write the report to FILE instead of stdout" },
-      "pdn_aware": { "type": "boolean", "description": "also check every cell against the fixed supply (PDN) vias, as after detailed_placement -pdn_aware" }
+      "pdn_aware": { "type": "boolean", "description": "also check every cell against the fixed supply (PDN) vias, as after detailed_placement -pdn_aware" },
+      "fixed": { "type": "boolean", "description": "check only the fixed instances and macros (a floorplan check, as check_placement -fixed)" },
+      "placeable": { "type": "boolean", "description": "check only the movable cells, against the fixed ones (as check_placement -placeable)" }
     }
   },
   "consumes": ["odb"],
@@ -294,7 +296,7 @@ const USAGE: &str = "\
 vyges physical dpl — detailed placement: legality checking and legalization over the design database
 
 USAGE:
-  vyges physical dpl check-placement    <design.odb> [--json] [-o FILE] [--padding-* ...] [--pdn-aware]
+  vyges physical dpl check-placement    <design.odb> [--json] [-o FILE] [--padding-* ...] [--pdn-aware] [--fixed] [--placeable]
   vyges physical dpl detailed-placement <design.odb> [--out-odb FILE] [--dry-run] [OPTIONS]
   vyges physical dpl filler-placement   <design.odb> PATTERN... [--prefix P] [--out-odb FILE]
   vyges physical dpl remove-fillers     <design.odb> [--out-odb FILE]
@@ -315,8 +317,12 @@ OPTIONS:
   --pdn-aware               keep cells clear of fixed supply (PDN) vias; also accepted by
                             check-placement and optimize-mirroring, which then check them too
                             (the reference's -pdn_aware, which later commands inherit)
+  --fixed                   check-placement: check only the fixed instances and macros (a
+                            floorplan check; the movable cells are not read)
+  --placeable               check-placement: check only the movable cells, against the fixed
+                            ones (neither flag, or both: check everything)
   -o FILE                   write the report to FILE instead of stdout
-  --json                    emit JSON (the default)
+  --json                   emit JSON (the default)
   --describe                print a machine-readable JSON description of the command
 
 EXIT STATUS:
@@ -897,11 +903,14 @@ fn check(args: &[String]) -> ExitCode {
     // `-masters` patterns, in call order, resolved once the database is open.
     let mut master_pads: Vec<(String, (i32, i32))> = Vec::new();
     let mut pdn_aware = false;
+    let (mut only_fixed, mut only_placeable) = (false, false);
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--json" => {}
             "--pdn-aware" => pdn_aware = true,
+            "--fixed" => only_fixed = true,
+            "--placeable" => only_placeable = true,
             "-o" => {
                 i += 1;
                 out = args.get(i).cloned();
@@ -938,7 +947,8 @@ fn check(args: &[String]) -> ExitCode {
         }
     };
     resolve_master_pads(&db, &mut padding, &master_pads);
-    let report = vyges_dpl::check::check_placement_pdn(&db, !db.has_one_site_master(), &padding, pdn_aware);
+    let scope = vyges_dpl::check::Scope::from_flags(only_fixed, only_placeable);
+    let report = vyges_dpl::check::check_placement_scoped(&db, !db.has_one_site_master(), &padding, pdn_aware, scope);
     // ⛔ `vacuous` is reserved across this suite: a run that examined no cell must not report
     // clean. A design with no instances is not a legal placement, it is an absent one.
     let status = if report.cells_checked == 0 {
@@ -952,6 +962,8 @@ fn check(args: &[String]) -> ExitCode {
         "tool": "vyges-dpl",
         "command": "check-placement",
         "status": status,
+        // `-fixed` alone is the floorplan check (upstream DPL-0041 instead of DPL-0033).
+        "scope": if scope.fixed_only() { "fixed" } else if !scope.fixed { "placeable" } else { "all" },
         "cells_checked": report.cells_checked,
         "violations": report.failures.len(),
         "not_checked": report.not_checked,

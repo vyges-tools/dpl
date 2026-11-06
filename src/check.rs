@@ -180,11 +180,52 @@ pub fn check_placement_opts(db: &Db, disallow_one_site_gaps: bool, padding: &cra
     check_placement_pdn(db, disallow_one_site_gaps, padding, false)
 }
 
+/// `check_placement -fixed` / `-placeable` (upstream 9241d34505, at the pin): which cells one call
+/// checks. Neither flag checks both; `-fixed` alone checks the fixed instances and macros (a
+/// floorplan check: the movable cells are not even imported); `-placeable` alone checks the movable
+/// cells against the fixed ones, which are painted first but not checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scope {
+    pub fixed: bool,
+    pub placeable: bool,
+}
+
+impl Default for Scope {
+    fn default() -> Scope {
+        Scope { fixed: true, placeable: true }
+    }
+}
+
+impl Scope {
+    /// The Tcl proc's reading of the two flags: without either, check both.
+    pub fn from_flags(fixed: bool, placeable: bool) -> Scope {
+        if !fixed && !placeable { Scope::default() } else { Scope { fixed, placeable } }
+    }
+
+    /// `fixed_only`: `importDb(true)` keeps only the fixed instances and the macros.
+    pub fn fixed_only(self) -> bool {
+        self.fixed && !self.placeable
+    }
+
+    /// `is_checked`: a fixed node (a fixed status, or a macro — `createNetwork` forces a placed
+    /// one fixed) by `-fixed`, any other by `-placeable`.
+    pub fn checks(self, node_fixed: bool) -> bool {
+        if node_fixed { self.fixed } else { self.placeable }
+    }
+}
+
 /// [`check_placement_opts`] after a `detailed_placement -pdn_aware` on this block: upstream's
 /// `checkPlacement` runs `initGrid(isPdnAwareForCurrentBlock())`, which is that call's flag, so
 /// every cell is also checked against the fixed supply vias (`Fixed supply vias`, DPL-0013 family).
 pub fn check_placement_pdn(db: &Db, disallow_one_site_gaps: bool, padding: &crate::negotiate::Padding,
                            pdn_aware: bool) -> Report {
+    check_placement_scoped(db, disallow_one_site_gaps, padding, pdn_aware, Scope::default())
+}
+
+/// [`check_placement_pdn`] for one [`Scope`] (`checkPlacement(verbose, file, check_fixed,
+/// check_placeable)`).
+pub fn check_placement_scoped(db: &Db, disallow_one_site_gaps: bool, padding: &crate::negotiate::Padding,
+                              pdn_aware: bool, scope: Scope) -> Report {
     let ys = row_ys(db);
     let sw = site_width(db);
     let x0 = core_x_min(db);
@@ -192,13 +233,21 @@ pub fn check_placement_pdn(db: &Db, disallow_one_site_gaps: bool, padding: &crat
     // masters and the fixed instances outside the rows' outer shell. ⛔ The order decides which
     // of two overlapping cells is painted first, and the filter decides what is checked at all:
     // `obstruction1`'s four corner endcaps sit outside the core and upstream never sees them.
-    let insts: Vec<String> = crate::network::network_insts(db);
-
     // Cells to consider: upstream skips anything that is not `Node::CELL`, and applies the
     // site-alignment and in-rows checks only to STD CELLS. A block (macro) is neither.
     let is_block = |i: &str| {
         db.master_get_type(&db.inst_master(i)).map(|t| t.contains("BLOCK")).unwrap_or(false)
     };
+    // `Node::isFixed` once `createNetwork` is done: the status, or a macro (forced fixed).
+    let node_fixed = |i: &str| {
+        crate::negotiate::status_is_fixed(&db.inst_get_placement_status(i)) || is_block(i)
+    };
+    // A fixed-only run imports no movable cell at all (`createNetwork(fixed_only)`).
+    let insts: Vec<String> = crate::network::network_insts(db)
+        .into_iter()
+        .filter(|i| !scope.fixed_only() || node_fixed(i))
+        .collect();
+    let checked: Vec<bool> = insts.iter().map(|i| scope.checks(node_fixed(i))).collect();
     #[allow(clippy::type_complexity)]
     let boxes: Vec<(String, (i64, i64, i64, i64), bool)> =
         insts.iter().map(|i| (i.clone(), cell_box(db, i), is_block(i))).collect();
@@ -332,7 +381,30 @@ pub fn check_placement_pdn(db: &Db, disallow_one_site_gaps: bool, padding: &crat
         .map(|(i, _)| i)
         .collect();
 
+    // `setFixedGridCells`, when the fixed cells are not checked: painted up front (each its body
+    // and its padding) so the placeable cells are checked against them.
+    if !scope.fixed {
+        if let Some(g) = drc_grid.as_mut() {
+            for (idx, (name, bx, _)) in boxes.iter().enumerate() {
+                if checked[idx] {
+                    continue;
+                }
+                let (cx, cy) = (bx.0 as i32 - g.core.0, bx.1 as i32 - g.core.1);
+                let (gx0, gy0, gx1, _) = g.covering(cx, cy, bx.2 as i32, bx.3 as i32);
+                g.paint_cell(cx, cy, bx.2 as i32, bx.3 as i32, Some(idx as u32));
+                let master = db.inst_master(name);
+                let (left_pad, right_pad) =
+                    padding.of(name, &master, &db.master_get_type(&master).unwrap_or_default());
+                g.paint_cell_padding(gx0, gy0, gx1 - gx0, bx.3 as i32, left_pad as i64, right_pad as i64, idx as u32);
+            }
+        }
+    }
+
     for (idx, (name, bx, blk)) in boxes.iter().enumerate() {
+        // `is_checked`: a cell out of this call's scope is skipped whole.
+        if !checked[idx] {
+            continue;
+        }
         out.cells_checked += 1;
 
         // ⛔ Site alignment first, and it `continue`s — a misaligned cell is reported once.
@@ -478,7 +550,10 @@ pub fn check_placement_pdn(db: &Db, disallow_one_site_gaps: bool, padding: &crat
     // it), against the grid as the first loop left it.
     if disallow_one_site_gaps {
         if let Some(g) = drc_grid.as_ref() {
-            for (name, bx, _) in &boxes {
+            for (idx, (name, bx, _)) in boxes.iter().enumerate() {
+                if !checked[idx] {
+                    continue;
+                }
                 let (cx, cy) = (bx.0 as i32 - g.core.0, bx.1 as i32 - g.core.1);
                 let (gx0, gy0, gx1, gy1) = g.covering(cx, cy, bx.2 as i32, bx.3 as i32);
                 let at = |px: i64, py: i64| g.pixel(px, py).map(|p| (p.is_valid, p.cell.is_some()));
@@ -580,6 +655,22 @@ pub fn grid_facts(db: &Db) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    /// Upstream rule (`check_placement` proc + `checkPlacement`, 9241d34505 at the pin): no flag
+    /// (or both) checks every cell; `-fixed` alone is the fixed-only run (fixed instances and
+    /// macros only, nothing movable imported); `-placeable` alone checks the movable cells and
+    /// only paints the fixed ones.
+    #[test]
+    fn a_scope_flag_picks_the_cells_one_call_checks() {
+        use super::Scope;
+        let all = Scope::from_flags(false, false);
+        assert_eq!(all, Scope::from_flags(true, true));
+        assert!(all.checks(true) && all.checks(false) && !all.fixed_only());
+        let fixed = Scope::from_flags(true, false);
+        assert!(fixed.fixed_only() && fixed.checks(true) && !fixed.checks(false));
+        let placeable = Scope::from_flags(false, true);
+        assert!(!placeable.fixed_only() && !placeable.checks(true) && placeable.checks(false));
+    }
+
     /// Upstream `checkInRows` ends `!isMultiRow || checkRowPowerCompatible(cell, ylo)`: a
     /// multi-row cell on valid squares still fails in-rows when its start row's rails do not
     /// match, and the test is asked at the FIRST row with the number of rows spanned.
