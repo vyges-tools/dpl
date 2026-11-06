@@ -164,6 +164,19 @@ pub fn snap_to_valid_site(
     if found { Some((best_x, best_y)) } else { None }
 }
 
+/// `initialSnap`'s `oneSiteGap` (upstream 64719bdf80, unchanged 4155ac31..a6e7f507): only when
+/// one-site gaps are disallowed, a cell at (`px`, `py`) leaves a gap when, on any of its rows, the
+/// square just left of it is free and the one beyond is occupied, or likewise on the right.
+/// `occupied` is a wall off the grid and a fixed cell on it (no movable usage exists yet), so the
+/// snap mirrors `PlacementDRC::checkOneSiteGap` against fixed cells only.
+pub fn one_site_gap_to_fixed(disallowed: bool, px: i32, py: i32, width: i32, height: i32, occupied: &dyn Fn(i32, i32) -> bool) -> bool {
+    if !disallowed {
+        return false;
+    }
+    let (left, right) = (px - 1, px + width);
+    (py..py + height).any(|gy| (!occupied(left, gy) && occupied(left - 1, gy)) || (!occupied(right, gy) && occupied(right + 1, gy)))
+}
+
 /// `dbMaster::isCoreAutoPlaceable` — may the placer touch an instance of this master at all?
 ///
 /// ⛔ **This is the model filter, and it is about the master's CLASS, never about whether the
@@ -465,6 +478,15 @@ impl NegGrid {
             return 0;
         }
         self.pixels[y as usize * self.width + x as usize].capacity
+    }
+
+    /// `initialSnap`'s `occupied`: off the grid (`!gridExists`) or `usage > 0` — before any
+    /// movable usage is seeded, a fixed cell's blockade.
+    pub fn occupied_at(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height {
+            return true;
+        }
+        self.pixels[y as usize * self.width + x as usize].usage > 0
     }
 
     pub fn blockade(&mut self, x: i32, y: i32, w: i32, h: i32) {
@@ -1594,6 +1616,26 @@ mod tests {
             Some((45, 0)),
             "40 sites out, found by doubling the budget rather than by one linear walk",
         );
+    }
+
+    /// Upstream rule (`initialSnap`'s `oneSiteGap`, 64719bdf80 at the pin): with one-site gaps
+    /// disallowed, a position whose left or right neighbour square is free but the next one is a
+    /// fixed cell or off the grid is not placeable, on any of the cell's rows; a cell flush
+    /// against a fixed cell, or two free squares, is fine; allowed gaps never test.
+    #[test]
+    fn the_snap_leaves_no_one_site_gap_to_a_fixed_cell() {
+        // a 10-square row, a fixed cell on square 6
+        let occ = |x: i32, y: i32| !(0..10).contains(&x) || y != 0 || x == 6;
+        assert!(one_site_gap_to_fixed(true, 3, 0, 2, 1, &occ), "square 5 free, 6 fixed: a gap on the right");
+        assert!(!one_site_gap_to_fixed(true, 4, 0, 2, 1, &occ), "flush against the fixed cell");
+        assert!(!one_site_gap_to_fixed(true, 2, 0, 2, 1, &occ), "two free squares to it");
+        assert!(one_site_gap_to_fixed(true, 8, 0, 1, 1, &occ), "square 7 free, 6 fixed: a gap on the left");
+        assert!(one_site_gap_to_fixed(true, 1, 0, 2, 1, &occ), "square 0 free, then off the grid: a wall");
+        assert!(!one_site_gap_to_fixed(false, 3, 0, 2, 1, &occ), "gaps allowed (a one-site master exists)");
+        // a two-row cell: the gap on its upper row alone counts
+        let occ2 = |x: i32, y: i32| !(0..10).contains(&x) || y > 1 || (y == 1 && x == 6);
+        assert!(one_site_gap_to_fixed(true, 3, 0, 2, 2, &occ2));
+        assert!(!one_site_gap_to_fixed(true, 3, 0, 2, 1, &occ2), "a one-row cell does not see row 1");
     }
 
     #[test]
@@ -3769,6 +3811,8 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
         crate::regions::Fences::build(db, &grid, &names)
     };
     let trace_snap = std::env::var_os("DPL_TRACE_SNAP").is_some();
+    // `opendp_->disallow_one_site_gaps_` (derived in `importDb`, see the DRC term below)
+    let snap_gaps_disallowed = !db.has_one_site_master();
     for c in cells.iter_mut() {
         let (cw, ch) = (c.width, c.height);
         let name = c.name.clone();
@@ -3781,6 +3825,7 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
                 (0..ch).all(|dy| (0..cw).all(|dx| {
                     ngrid.capacity_at(x + dx, y + dy) != 0
                 })) && fences.respects(&name, x, y, cw, ch)
+                    && !one_site_gap_to_fixed(snap_gaps_disallowed, x, y, cw, ch, &|gx, gy| ngrid.occupied_at(gx, gy))
             },
         );
         if let Some((nx, ny)) = snapped {
