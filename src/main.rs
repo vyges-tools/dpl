@@ -322,7 +322,7 @@ OPTIONS:
   --placeable               check-placement: check only the movable cells, against the fixed
                             ones (neither flag, or both: check everything)
   -o FILE                   write the report to FILE instead of stdout
-  --json                   emit JSON (the default)
+  --json                    emit JSON (the default)
   --describe                print a machine-readable JSON description of the command
 
 EXIT STATUS:
