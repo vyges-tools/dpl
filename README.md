@@ -1,5 +1,7 @@
 # vyges-dpl
 
+**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
+
 Detailed placement over the OpenDB design database: **legality checking** and **legalization**.
 
 ```text
