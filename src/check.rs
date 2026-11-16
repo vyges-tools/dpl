@@ -534,7 +534,7 @@ pub fn check_placement_scoped(db: &Db, disallow_one_site_gaps: bool, padding: &c
             }
             // `checkFixedSupplyVias(cell)` — at `gridX(cell)`, `gridRoundY(cell)`, its orient.
             if let Some(s) = &supply {
-                let gx = cx.div_euclid(g.site_width);
+                let gx = crate::grid::grid_x(cx, g.site_width);
                 let gy = g.grid_round_y(cy) as i32;
                 if !s.check(name, &master, &s.nets_of(db, name, &master), gx, gy, &orients[idx]) {
                     out.failures.push(Failure { family: "fixed_supply_vias".into(), cell: name.clone(),

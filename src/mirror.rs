@@ -207,7 +207,7 @@ pub fn optimize_mirroring_with(db: &mut Db, pdn_aware: bool) -> Result<MirrorRep
         }
         // `isFixedSupplyViasLegal(cell, orient_my)` — at `gridX(cell)`, `gridRoundY(cell)`.
         if let Some(s) = &supply {
-            let (gx, gy) = (b.0.div_euclid(grid.site_width), grid.grid_round_y(b.1) as i32);
+            let (gx, gy) = (crate::grid::grid_x(b.0, grid.site_width), grid.grid_round_y(b.1) as i32);
             if !s.check(inst, &masters[i], &supply_nets[i], gx, gy, orient_my) {
                 report.fixed_supply_vias_rejected.push(inst.clone());
                 continue;

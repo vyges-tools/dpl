@@ -188,6 +188,17 @@ impl FixedCells {
     }
 }
 
+/// `Grid::gridX(DbuX x)` — `x / site_width`, C++ integer division, which TRUNCATES toward zero.
+/// `dbuToGridFloor` is `divFloor`, the same `dividend / divisor`.
+///
+/// ⛔ **Not `div_euclid`.** That floors, and the two differ for a negative core-relative `x` off
+/// a site boundary (`-190 / 380` is 0, its floor is -1): a cell left of the core, which an
+/// unlegalized placement can hand `optimize_mirroring`. Every `gridX` / `dbuToGridFloor` site
+/// goes through here.
+pub fn grid_x(x: i32, site_width: i32) -> i32 {
+    x / site_width
+}
+
 impl Grid {
     /// `Grid::initGrid` — allocate, mark valid from the rows, then subtract hard blockages.
     ///
@@ -1294,5 +1305,25 @@ mod legal_cell_pos_tests {
         assert_eq!(g.legal_cell_pos(&f, 3680, 5440, 920, 2720), Some((3680, 2720)));
         // One site further left, the end corner is clear: untouched.
         assert_eq!(g.legal_cell_pos(&f, 3220, 5440, 920, 2720), None);
+    }
+}
+
+#[cfg(test)]
+mod grid_x_tests {
+    use super::grid_x;
+
+    /// Upstream `Grid::gridX(DbuX x)` is `x.v / getSiteWidth().v` and `dbuToGridFloor` is
+    /// `divFloor` = `dividend / divisor`: C++ integer division, truncating toward zero. A cell
+    /// 190 left of the core on 380 sites is in column 0, not -1; on a multiple of the site width
+    /// and to the right of the core, truncation and floor agree.
+    #[test]
+    fn grid_x_truncates_toward_zero_as_the_reference_divides() {
+        assert_eq!(grid_x(-190, 380), 0);
+        assert_eq!(grid_x(-570, 380), -1);
+        assert_eq!(grid_x(-54, 11), -4, "the alive2 witness: reference -4, a floor gives -5");
+        assert_eq!(grid_x(-380, 380), -1);
+        assert_eq!(grid_x(0, 380), 0);
+        assert_eq!(grid_x(379, 380), 0);
+        assert_eq!(grid_x(760, 380), 2);
     }
 }

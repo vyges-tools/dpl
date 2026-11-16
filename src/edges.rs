@@ -69,13 +69,13 @@ impl EdgeModel {
             return true;
         }
         let sw = grid.site_width;
-        let (gx, gy) = (cx.div_euclid(sw), grid.grid_round_y(cy));
+        let (gx, gy) = (crate::grid::grid_x(cx, sw), grid.grid_round_y(cy));
         let (xr, yr) = (gx * sw, grid.row_y.get(gy).copied().unwrap_or(0));
         let mine = self.edges_at(master, orient, xr, yr);
         let row_y = &grid.row_y;
         crate::drc::check_edge_spacing(
             &self.table, me, &mine,
-            &|v| v.div_euclid(sw),
+            &|v| crate::grid::grid_x(v, sw),
             &|v| (f64::from(v) / f64::from(sw)).ceil() as i32,
             &|v| row_y.iter().position(|&ry| ry >= v).unwrap_or(row_y.len()) as i32,
             occupant,

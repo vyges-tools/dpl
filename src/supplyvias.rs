@@ -114,8 +114,11 @@ pub fn horizontal_keepout(space: i32, vertical_gap: i64) -> i64 {
     floor_sqrt(space as i64 * space as i64 - vertical_gap * vertical_gap - 1)
 }
 
+/// dpl `divFloor` — `dividend / divisor`, C++ integer division: it TRUNCATES, despite the name.
+/// Its one call site passes `high - core_x` after `high < core_x` returned, so the dividend is
+/// never negative there and a floor would agree; written as the reference divides all the same.
 fn div_floor(a: i64, b: i64) -> i64 {
-    a.div_euclid(b)
+    a / b
 }
 
 fn div_ceil(a: i64, b: i64) -> i64 {
@@ -375,9 +378,13 @@ mod tests {
         assert_eq!(vertical_distance(fixed, (0, 0, 10, 50), 50), 0, "touching");
     }
 
+    /// Upstream `Opendp.cpp`: `divFloor` is `dividend / divisor`, C++ integer division, which
+    /// TRUNCATES toward zero despite its name (`-1 / 4` is 0); `divCeil` is
+    /// `ceil(double(dividend) / divisor)`, the exact ceiling.
     #[test]
     fn floor_and_ceil_division_follow_the_sign() {
-        assert_eq!(div_floor(-1, 4), -1);
+        assert_eq!(div_floor(-1, 4), 0);
+        assert_eq!(div_floor(-5, 4), -1);
         assert_eq!(div_ceil(-1, 4), 0);
         assert_eq!(div_floor(7, 4), 1);
         assert_eq!(div_ceil(7, 4), 2);

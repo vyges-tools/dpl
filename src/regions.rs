@@ -36,7 +36,7 @@ impl Group {
 pub fn grid_within(grid: &Grid, r: &Box4) -> (i64, i64, i64, i64) {
     let sw = grid.site_width;
     ((r.0 + sw - 1).div_euclid(sw) as i64, grid.grid_end_y_dbu(r.1) as i64,
-     r.2.div_euclid(sw) as i64, grid.grid_snap_down_y(r.3).unwrap_or(0) as i64)
+     crate::grid::grid_x(r.2, sw) as i64, grid.grid_snap_down_y(r.3).unwrap_or(0) as i64)
 }
 
 /// `setUpPlacementGroups` — every `dbGroup` with a region, in `getGroups` order; its index here is
