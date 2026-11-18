@@ -301,7 +301,7 @@ USAGE:
   vyges physical dpl filler-placement   <design.odb> PATTERN... [--prefix P] [--out-odb FILE]
   vyges physical dpl remove-fillers     <design.odb> [--out-odb FILE]
   vyges physical dpl optimize-mirroring <design.odb> [--out-odb FILE] [--pdn-aware]
-  vyges physical dpl improve-placement  <design.odb> [--out-odb FILE] [--random-seed N] [--max-displacement X[,Y]]
+  vyges physical dpl improve-placement  <design.odb> [--out-odb FILE] [--random-seed N] [--max-displacement X[,Y]] [--padding-* ...]
                                         (in progress: mis/gs/vs/ro not built; --rng-skip N stands in)
   vyges physical dpl --describe | --help | --version
 
@@ -554,6 +554,8 @@ fn optimize_mirroring(args: &[String]) -> ExitCode {
 fn improve_placement(args: &[String]) -> ExitCode {
     let (mut odb, mut out_odb, mut dump, mut opts) = (None, None, false, vyges_dpl::improve_opt::Options::default());
     let (mut seed, mut max_disp) = (1u32, (0i32, 0i32));
+    let mut padding = vyges_dpl::negotiate::Padding::default();
+    let mut master_pads: Vec<(String, (i32, i32))> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -571,6 +573,14 @@ fn improve_placement(args: &[String]) -> ExitCode {
                 max_disp = match v.as_slice() { [x] => (*x, *x), [x, y] => (*x, *y), _ => (0, 0) };
             }
             "--out-odb" => { i += 1; out_odb = args.get(i).cloned(); }
+            // `set_placement_padding`: the reference's DPO reads the same in-memory padding as
+            // the legalizer (`importDb` -> `Architecture::setPadding`, `setUsePadding(true)`).
+            "--padding-global" | "--padding-master" | "--padding-inst" => {
+                if let Err(e) = padding_flag(args, &mut i, &mut padding, &mut master_pads) {
+                    diag!("vyges-dpl: improve-placement: {e}");
+                    return ExitCode::from(2);
+                }
+            }
             "--inject-stage" => { i += 1; opts.inject_file = args.get(i).cloned(); }
             "--start-stage" => { i += 1; opts.start_stage = args.get(i).cloned(); }
             "--stop-stage" => { i += 1; opts.stop_stage = args.get(i).cloned(); }
@@ -594,7 +604,8 @@ fn improve_placement(args: &[String]) -> ExitCode {
         Ok(d) => d,
         Err(e) => { diag!("vyges-dpl: cannot open {path}: {e}"); return ExitCode::from(2); }
     };
-    let mut setup = match vyges_dpl::improve::setup_with(&db, &vyges_dpl::negotiate::Padding::default(), seed, max_disp) {
+    resolve_master_pads(&db, &mut padding, &master_pads);
+    let mut setup = match vyges_dpl::improve::setup_with(&db, &padding, seed, max_disp) {
         Ok(s) => s,
         Err(e) => { diag!("vyges-dpl: {e}"); return ExitCode::from(1); }
     };
@@ -674,16 +685,10 @@ fn legalize(args: &[String]) -> ExitCode {
             // set_placement_padding, which lives in opendp's memory and not in the database:
             // --padding-global L R, --padding-master M L R, --padding-inst I L R (sites).
             "--padding-global" | "--padding-master" | "--padding-inst" => {
-                let flag = args[i].clone();
-                let key = if flag == "--padding-global" { None } else { i += 1; args.get(i).cloned() };
-                let side = |k: usize| args.get(k).and_then(|v| v.parse::<i32>().ok());
-                match (side(i + 1), side(i + 2), key) {
-                    (Some(l), Some(r), None) => padding.global = (l, r),
-                    (Some(l), Some(r), Some(k)) if flag == "--padding-master" => { master_pads.push((k, (l, r))); }
-                    (Some(l), Some(r), Some(k)) => { padding.insts.insert(k, (l, r)); }
-                    _ => { diag!("vyges-dpl: {flag} needs [NAME] LEFT RIGHT (sites)"); bad = true; }
+                if let Err(e) = padding_flag(args, &mut i, &mut padding, &mut master_pads) {
+                    diag!("vyges-dpl: {e}");
+                    bad = true;
                 }
-                i += 2;
             }
             "--max-displacement" => match num(&mut i, "--max-displacement") {
                 None => bad = true,
@@ -891,6 +896,27 @@ fn legalize(args: &[String]) -> ExitCode {
                    _ => ExitCode::from(1) }
 }
 
+/// One `set_placement_padding` call as a flag: `--padding-global L R`, `--padding-master M L R`,
+/// `--padding-inst I L R` (sites). `i` is at the flag and is left on its last value. Masters are
+/// kept as patterns, in call order, for `resolve_master_pads` once the database is open.
+/// ⛔ Padding lives in opendp's MEMORY (`Opendp::padding_`), not in the database, so every command
+/// that reads it in the reference takes these flags: the legalizer, `check_placement`, and
+/// `improve_placement` (`importDb` hands the same object to the architecture).
+fn padding_flag(args: &[String], i: &mut usize, padding: &mut vyges_dpl::negotiate::Padding,
+                master_pads: &mut Vec<(String, (i32, i32))>) -> Result<(), String> {
+    let flag = args[*i].clone();
+    let key = if flag == "--padding-global" { None } else { *i += 1; args.get(*i).cloned() };
+    let side = |k: usize| args.get(k).and_then(|v| v.parse::<i32>().ok());
+    let r = match (side(*i + 1), side(*i + 2), key) {
+        (Some(l), Some(r), None) => { padding.global = (l, r); Ok(()) }
+        (Some(l), Some(r), Some(k)) if flag == "--padding-master" => { master_pads.push((k, (l, r))); Ok(()) }
+        (Some(l), Some(r), Some(k)) => { padding.insts.insert(k, (l, r)); Ok(()) }
+        _ => Err(format!("{flag} needs [NAME] LEFT RIGHT (sites)")),
+    };
+    *i += 2;
+    r
+}
+
 /// `set_placement_padding -masters`: each pattern is a Tcl glob over every library's masters
 /// (`get_masters_arg`), applied in CALL order — a later call for the same master replaces an
 /// earlier one, as upstream's per-master map does.
@@ -924,16 +950,10 @@ fn check(args: &[String]) -> ExitCode {
                 out = args.get(i).cloned();
             }
             "--padding-global" | "--padding-master" | "--padding-inst" => {
-                let flag = args[i].clone();
-                let key = if flag == "--padding-global" { None } else { i += 1; args.get(i).cloned() };
-                let side = |k: usize| args.get(k).and_then(|v| v.parse::<i32>().ok());
-                match (side(i + 1), side(i + 2), key) {
-                    (Some(l), Some(r), None) => padding.global = (l, r),
-                    (Some(l), Some(r), Some(k)) if flag == "--padding-master" => { master_pads.push((k, (l, r))); }
-                    (Some(l), Some(r), Some(k)) => { padding.insts.insert(k, (l, r)); }
-                    _ => { diag!("vyges-dpl: {flag} needs [NAME] LEFT RIGHT (sites)"); return ExitCode::from(2); }
+                if let Err(e) = padding_flag(args, &mut i, &mut padding, &mut master_pads) {
+                    diag!("vyges-dpl: {e}");
+                    return ExitCode::from(2);
                 }
-                i += 2;
             }
             a if a.starts_with('-') => {
                 diag!("vyges-dpl: unknown option `{a}`");
@@ -1137,6 +1157,32 @@ mod descriptor_tests {
         // or the next reader will file their absence as an oversight.
         assert!(USAGE.contains("disallow_one_site_gaps") && USAGE.contains("incremental"),
                 "an option refused on purpose must be documented as refused");
+    }
+
+    /// `set_placement_padding -left L -right R` is stored as `(L, R)` (`Padding::setPadding`), per
+    /// instance, per master pattern (in call order) or global; each flag consumes exactly its own
+    /// values so the next flag parses. `improve-placement` takes the same flags: the reference's
+    /// DPO reads the legalizer's in-memory padding (`importDb` -> `Architecture::setPadding`).
+    #[test]
+    fn padding_flags_store_left_then_right_and_consume_only_their_values() {
+        let args: Vec<String> = ["--padding-global", "2", "0", "--padding-master", "INV*", "1", "3",
+                                 "--padding-inst", "u1", "0", "4", "--padding-global", "x", "1"]
+            .iter().map(|s| s.to_string()).collect();
+        let (mut pad, mut masters) = (vyges_dpl::negotiate::Padding::default(), Vec::new());
+        let mut i = 0;
+        assert!(super::padding_flag(&args, &mut i, &mut pad, &mut masters).is_ok());
+        assert_eq!((pad.global, i), ((2, 0), 2), "global is (left, right); cursor on its last value");
+        i += 1;
+        assert!(super::padding_flag(&args, &mut i, &mut pad, &mut masters).is_ok());
+        assert_eq!((masters.clone(), i), (vec![("INV*".to_string(), (1, 3))], 6));
+        i += 1;
+        assert!(super::padding_flag(&args, &mut i, &mut pad, &mut masters).is_ok());
+        assert_eq!((pad.insts.get("u1").copied(), i), (Some((0, 4)), 10));
+        i += 1;
+        assert!(super::padding_flag(&args, &mut i, &mut pad, &mut masters).is_err(), "a non-number is refused");
+        assert_eq!(pad.global, (2, 0), "a refused flag changes nothing");
+        assert!(USAGE.lines().any(|l| l.contains("improve-placement") && l.contains("--padding-*")),
+                "improve-placement documents the padding flags");
     }
 
     #[test]
