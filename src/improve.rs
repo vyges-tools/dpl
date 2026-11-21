@@ -173,6 +173,17 @@ impl Arch {
     }
 }
 
+/// `createArchitecture`'s row skip (OpenROAD #12071, in the f11b4276 pin): on a HYBRID-row design a
+/// row is skipped when its site has a ROWPATTERN; otherwise when its site is taller than the
+/// shortest row. Before the pin the height test applied to hybrid designs too.
+pub fn architecture_skips_row(has_hybrid_rows: bool, site_has_row_pattern: bool, site_height: i32, min_row_height: i32) -> bool {
+    if has_hybrid_rows {
+        site_has_row_pattern
+    } else {
+        site_height > min_row_height
+    }
+}
+
 /// `Opendp::createArchitecture` then `Architecture::postProcess`, which merges co-linear sub-rows
 /// and ADDS a FILLER node to the network for every gap between the architecture's box and a row.
 fn create_architecture(db: &Db, core: (i32, i32, i32, i32), nodes: &mut Vec<Node>) -> Arch {
@@ -182,6 +193,11 @@ fn create_architecture(db: &Db, core: (i32, i32, i32, i32), nodes: &mut Vec<Node
         .map(|(_, site, _)| db.site_get_height(&site))
         .min()
         .unwrap_or(i32::MAX);
+    // `Grid::examineRows`, which `importDb` runs BEFORE `createArchitecture`: any non-PAD row
+    // whose site is hybrid.
+    let has_hybrid_rows = (0..n)
+        .filter_map(|i| db.nth_row(i).ok().flatten())
+        .any(|(_, site, _)| db.site_get_class(&site).unwrap_or_default() != "PAD" && db.site_is_hybrid(&site));
     let mut arch = Arch::default();
     for i in 0..n {
         let Ok(Some((_, site, orient))) = db.nth_row(i) else { continue };
@@ -191,7 +207,7 @@ fn create_architecture(db: &Db, core: (i32, i32, i32, i32), nodes: &mut Vec<Node
         if db.nth_row_direction(i).unwrap_or_default() != "HORIZONTAL" {
             continue;
         }
-        if db.site_get_height(&site) > min_row_height {
+        if architecture_skips_row(has_hybrid_rows, db.site_has_row_pattern(&site), db.site_get_height(&site), min_row_height) {
             continue;
         }
         let name = db.nth_row_name(i).unwrap_or_default();
@@ -1157,6 +1173,17 @@ impl BotTop for (Power, Power) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hybrid_designs_skip_pattern_rows_not_tall_rows() {
+        // Upstream rule (createArchitecture, f11b4276 pin, #12071): with hybrid rows a row is
+        // skipped when its site has a ROWPATTERN, whatever its height; without them, when its
+        // site is taller than the shortest row.
+        assert!(architecture_skips_row(true, true, 1000, 1000));
+        assert!(!architecture_skips_row(true, false, 2000, 1000), "a tall hybrid row is kept");
+        assert!(architecture_skips_row(false, false, 2000, 1000));
+        assert!(!architecture_skips_row(false, true, 1000, 1000));
+    }
 
     fn row(bottom: i32) -> Row {
         Row { left: 0, num_sites: 10, site_spacing: 100, site_width: 100, sym_y: true, bottom, height: 1000,

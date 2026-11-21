@@ -500,7 +500,12 @@ pub fn check_placement_scoped(db: &Db, disallow_one_site_gaps: bool, padding: &c
                 Some((p.cell.map(|c| (classes[c as usize], c == me)),
                       p.padding_reserved_by.map(|c| (classes[c as usize], c == me))))
             };
-            if !crate::drc::check_padding(gx0 as i32, gx1 as i32, gy0 as i32, gy1 as i32,
+            // 🔑 `checkPadding(cell)` scans `gridCovering(cell)` (OpenROAD #12264, in the
+            // f11b4276 pin): `gridX(left)`, `gridSnapDownY(bottom)`, `divCeil(left + width)`,
+            // `gridEndY(bottom + height)` — the box form, which for an OFF-GRID fixed cell
+            // reaches one column further right than the cell form above.
+            let (px0, py0, px1, py1) = padding_scan(g, cx, cy, bx.2 as i32, bx.3 as i32);
+            if !crate::drc::check_padding(px0 as i32, px1 as i32, py0 as i32, py1 as i32,
                                           left_pad, right_pad, cls, &at) {
                 out.failures.push(Failure { family: "padding".into(), cell: name.clone(),
                                             with: None });
@@ -653,8 +658,25 @@ pub fn grid_facts(db: &Db) -> serde_json::Value {
     })
 }
 
+/// The squares `checkPlacement`'s padding check scans: `gridCovering(cell)` (OpenROAD #12264, in
+/// the f11b4276 pin), the core-relative BOX form — not `gridX`/`gridRoundY` plus `gridWidth`.
+pub(crate) fn padding_scan(g: &crate::grid::Grid, x: i32, y: i32, w: i32, h: i32) -> (i64, i64, i64, i64) {
+    g.covering_rect(x, y, x + w, y + h)
+}
+
 #[cfg(test)]
 mod tests {
+    /// Upstream rule (`PlacementDRC::checkPadding(cell)`, OpenROAD #12264 in the f11b4276 pin):
+    /// the scan is `gridCovering(cell)` — `divCeil(left + width)` on the right — so an off-grid
+    /// cell covers the column it hangs into; the cell form (`gridX + divCeil(width)`) did not.
+    #[test]
+    fn the_padding_scan_covers_an_off_grid_cell_by_its_box() {
+        let g = crate::grid::Grid::uniform_for_test((0, 0, 1000, 200), 100, vec![0, 100, 200]);
+        assert_eq!(super::padding_scan(&g, 50, 0, 100, 100), (0, 0, 2, 1));
+        assert_eq!(g.covering(50, 0, 100, 100).2, 1, "the cell form stops a column short");
+        assert_eq!(super::padding_scan(&g, 100, 0, 100, 100), (1, 0, 2, 1), "on grid both agree");
+    }
+
     /// Upstream rule (`check_placement` proc + `checkPlacement`, 9241d34505 at the pin): no flag
     /// (or both) checks every cell; `-fixed` alone is the fixed-only run (fixed instances and
     /// macros only, nothing movable imported); `-placeable` alone checks the movable cells and

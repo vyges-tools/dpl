@@ -216,12 +216,26 @@ pub fn is_core_auto_placeable(master_type: &str) -> bool {
 /// ⛔ **Three statuses, and `COVER` is the one that is easy to miss.** `NONE`, `UNPLACED`,
 /// `SUGGESTED` and `PLACED` are all movable.
 ///
-/// ⚠️ **`PLACED` is movable even for a macro.** `dbToOpendp` warns DPL-404 and calls
-/// `node->setFixed(true)` on its own network NODE, but it never writes the dbInst's status —
-/// and `initFromDb` reads the dbInst. So the negotiation legalizer sweeps a placed-but-not-fixed
-/// macro, whatever that warning says. ⟹ Transcribe the code, not the message it prints.
+/// ⚠️ This is the dbInst STATUS alone. The negotiation legalizer's `cell.fixed` also takes a
+/// placed BLOCK since the f11b4276 pin — see [`negotiation_fixed`].
 pub fn status_is_fixed(placement_status: &str) -> bool {
     matches!(placement_status, "LOCKED" | "FIRM" | "COVER")
+}
+
+/// `initFromDb`'s `cell.fixed` (OpenROAD #12071, in the f11b4276 pin):
+/// `status.isFixed() || (cell.node && cell.node->isFixed())`.
+///
+/// 🔑 **A placed BLOCK is fixed in negotiation now.** `dbToOpendp` warns DPL-404 and sets its
+/// network NODE fixed, and `initFromDb` reads the node too. Before the pin it read the dbInst
+/// status alone, so a placed-but-not-fixed macro was swept and its answer discarded.
+/// `is_block` is `Node::isBlock`: master type exactly `BLOCK`.
+pub fn negotiation_fixed(placement_status: &str, is_block: bool) -> bool {
+    status_is_fixed(placement_status) || is_block
+}
+
+/// `dbOrientType` rotated by 90 degrees: `getBbox`'s `swapWidthHeight`.
+pub fn swaps_width_height(orient: &str) -> bool {
+    matches!(orient, "R90" | "R270" | "MXR90" | "MYR90")
 }
 
 /// `Node::isStdCell` — `dbInst::isCore() || dbInst::isEndCap()`.
@@ -1754,19 +1768,40 @@ mod tests {
     }
 
     #[test]
-    fn a_discarded_macro_still_counts_its_displacement() {
-        // Upstream rule: commitNegotiationPosToDpl skips only NegCell.fixed (dbInst status), so a
-        // PLACED macro's node moves to its snapped spot while the db does not; findDisplacementStats
-        // measures node vs db. Reference on macro_placed_not_fixed: block1 adds 540 dbu (66.6 u).
-        assert!(node_takes_discarded_position(status_is_fixed("PLACED")));
-        assert!(!node_takes_discarded_position(status_is_fixed("FIRM")));
+    fn a_discarded_cell_still_counts_its_displacement() {
+        // Upstream rule: commitNegotiationPosToDpl skips only NegCell.fixed, so a swept cell the
+        // write-back skips still moves its node; findDisplacementStats measures node vs db.
+        assert!(node_takes_discarded_position(negotiation_fixed("PLACED", false)));
+        assert!(!node_takes_discarded_position(negotiation_fixed("FIRM", false)));
+    }
+
+    #[test]
+    fn a_placed_block_is_fixed_in_negotiation() {
+        // Upstream rule (initFromDb, f11b4276 pin, #12071): `cell.fixed = status.isFixed() ||
+        // node->isFixed()`, and dbToOpendp forces a placed BLOCK node fixed (DPL-404). So
+        // `macro_placed_not_fixed`'s macro is a blockage, no longer swept and discarded.
+        assert!(negotiation_fixed("PLACED", true));
+        assert!(!node_takes_discarded_position(negotiation_fixed("PLACED", true)));
+        assert!(!negotiation_fixed("PLACED", false));
+        assert!(negotiation_fixed("FIRM", false));
+    }
+
+    #[test]
+    fn a_rotated_fixed_footprint_swaps_width_and_height() {
+        // Upstream rule (Opendp::getBbox's swapWidthHeight, used for fixed cells since #11856):
+        // the four 90-degree orientations swap; the other four do not.
+        for o in ["R90", "R270", "MXR90", "MYR90"] {
+            assert!(swaps_width_height(o), "{o}");
+        }
+        for o in ["R0", "R180", "MX", "MY"] {
+            assert!(!swaps_width_height(o), "{o}");
+        }
     }
 
     #[test]
     fn only_three_statuses_are_fixed() {
-        // ⛔ `dbPlacementStatus::isFixed`. COVER is the one that is easy to miss, and PLACED is
-        // MOVABLE even for a macro: DPL-404 sets the network node fixed, not the dbInst status,
-        // and `initFromDb` reads the dbInst.
+        // ⛔ `dbPlacementStatus::isFixed`. COVER is the one that is easy to miss. (A PLACED
+        // macro is fixed in negotiation through its node — `negotiation_fixed` — not its status.)
         for s in ["LOCKED", "FIRM", "COVER"] {
             assert!(status_is_fixed(s), "{s} is fixed");
         }
@@ -3674,9 +3709,9 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             *out.filtered_out.entry(format!("{mtype}/{status}")).or_default() += 1;
             continue;
         }
-        // ⛔ From the STATUS alone. Reading it off the master type made every macro an obstacle,
-        // including the ones upstream legalizes.
-        let fixed = status_is_fixed(&status);
+        // ⛔ The STATUS, or a placed BLOCK's forced-fixed network node (#12071). Reading every
+        // macro TYPE as an obstacle was wrong; only `BLOCK` exactly is `Node::isBlock`.
+        let fixed = negotiation_fixed(&status, mtype == "BLOCK");
 
         if fixed {
             // ⛔ **`covering` returns HALF-OPEN bounds** — `xhi`/`yhi` are one past the last
@@ -3692,10 +3727,14 @@ pub fn legalize_padded(db: &Db, opts: Options, padding: &Padding) -> Result<Lega
             // blockade that is one row too tall does not look like an off-by-one in the output;
             // it looks like a legalizer that will not move cells vertically.
             let (x0, y0, x1, y1) = grid.covering(x - core.0, y - core.1, w, h);
-            // The cell's negotiation height (`gridHeight(master)`), which the height census
-            // below counts.
-            let fh = grid.grid_height(h, db.row_pattern(&db.master_get_site(&master))
-                                        .map_or(0, |p| p.len()));
+            // 🔑 **The cell's negotiation footprint is `gridCovering(getBbox(inst))`** (OpenROAD
+            // #11856, in the f11b4276 pin): the ORIENTED box (width and height swapped for a
+            // 90-degree orientation) at its actual location, covered — not `gridHeight(master)`.
+            // Its height is what the height census below counts.
+            let (ow, oh) = if swaps_width_height(&db.inst_get_orient(&name)) { (h, w) } else { (w, h) };
+            let (bx, by) = (x - core.0, y - core.1);
+            let (_, fy0, _, fy1) = grid.covering_rect(bx, by, bx + ow, by + oh);
+            let fh = (fy1 - fy0) as i32;
             // ⛔ **Upstream `142cb954632` (at `4155ac3`): the blockade is `visitCellPixels(cell,
             // unpadded)` — the very squares `checkPlacement` tests for overlap.** For a master
             // with OVERLAP obstructions that is the obstruction shapes, not the whole box, and
